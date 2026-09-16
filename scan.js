@@ -66,8 +66,12 @@ async function scan(client, sourceSchema, options) {
     }
 
     say('  Copy matches. Seeding two people and attacking it ...');
-    const sown = await attack.seed(client, copyName, copyPlan.tables);
-    const impersonation = await attack.impersonate(client, copyName, copyPlan.tables);
+    // The stand-ins built for tables outside the schema belong to this tool,
+    // not to the customer. Attacking them would produce findings about a table
+    // that does not exist in their app.
+    const theirs = copyPlan.tables.filter((table) => !schema.isStub(table.name));
+    const sown = await attack.seed(client, copyName, theirs);
+    const impersonation = await attack.impersonate(client, copyName, theirs);
 
     // Every attack genuinely run, named the way a finding is named. The
     // re-check needs this: a finding that disappears because its attack never
@@ -100,7 +104,7 @@ async function scan(client, sourceSchema, options) {
       const one = await opts.openSession();
       const two = await opts.openSession();
       try {
-        collisions = await collision.collide(client, one, two, copyName, copyPlan.tables, copyPlan.indexes);
+        collisions = await collision.collide(client, one, two, copyName, theirs, copyPlan.indexes);
       } finally {
         await one.end().catch(() => {});
         await two.end().catch(() => {});
@@ -119,7 +123,7 @@ async function scan(client, sourceSchema, options) {
       // Two requests at once needs two connections. Without them the attack
       // cannot happen at all, and a report that quietly omits it reads exactly
       // like a report that ran it and found nothing.
-      for (const target of collision.candidates(copyPlan.tables, copyPlan.indexes).filter((t) => !t.covered)) {
+      for (const target of collision.candidates(theirs, copyPlan.indexes).filter((t) => !t.covered)) {
         notChecked.push({
           table: target.table + '.' + target.column,
           key: 'duplicated:' + target.table + ':' + target.column,

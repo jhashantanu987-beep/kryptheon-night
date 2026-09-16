@@ -144,6 +144,83 @@ async function readGrants(client, schema) {
   return rows;
 }
 
+/** What a foreign key points at, pulled out of Postgres's own wording. */
+function referenceIn(definition) {
+  const match = /FOREIGN KEY\s*\(([^)]+)\)\s*REFERENCES\s+([^\s(]+)\s*\(([^)]+)\)/i.exec(String(definition));
+  if (!match) return null;
+  const strip = (text) => text.trim().replace(/^"(.*)"$/, '$1');
+  const target = match[2].trim().split(/\.(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(strip);
+  return {
+    schema: target.length > 1 ? target[0] : null,
+    table: target[target.length - 1],
+    columns: match[3].split(',').map(strip),
+  };
+}
+
+/** The name a stand-in for an outside table is given inside the copy. */
+function stubNameFor(refSchema, refTable) {
+  return 'kn_ext__' + refSchema + '__' + refTable;
+}
+
+/** Is this one of our stand-ins rather than something the customer wrote? */
+function isStub(name) {
+  return /^kn_ext__/.test(String(name));
+}
+
+/**
+ * Tables outside this schema that its foreign keys point at.
+ *
+ * Nearly every Supabase app has `references auth.users(id)`, and the copy
+ * cannot carry that as written: pointed at the real auth.users, every seeded
+ * row becomes a write into the customer's own authentication table. So the
+ * shape of the outside table is read - columns and types, never rows - and a
+ * stand-in is built inside the copy instead.
+ *
+ * A target whose shape cannot be read at all is returned with no columns, and
+ * the caller treats that as unsupported rather than guessing at it.
+ */
+async function readExternalTargets(client, schema, tables) {
+  const wanted = new Map();
+  for (const table of tables) {
+    for (const constraint of table.constraints || []) {
+      if (constraint.kind !== 'f') continue;
+      const points = referenceIn(constraint.definition);
+      if (!points || !points.schema || points.schema === schema) continue;
+      const key = points.schema + '.' + points.table;
+      if (!wanted.has(key)) {
+        wanted.set(key, { schema: points.schema, table: points.table, columns: new Set() });
+      }
+      points.columns.forEach((column) => wanted.get(key).columns.add(column));
+    }
+  }
+
+  const targets = [];
+  for (const entry of wanted.values()) {
+    let columns = [];
+    try {
+      const { rows } = await client.query(
+        `SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type
+           FROM pg_attribute a
+          WHERE a.attrelid = format('%I.%I', $1::text, $2::text)::regclass
+            AND a.attname = ANY($3) AND a.attnum > 0 AND NOT a.attisdropped
+          ORDER BY a.attnum`,
+        [entry.schema, entry.table, Array.from(entry.columns)],
+      );
+      columns = rows;
+    } catch (err) {
+      columns = [];
+    }
+    targets.push({
+      schema: entry.schema,
+      table: entry.table,
+      columns: columns,
+      stub: stubNameFor(entry.schema, entry.table),
+      wanted: Array.from(entry.columns),
+    });
+  }
+  return targets;
+}
+
 /**
  * Everything needed to rebuild a schema, and everything that could not be.
  *
@@ -159,17 +236,6 @@ async function readSchema(client, schema) {
     const columns = await readColumns(client, schema, table.name);
     const constraints = await readConstraints(client, schema, table.name);
 
-    for (const constraint of constraints) {
-      // A foreign key pointing outside this schema cannot be rebuilt as
-      // written, and quietly dropping it would change what seeding is allowed
-      // to insert.
-      if (constraint.kind === 'f' && !constraint.definition.includes(schema + '.')) {
-        unsupported.push(
-          table.name + '.' + constraint.name + ' points outside the schema: ' + constraint.definition,
-        );
-      }
-    }
-
     built.push({
       name: table.name,
       rlsEnabled: table.rls_enabled,
@@ -179,12 +245,27 @@ async function readSchema(client, schema) {
     });
   }
 
+  // A foreign key pointing outside this schema gets a stand-in inside the
+  // copy. Quietly dropping it instead would change what seeding is allowed to
+  // insert, and pointing it at the real table would make every seeded row a
+  // write into the customer's own data.
+  const external = await readExternalTargets(client, schema, built);
+  for (const target of external) {
+    if (target.columns.length !== target.wanted.length) {
+      unsupported.push(
+        'a foreign key points at ' + target.schema + '.' + target.table +
+          ', and I could not read its shape to stand in for it',
+      );
+    }
+  }
+
   return {
     schema: schema,
     tables: built,
     policies: await readPolicies(client, schema),
     grants: await readGrants(client, schema),
     indexes: await readIndexes(client, schema),
+    external: external,
     unsupported: unsupported,
   };
 }
@@ -230,6 +311,40 @@ function roleList(roles) {
 function rewriteSchemaRefs(expr, fromSchema, toSchema) {
   if (!expr) return null;
   return String(expr).split(quote(fromSchema) + '.').join(quote(toSchema) + '.').split(fromSchema + '.').join(toSchema + '.');
+}
+
+/**
+ * Points a foreign key at the stand-in instead of at the real outside table.
+ *
+ * Both spellings again, for the same reason the schema rewrite handles both:
+ * Postgres writes a name unquoted whenever it does not have to quote it, and
+ * missing one spelling leaves the copy holding a live reference into the
+ * customer's database.
+ */
+function rewriteExternalRefs(expr, external, toSchema) {
+  let text = String(expr);
+  for (const target of external || []) {
+    const stub = quote(toSchema) + '.' + quote(target.stub);
+    text = text
+      .split(quote(target.schema) + '.' + quote(target.table))
+      .join(stub)
+      .split(target.schema + '.' + target.table)
+      .join(stub);
+  }
+  return text;
+}
+
+/** Two people who do not exist, used wherever a stand-in row is needed. */
+const IDENTITIES = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
+
+/** Something of the right type to put in a stand-in row. */
+function stubValue(type, nth) {
+  const kind = String(type).toLowerCase();
+  if (kind === 'uuid') return "'" + IDENTITIES[nth] + "'";
+  if (/^(integer|bigint|smallint|numeric|decimal|real|double)/.test(kind)) return String(nth + 1);
+  if (/^bool/.test(kind)) return nth === 0 ? 'true' : 'false';
+  if (/^(timestamp|date)/.test(kind)) return 'now()';
+  return "'kryptheon-" + (nth + 1) + "'";
 }
 
 /** Which of these roles this database actually has. */
@@ -296,6 +411,21 @@ async function writeSchema(client, plan, target) {
     );
   }
 
+  // Stand-ins for the tables outside this schema that its foreign keys point
+  // at, with two rows already in them so seeding has something to reference.
+  // Built before the constraints, because a foreign key cannot be added to a
+  // table that is not there yet.
+  for (const outside of plan.external || []) {
+    const stub = quote(target) + '.' + quote(outside.stub);
+    const columns = outside.columns.map((column) => quote(column.name) + ' ' + column.type + ' NOT NULL');
+    const keyed = outside.columns.map((column) => quote(column.name)).join(', ');
+    statements.push('CREATE TABLE ' + stub + ' (' + columns.join(', ') + ', PRIMARY KEY (' + keyed + '))');
+    for (let nth = 0; nth < IDENTITIES.length; nth++) {
+      const values = outside.columns.map((column) => stubValue(column.type, nth));
+      statements.push('INSERT INTO ' + stub + ' VALUES (' + values.join(', ') + ')');
+    }
+  }
+
   // Keys and uniques across every table first, then the foreign keys.
   // Constraints used to be added table by table, so a foreign key on `orders`
   // was created before the primary key on `profiles` existed and Postgres
@@ -306,7 +436,11 @@ async function writeSchema(client, plan, target) {
       for (const constraint of table.constraints) {
         const isForeign = constraint.kind === 'f';
         if (isForeign !== wantForeign) continue;
-        const definition = rewriteSchemaRefs(constraint.definition, plan.schema, target);
+        const definition = rewriteExternalRefs(
+          rewriteSchemaRefs(constraint.definition, plan.schema, target),
+          plan.external,
+          target,
+        );
         statements.push(
           'ALTER TABLE ' + quote(target) + '.' + quote(table.name) +
             ' ADD CONSTRAINT ' + quote(constraint.name) + ' ' + definition,
@@ -388,7 +522,11 @@ async function writeSchema(client, plan, target) {
 function diffSchemas(source, copy) {
   const differences = [];
 
-  const named = (list) => list.map((t) => t.name).sort().join(', ');
+  // The stand-ins exist only in the copy, by design. Comparing them against
+  // an original that never had them would report every Supabase app as a
+  // copy that came out wrong.
+  const mine = (list) => list.filter((t) => !isStub(t.name));
+  const named = (list) => mine(list).map((t) => t.name).sort().join(', ');
   if (named(source.tables) !== named(copy.tables)) {
     differences.push('tables differ: ' + named(source.tables) + '  vs  ' + named(copy.tables));
   }
@@ -464,6 +602,11 @@ module.exports = {
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,
   readIndexes: readIndexes,
+  readExternalTargets: readExternalTargets,
+  referenceIn: referenceIn,
+  stubNameFor: stubNameFor,
+  isStub: isStub,
+  IDENTITIES: IDENTITIES,
   quote: quote,
   roleList: roleList,
 };
