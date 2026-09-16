@@ -18,9 +18,16 @@
 // So this compares the two runs against what the second run actually managed to
 // try, not against what it happened to report.
 
-/** A finding's identity across runs: the attack, and what it was against. */
+/**
+ * A finding's identity across runs: the attack, and what it was against.
+ *
+ * The column is part of it wherever there is one. A users table can accept a
+ * duplicate email AND a duplicate username; without the column those two share
+ * an identity, and adding a unique constraint to one of them would be read as
+ * having fixed both.
+ */
 function keyOf(item) {
-  return item.kind + ':' + item.table;
+  return item.kind + ':' + item.table + (item.column ? ':' + item.column : '');
 }
 
 /**
@@ -47,29 +54,49 @@ function compare(before, after) {
   }
 
   const nowByKey = new Map(now.map((item) => [keyOf(item), item]));
-  const checked = new Set((after && after.checked) || []);
-  const couldNotCheck = new Map(((after && after.notChecked) || []).map((entry) => [entry.table, entry.why]));
+
+  // What the second run actually attempted, named the same way a finding is.
+  // Per attack rather than per table, because one table can be attacked three
+  // different ways: a table that was seeded and read is not thereby a table
+  // whose unique columns were raced. Keyed by table alone, a collision attack
+  // that never ran would have looked like a collision that was refused.
+  const attempted = new Set((after && after.attempted) || []);
+  const skipped = (after && after.notChecked) || [];
+  const reasons = new Map();
+  for (const entry of skipped) {
+    if (entry.key) reasons.set(entry.key, entry.why);
+    if (entry.table && !reasons.has(entry.table)) reasons.set(entry.table, entry.why);
+  }
+  const tablesTouched = new Set(
+    Array.from(attempted).map((key) => String(key).split(':')[1]).filter(Boolean),
+  );
 
   const fixed = [];
   const stillOpen = [];
   const unverifiable = [];
 
   for (const item of was) {
-    if (nowByKey.has(keyOf(item))) {
+    const key = keyOf(item);
+    if (nowByKey.has(key)) {
       stillOpen.push(item);
       continue;
     }
     // Gone from the list. Now the only question that matters: was it tried?
-    if (couldNotCheck.has(item.table)) {
-      unverifiable.push(Object.assign({}, item, { why: couldNotCheck.get(item.table) }));
-      continue;
-    }
-    if (!checked.has(item.table)) {
-      // Not attacked, and not reported as skipped either - most often the table
-      // is simply no longer there. Said as what it is rather than folded into
-      // "fixed", because deleting a table and securing one are different acts
-      // and only one of them is what the person was asked to do.
-      unverifiable.push(Object.assign({}, item, { why: 'the table was not there to test this time' }));
+    if (!attempted.has(key)) {
+      unverifiable.push(
+        Object.assign({}, item, {
+          why:
+            reasons.get(key) ||
+            reasons.get(item.table) ||
+            // Not attempted and no reason offered. Either the table is gone or
+            // that particular attack did not run. Said as what it is rather
+            // than folded into "fixed", because deleting a table and securing
+            // one are different acts and only one is what was asked for.
+            (tablesTouched.has(item.table)
+              ? 'this particular check did not run this time'
+              : 'the table was not there to test this time'),
+        }),
+      );
       continue;
     }
     fixed.push(item);

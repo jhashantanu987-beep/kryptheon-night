@@ -38,15 +38,34 @@ function ownerColumn(table) {
   return null;
 }
 
-/** Something valid to put in a column, so a row can exist at all. */
-function valueFor(column, owner) {
+/** Keeps a generated value inside a declared width like varchar(20). */
+function fitTo(text, type) {
+  const match = /^[a-z ]*\((\d+)\)$/.exec(String(type).trim());
+  if (!match) return text;
+  const limit = Number(match[1]);
+  return text.length > limit ? text.slice(0, limit) : text;
+}
+
+/**
+ * Something valid to put in a column, so a row can exist at all.
+ *
+ * `distinct` is what keeps two seeded rows from being identical. Without it
+ * every row carried the same text, so a table with a unique email column
+ * refused the second insert and the whole table was reported as "not checked"
+ * - a well-built app treated as an unknown one. The tag goes at the front
+ * because a narrow varchar truncates the end, and two rows truncated to the
+ * same string is that bug all over again.
+ */
+function valueFor(column, owner, distinct) {
   const type = String(column.type).toLowerCase();
+  const tag = distinct === undefined || distinct === null ? '' : String(distinct);
+  const step = Number(tag) || 0;
   if (type === 'uuid') return owner;
-  if (/^(integer|bigint|smallint|numeric|decimal|real|double)/.test(type)) return 1;
+  if (/^(integer|bigint|smallint|numeric|decimal|real|double)/.test(type)) return 1 + step;
   if (/^bool/.test(type)) return true;
   if (/^(timestamp|date)/.test(type)) return new Date().toISOString();
   if (/^json/.test(type)) return '{}';
-  return 'kryptheon test';
+  return fitTo(tag ? tag + ' kryptheon test' : 'kryptheon test', type);
 }
 
 /** The foreign keys on a table, read out of Postgres's own wording. */
@@ -110,6 +129,70 @@ async function existingValue(client, schema, key) {
 }
 
 /**
+ * A row that will actually go in.
+ *
+ * Owner column set to the person, foreign keys pointing at rows that really
+ * exist, every NOT NULL column filled, and anything with a default left to
+ * supply its own value.
+ *
+ * `overrides` is what the Collision attack needs: it forces one column to a
+ * chosen value while everything else stays distinct, so when two inserts race
+ * they collide on that column and on nothing else. Without it a second unique
+ * column elsewhere in the table would refuse the insert, and the refusal would
+ * be read as the app defending itself.
+ */
+async function rowFor(client, schema, table, person, distinct, overrides) {
+  const forced = overrides || {};
+  const owner = ownerColumn(table);
+  const pointsAt = new Map(foreignKeys(table).map((k) => [k.column, k]));
+  const columns = [];
+  const values = [];
+
+  for (const column of table.columns) {
+    if (Object.prototype.hasOwnProperty.call(forced, column.name)) {
+      columns.push(column.name);
+      values.push(forced[column.name]);
+      continue;
+    }
+    if (column.name === owner) {
+      columns.push(column.name);
+      values.push(person);
+      continue;
+    }
+    // A column pointing at another table has to hold something that is
+    // actually there, whatever its type would otherwise suggest.
+    const key = pointsAt.get(column.name);
+    if (key) {
+      const borrowed = await existingValue(client, schema, key);
+      if (borrowed !== null) {
+        columns.push(column.name);
+        values.push(borrowed);
+        continue;
+      }
+      if (column.not_null) throw new Error('nothing in ' + key.refTable + ' to point ' + column.name + ' at');
+      continue;
+    }
+    // Anything with a default can supply its own value.
+    if (column.default_expr) continue;
+    if (!column.not_null) continue;
+    columns.push(column.name);
+    values.push(valueFor(column, person, distinct));
+  }
+
+  return { columns: columns, values: values };
+}
+
+/** Puts a built row in. Separate so the same row can be raced against itself. */
+function insertRow(client, schema, table, row) {
+  const placeholders = row.values.map((_, i) => '$' + (i + 1));
+  return client.query(
+    'INSERT INTO ' + quote(schema) + '.' + quote(table) +
+      ' (' + row.columns.map(quote).join(', ') + ') VALUES (' + placeholders.join(', ') + ')',
+    row.values,
+  );
+}
+
+/**
  * Two rows per table: one belonging to each fake person.
  *
  * Inserted as the owner of the schema, deliberately - seeding is not the
@@ -132,44 +215,12 @@ async function seed(client, schema, tables) {
     // that get left open.
     const people = owner ? [USER_A, USER_B] : [USER_A];
 
-    const keys = foreignKeys(table);
-    const pointsAt = new Map(keys.map((k) => [k.column, k]));
-
     try {
+      let nth = 0;
       for (const person of people) {
-        const columns = [];
-        const values = [];
-        for (const column of table.columns) {
-          if (column.name === owner) {
-            columns.push(column.name);
-            values.push(person);
-            continue;
-          }
-          // A column pointing at another table has to hold something that is
-          // actually there, whatever its type would otherwise suggest.
-          const key = pointsAt.get(column.name);
-          if (key) {
-            const borrowed = await existingValue(client, schema, key);
-            if (borrowed !== null) {
-              columns.push(column.name);
-              values.push(borrowed);
-              continue;
-            }
-            if (column.not_null) throw new Error('nothing in ' + key.refTable + ' to point ' + column.name + ' at');
-            continue;
-          }
-          // Anything with a default can supply its own value.
-          if (column.default_expr) continue;
-          if (!column.not_null) continue;
-          columns.push(column.name);
-          values.push(valueFor(column, person));
-        }
-        const placeholders = values.map((_, i) => '$' + (i + 1));
-        await client.query(
-          'INSERT INTO ' + quote(schema) + '.' + quote(table.name) +
-            ' (' + columns.map(quote).join(', ') + ') VALUES (' + placeholders.join(', ') + ')',
-          values,
-        );
+        nth += 1;
+        const row = await rowFor(client, schema, table, person, nth);
+        await insertRow(client, schema, table.name, row);
       }
       seeded.push({ table: table.name, owner: owner });
     } catch (err) {
@@ -267,6 +318,9 @@ module.exports = {
   ownerColumn: ownerColumn,
   foreignKeys: foreignKeys,
   dependencyOrder: dependencyOrder,
+  valueFor: valueFor,
+  rowFor: rowFor,
+  insertRow: insertRow,
   seed: seed,
   readAs: readAs,
   impersonate: impersonate,

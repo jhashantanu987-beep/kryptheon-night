@@ -27,22 +27,34 @@ const ORDERS = {
   headline: 'Your orders table lets one customer read another one\'s rows.',
 };
 
+/** Both impersonation attacks are run against every table that was seeded. */
+function attacksOn(tables) {
+  return tables.reduce((all, table) => all.concat(['exposed:' + table, 'crossed:' + table]), []);
+}
+
 /** A first run that found both problems. */
 const BEFORE = {
   stopped: null,
   findings: [CUSTOMERS, ORDERS],
-  checked: ['customers', 'orders', 'profiles'],
+  attempted: attacksOn(['customers', 'orders', 'profiles']),
   notChecked: [],
   attacksRun: 6,
 };
 
-/** A second run, described by what it managed to try. */
+/**
+ * A second run, described by what it managed to try.
+ *
+ * `checked` names tables because that reads well; what the comparison actually
+ * reads is the list of attacks. Those are not the same thing - a table that
+ * was seeded and read is not a table whose unique columns were raced - and a
+ * test that blurred the two would let exactly that bug through.
+ */
 function after(options) {
   const opts = options || {};
   return {
     stopped: opts.stopped || null,
     findings: opts.findings || [],
-    checked: opts.checked || ['customers', 'orders', 'profiles'],
+    attempted: opts.attempted || attacksOn(opts.checked || ['customers', 'orders', 'profiles']),
     notChecked: opts.notChecked || [],
     attacksRun: 6,
   };
@@ -267,6 +279,104 @@ const cases = [
       for (const key of wanted) {
         const times = landed.filter((k) => k === key).length;
         if (times !== 1) problems.push(key + ' appears ' + times + ' times, expected 1');
+      }
+      return problems;
+    },
+  },
+  {
+    name: '13. two columns on one table are told apart',
+    run: () => {
+      // A users table can accept a duplicate email AND a duplicate username.
+      // Adding one unique constraint fixes one of them. If the two share an
+      // identity, the person is told both are closed while one still is not.
+      const EMAIL = { kind: 'duplicated', table: 'users', column: 'email', headline: 'e', severity: 'CRITICAL' };
+      const USERNAME = { kind: 'duplicated', table: 'users', column: 'username', headline: 'u', severity: 'CRITICAL' };
+      const first = {
+        stopped: null,
+        findings: [EMAIL, USERNAME],
+        attempted: ['duplicated:users:email', 'duplicated:users:username'],
+        notChecked: [],
+        attacksRun: 2,
+      };
+      const r = recheck.compare(
+        first,
+        after({
+          findings: [USERNAME],
+          attempted: ['duplicated:users:email', 'duplicated:users:username'],
+        }),
+      );
+      const problems = [];
+      if (recheck.keyOf(EMAIL) === recheck.keyOf(USERNAME)) problems.push('both columns share one identity');
+      if (r.fixed.length !== 1) problems.push('fixed ' + r.fixed.length + ', expected 1');
+      if (r.fixed.length && r.fixed[0].column !== 'email') problems.push('it closed the wrong column');
+      if (r.stillOpen.length !== 1) problems.push('still open ' + r.stillOpen.length + ', expected 1');
+      if (r.allClear) problems.push('it went green with one column still open');
+      return problems;
+    },
+  },
+  {
+    name: '14. an attack that did not run is not a fix, even on a table that was attacked',
+    run: () => {
+      // The table was seeded and read, so by table name it looks covered. But
+      // the race never happened - no second connection - and the finding is
+      // gone from the list for that reason alone. This is the case that made
+      // the comparison per-attack instead of per-table.
+      const RACE = { kind: 'duplicated', table: 'users', column: 'email', headline: 'e', severity: 'CRITICAL' };
+      const first = {
+        stopped: null,
+        findings: [RACE],
+        attempted: ['exposed:users', 'crossed:users', 'duplicated:users:email'],
+        notChecked: [],
+        attacksRun: 3,
+      };
+      const r = recheck.compare(
+        first,
+        after({ findings: [], attempted: ['exposed:users', 'crossed:users'] }),
+      );
+      const problems = [];
+      if (r.fixed.length) problems.push('it called an attack it never ran a fix');
+      if (r.unverifiable.length !== 1) problems.push('unverifiable ' + r.unverifiable.length + ', expected 1');
+      if (r.allClear) problems.push('it went green over a race that never happened');
+      if (recheck.badgeLines(r, 3).length) problems.push('it issued a badge for an attack that did not run');
+      const said = recheck.describe(r).join('\n');
+      // The table IS still there, so blaming a missing table would be a lie.
+      if (/not there to test/.test(said)) problems.push('it blamed a missing table that is not missing');
+      if (!/did not run this time/.test(said)) problems.push('it does not say the check did not run: ' + said);
+      return problems;
+    },
+  },
+  {
+    name: '15. the reason a race could not run survives into the report',
+    run: () => {
+      // A skipped collision names the column, so its table reads "users.email"
+      // and will never match a finding whose table is "users". The key is what
+      // carries the reason across. Lose it and a real explanation - the test
+      // row would not go in - is replaced by a shrug, and the person has
+      // nothing to act on.
+      const RACE = { kind: 'duplicated', table: 'users', column: 'email', headline: 'e', severity: 'CRITICAL' };
+      const first = {
+        stopped: null,
+        findings: [RACE],
+        attempted: ['exposed:users', 'crossed:users', 'duplicated:users:email'],
+        notChecked: [],
+        attacksRun: 3,
+      };
+      const r = recheck.compare(
+        first,
+        after({
+          findings: [],
+          attempted: ['exposed:users', 'crossed:users'],
+          notChecked: [
+            { table: 'users.email', key: 'duplicated:users:email', why: 'I could not get even one test row in' },
+          ],
+        }),
+      );
+      const problems = [];
+      if (r.fixed.length) problems.push('it called an untested column fixed');
+      if (r.unverifiable.length !== 1) problems.push('unverifiable ' + r.unverifiable.length + ', expected 1');
+      const said = recheck.describe(r).join('\n');
+      if (!/could not get even one test row in/.test(said)) {
+        problems.push('the reason the scan gave was dropped: ' + said);
       }
       return problems;
     },

@@ -46,7 +46,15 @@ const APP = 'app_' + Date.now().toString(36);
     console.log('');
     console.log('  $ kryptheon scan   (app: ' + APP + ')');
     console.log('');
-    const result = await scan(client, APP);
+    const result = await scan(client, APP, {
+      // Two requests at once cannot be faked down one connection, so the
+      // collision attack is given a way to open its own.
+      openSession: async () => {
+        const extra = new Client({ connectionString: process.argv[2] });
+        await extra.connect();
+        return extra;
+      },
+    });
     report(result);
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE');

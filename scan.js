@@ -17,6 +17,7 @@ const { Client } = require('pg');
 const schema = require('./schema.js');
 const attack = require('./attack.js');
 const finding = require('./finding.js');
+const collision = require('./collision.js');
 const recheck = require('./recheck.js');
 
 // Where the last run is kept so the next one has something to compare against.
@@ -68,19 +69,62 @@ async function scan(client, sourceSchema, options) {
     const sown = await attack.seed(client, copyName, copyPlan.tables);
     const raw = await attack.impersonate(client, copyName, copyPlan.tables);
 
+    // Every attack genuinely run, named the way a finding is named. The
+    // re-check needs this: a finding that disappears because its attack never
+    // ran this time is not a finding that was fixed, and without this list the
+    // two are indistinguishable.
+    const attempted = [];
+    for (const entry of sown.seeded) {
+      attempted.push('exposed:' + entry.table);
+      // Crossed is only ever looked for where a row says who it belongs to.
+      if (entry.owner) attempted.push('crossed:' + entry.table);
+    }
+
+    // Surfaced, not swallowed. A table with no row in it reads as a safe
+    // table, so the one thing that must never happen is reporting an app as
+    // clear when part of it was never actually tried.
+    const notChecked = sown.skipped.slice();
+
+    let collisions = { findings: [], notTried: [], raced: [] };
+    if (opts.openSession) {
+      say('  Racing two requests against each other ...');
+      const one = await opts.openSession();
+      const two = await opts.openSession();
+      try {
+        collisions = await collision.collide(client, one, two, copyName, copyPlan.tables, copyPlan.indexes);
+      } finally {
+        await one.end().catch(() => {});
+        await two.end().catch(() => {});
+      }
+      for (const raced of collisions.raced) {
+        attempted.push('duplicated:' + raced.table + ':' + raced.column);
+      }
+      for (const missed of collisions.notTried) {
+        notChecked.push({
+          table: missed.table + '.' + missed.column,
+          key: 'duplicated:' + missed.table + ':' + missed.column,
+          why: missed.why,
+        });
+      }
+    } else {
+      // Two requests at once needs two connections. Without them the attack
+      // cannot happen at all, and a report that quietly omits it reads exactly
+      // like a report that ran it and found nothing.
+      for (const target of collision.candidates(copyPlan.tables, copyPlan.indexes).filter((t) => !t.covered)) {
+        notChecked.push({
+          table: target.table + '.' + target.column,
+          key: 'duplicated:' + target.table + ':' + target.column,
+          why: 'racing two requests needs a second connection, and none was available',
+        });
+      }
+    }
+
     return {
       stopped: null,
-      attacksRun: sown.seeded.length * 2,
-      // Surfaced, not swallowed. A table with no row in it reads as a safe
-      // table, so the one thing that must never happen is reporting an app
-      // as clear when part of it was never actually tried.
-      notChecked: sown.skipped,
-      // Which tables were genuinely tried. The re-check needs this: a finding
-      // that disappears because its table could not be tested this time is
-      // not a finding that was fixed, and without this list the two are
-      // indistinguishable.
-      checked: sown.seeded.map((entry) => entry.table),
-      findings: finding.describeAll(raw),
+      attacksRun: attempted.length,
+      notChecked: notChecked,
+      attempted: attempted,
+      findings: finding.describeAll(raw.concat(collisions.findings)),
     };
   } finally {
     try {
@@ -235,7 +279,15 @@ async function main() {
   const client = new Client({ connectionString: connection });
   await client.connect();
   try {
-    const result = await scan(client, target);
+    const result = await scan(client, target, {
+      // Two requests arriving together cannot be faked down one connection, so
+      // the collision attack is handed a way to open its own.
+      openSession: async () => {
+        const extra = new Client({ connectionString: connection });
+        await extra.connect();
+        return extra;
+      },
+    });
 
     if (!before) {
       report(result);

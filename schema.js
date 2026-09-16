@@ -13,10 +13,12 @@
 // `unsupported` below, which is checked by the caller and is not advisory.
 //
 // What is deliberately not copied: data (none of it, ever - that is the whole
-// promise), indexes, triggers, views and functions. None of them change whether
-// a policy lets a caller through, which is what is under test. Data being
-// absent is the point; the rest is noted and will matter when the Scale and
-// Interruption attacks arrive.
+// promise), triggers, views and functions. Unique indexes ARE copied, because
+// they decide whether the same thing can exist twice - an app that enforces
+// uniqueness with CREATE UNIQUE INDEX rather than a UNIQUE constraint would
+// otherwise arrive at the copy with none of it, and be reported as broken for
+// having got it right. Data being absent is the point; the rest is noted and
+// will matter when the Scale and Interruption attacks arrive.
 
 /* --------------------------------------------------------------------------
    Reading.
@@ -71,6 +73,37 @@ async function readConstraints(client, schema, table) {
       WHERE con.conrelid = format('%I.%I', $1::text, $2::text)::regclass
       ORDER BY con.conname`,
     [schema, table],
+  );
+  return rows;
+}
+
+/**
+ * Unique indexes, which are the other half of "can this happen twice".
+ *
+ * Read separately from constraints because `CREATE UNIQUE INDEX` and
+ * `UNIQUE (...)` are different objects in Postgres and real apps use both. An
+ * app whose uniqueness lives in an index would arrive at the copy with none of
+ * it, and the Collision attack would then report every such app as broken - a
+ * false alarm on exactly the apps that got it right.
+ *
+ * Primary keys and indexes backing a constraint are left out: those come along
+ * with the constraint itself, and creating them again is an error.
+ */
+async function readIndexes(client, schema) {
+  const { rows } = await client.query(
+    `SELECT c.relname AS name,
+            t.relname AS table_name,
+            pg_get_indexdef(i.indexrelid) AS definition
+       FROM pg_index i
+       JOIN pg_class c ON c.oid = i.indexrelid
+       JOIN pg_class t ON t.oid = i.indrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = $1
+        AND i.indisunique
+        AND NOT i.indisprimary
+        AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+      ORDER BY t.relname, c.relname`,
+    [schema],
   );
   return rows;
 }
@@ -151,6 +184,7 @@ async function readSchema(client, schema) {
     tables: built,
     policies: await readPolicies(client, schema),
     grants: await readGrants(client, schema),
+    indexes: await readIndexes(client, schema),
     unsupported: unsupported,
   };
 }
@@ -253,6 +287,14 @@ async function writeSchema(client, plan, target, options) {
     }
   }
 
+  // Unique indexes, once every table exists. The schema name inside the
+  // definition is rewritten for the same reason a foreign key's was: Postgres
+  // writes it unquoted, and every single index definition carries it. Replayed
+  // as-is, the copy would build its indexes on the customer's real tables.
+  for (const index of plan.indexes || []) {
+    statements.push(rewriteSchemaRefs(index.definition, plan.schema, target));
+  }
+
   // The roles PostgREST switches into, and the auth.uid() the policies read.
   // Without these the policies would fail to create, or would create and then
   // never match anything - which would look like a very secure application.
@@ -338,6 +380,27 @@ function diffSchemas(source, copy) {
     }
   }
 
+  // Uniqueness decides whether the Collision attack has anything to report, so
+  // a unique index that failed to come across has to be caught here rather
+  // than turn into a confident finding about a table that was actually fine.
+  // The schema name is stripped before comparing, since it differs by design.
+  const indexText = (plan) =>
+    (plan.indexes || [])
+      .map((index) => String(index.definition).split(quote(plan.schema) + '.').join('').split(plan.schema + '.').join(''))
+      .sort();
+  const sourceIndexes = indexText(source);
+  const copyIndexes = indexText(copy);
+  if (sourceIndexes.length !== copyIndexes.length) {
+    differences.push(
+      'the copy has ' + copyIndexes.length + ' unique indexes, the original has ' + sourceIndexes.length,
+    );
+  }
+  for (let i = 0; i < Math.max(sourceIndexes.length, copyIndexes.length); i++) {
+    if (sourceIndexes[i] !== copyIndexes[i]) {
+      differences.push('a unique index came across changed:\n      ' + sourceIndexes[i] + '\n      ' + copyIndexes[i]);
+    }
+  }
+
   // The policies matter most, so they are compared word for word.
   const asText = (list, schema) =>
     list
@@ -367,6 +430,7 @@ module.exports = {
   writeSchema: writeSchema,
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,
+  readIndexes: readIndexes,
   quote: quote,
   roleList: roleList,
 };

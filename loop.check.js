@@ -62,7 +62,11 @@ async function buildApp(client, app) {
   );
   await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated');
 
-  await client.query('CREATE TABLE ' + q('profiles') + ' (id uuid PRIMARY KEY, email text NOT NULL, full_name text)');
+  // profiles is the table that was done properly: its policy is right and its
+  // email is unique, so neither attack should have anything to say about it.
+  await client.query(
+    'CREATE TABLE ' + q('profiles') + ' (id uuid PRIMARY KEY, email text NOT NULL UNIQUE, full_name text)',
+  );
   await client.query(
     'CREATE TABLE ' + q('customers') +
       ' (id serial PRIMARY KEY, owner uuid NOT NULL, name text NOT NULL, email text NOT NULL, phone text)',
@@ -116,12 +120,19 @@ function must(condition, what) {
     must(/customers/.test(first.out), 'it names the table with the rule that lets everyone through');
     must(/integrations/.test(first.out), 'it names the table with no protection at all');
     must(/access tokens/.test(first.out), 'it says an api_key column is access tokens');
+    // Both attacks, through one command: the open door and the duplicate.
+    must(/exist twice/.test(first.out), 'it ran the collision attack too, not only impersonation');
+    must(!/profiles/.test(first.out), 'it reported the table that was done properly');
     must(fs.existsSync(SAVED), 'it saved the run so a re-check has something to compare against');
     const saved = JSON.parse(fs.readFileSync(SAVED, 'utf8'));
-    must(saved.findings.length === 2, 'it saved 2 findings, got ' + saved.findings.length);
-    must((saved.checked || []).length > 0, 'it saved which tables were actually tested');
+    must(saved.findings.length === 3, 'it saved 3 findings, got ' + saved.findings.length);
+    must((saved.attempted || []).length > 0, 'it saved which attacks were actually run');
+    must(
+      (saved.attempted || []).some((key) => /^duplicated:/.test(key)),
+      'it saved the collision attacks it ran, not only the impersonation ones',
+    );
 
-    // The person does what the pasted prompt told them to do.
+    // The person does what the pasted prompts told them to do.
     const q = (t) => schema.quote(appA) + '.' + schema.quote(t);
     await client.query('DROP POLICY read_customers ON ' + q('customers'));
     await client.query(
@@ -132,12 +143,13 @@ function must(condition, what) {
       'CREATE POLICY own_integrations ON ' + q('integrations') +
         ' FOR SELECT TO authenticated USING (owner = auth.uid())',
     );
+    await client.query('ALTER TABLE ' + q('integrations') + ' ADD CONSTRAINT integrations_api_key_key UNIQUE (api_key)');
 
     console.log('');
     console.log('  --- re-check after a real fix ---');
     const again = cli([appA, '--recheck']);
     must(again.code === 0, 're-check exits 0 when everything is genuinely closed, got ' + again.code);
-    must(/2 problems are fixed/.test(again.out), 'it says both are fixed');
+    must(/3 problems are fixed/.test(again.out), 'it says all three are fixed');
     must(/Kryptheon Verified/.test(again.out), 'it hands out the badge');
     must(!/could NOT confirm/.test(again.out), 'it does not hedge on a fix it proved');
     must(!/still open/.test(again.out), 'it does not report anything still open');
@@ -154,7 +166,7 @@ function must(condition, what) {
     console.log('');
     console.log('  --- first scan on a second app ---');
     const first = cli([appB]);
-    must(first.code === 1, 'it found the same two problems');
+    must(first.code === 1, 'it found the same three problems');
 
     // One table genuinely fixed, the other one deleted rather than secured.
     const q = (t) => schema.quote(appB) + '.' + schema.quote(t);
@@ -171,8 +183,11 @@ function must(condition, what) {
     must(/could NOT confirm/.test(again.out), 'it says it could not confirm');
     must(/integrations/.test(again.out), 'it names the table it could not confirm');
     must(!/Kryptheon Verified/.test(again.out), 'it withholds the badge');
-    must(!/2 problems are fixed/.test(again.out), 'it does not count the dropped table as fixed');
+    must(!/3 problems are fixed/.test(again.out), 'it does not count the dropped table as fixed');
     must(/1 problem is fixed/.test(again.out), 'it still credits the one real fix');
+    // Two findings lived on that table - the open door and the duplicate
+    // api_key - and dropping it confirms neither.
+    must(/2 I could NOT confirm/.test(again.out), 'it does not account for both findings on the dropped table');
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(appB) + ' CASCADE');
     try { fs.unlinkSync(SAVED); } catch (err) { /* already gone */ }

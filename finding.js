@@ -72,6 +72,14 @@ function listOf(items) {
  * should be fixed - there is no such thing as a low finding here.
  */
 function severityOf(finding, contents) {
+  if (finding.kind === 'duplicated') {
+    // Judged by what the duplicate lets somebody do, not by what else sits in
+    // the table. A second row holding the same session token is critical even
+    // if the table has nothing personal in it at all.
+    if (finding.expectation === 'credential') return 'CRITICAL';
+    if (finding.expectation === 'identity') return 'CRITICAL';
+    return 'HIGH';
+  }
   if (contents.secrets.length) return 'CRITICAL';
   if (contents.identity.length) return 'CRITICAL';
   return 'HIGH';
@@ -90,6 +98,16 @@ function severityOf(finding, contents) {
  * one it is saves them looking in the wrong place.
  */
 function causeOf(finding) {
+  if (finding.kind === 'duplicated') {
+    return {
+      short: 'nothing in the database makes it unique',
+      long:
+        'There is no unique constraint and no unique index on this column, so ' +
+        'the database has no way to refuse the second one. Checking in your app ' +
+        'code before inserting does not close this: between the check and the ' +
+        'insert, the other request has already been accepted.',
+    };
+  }
   if (finding.rlsEnabled) {
     return {
       short: 'the rule that guards it lets everybody through',
@@ -108,6 +126,9 @@ function causeOf(finding) {
 }
 
 function headlineFor(finding) {
+  if (finding.kind === 'duplicated') {
+    return 'Your ' + finding.table + ' table lets the same ' + finding.column + ' exist twice.';
+  }
   if (finding.kind === 'exposed') {
     return 'Your ' + finding.table + ' table can be read by anyone.';
   }
@@ -117,9 +138,27 @@ function headlineFor(finding) {
   return 'Your ' + finding.table + ' table lets one customer read another one\'s rows.';
 }
 
+/** What a duplicate of this particular column actually costs the person. */
+const COST_OF_A_DUPLICATE = {
+  credential: 'A credential that matches more than one row means one secret opens more than one account.',
+  identity: 'Two accounts can answer to the same login, and a password reset has to guess which one to send.',
+  code: 'A one-time code that can exist twice can be redeemed twice.',
+};
+
 function bodyFor(finding, contents) {
   const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
   const rowWord = finding.readable === 1 ? 'row' : 'rows';
+
+  if (finding.kind === 'duplicated') {
+    // Said as what was done, not as what it implies. Two connections, one
+    // moment, both accepted, and here is the count afterwards.
+    return (
+      'I opened two connections to a copy of your app and inserted the same ' +
+      finding.column + ' from both at the same moment. Both were accepted, so there are ' +
+      'now ' + finding.copies + ' rows holding the identical value. ' +
+      (COST_OF_A_DUPLICATE[finding.expectation] || '')
+    ).trim();
+  }
 
   if (finding.kind === 'exposed') {
     return (
@@ -165,19 +204,38 @@ function fixPromptFor(finding) {
   const cause = causeOf(finding);
   const owner = finding.owner ? '"' + finding.owner + '"' : 'the column that says who each row belongs to';
 
-  const lines = [
-    'My app has a security problem.',
-    '',
-    'The "' + finding.table + '" table ' +
-      (finding.kind === 'exposed'
-        ? 'can be read by anyone who is not logged in, because ' + cause.short + '.'
-        : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
-    '',
-    'Fix it so a person can only read their own rows: compare ' + owner +
-      ' against the id of the signed-in user, and make sure logged-out visitors get nothing.',
-    '',
-    'Then look for the same mistake on every other table and fix those too.',
-  ];
+  const lines = finding.kind === 'duplicated'
+    ? [
+      'My app has a security problem.',
+      '',
+      'Two rows in the "' + finding.table + '" table can hold the same "' + finding.column +
+        '". I proved it by inserting the same value from two connections at the same ' +
+        'moment, and both were accepted.',
+      '',
+      'Add a unique constraint on "' + finding.table + '"."' + finding.column +
+        '" in the database itself. Checking in application code before inserting is not ' +
+        'enough - between the check and the insert, the other request has already gone in.',
+      '',
+      // Said because the obvious fix is wrong for multi-tenant apps, and being
+      // told to drop a legitimate design would cost them more than the bug.
+      'If the same value is allowed to repeat for different owners, make the constraint ' +
+        'cover both columns together rather than leaving it off.',
+      '',
+      'Then look for the same missing constraint on every other table and fix those too.',
+    ]
+    : [
+      'My app has a security problem.',
+      '',
+      'The "' + finding.table + '" table ' +
+        (finding.kind === 'exposed'
+          ? 'can be read by anyone who is not logged in, because ' + cause.short + '.'
+          : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
+      '',
+      'Fix it so a person can only read their own rows: compare ' + owner +
+        ' against the id of the signed-in user, and make sure logged-out visitors get nothing.',
+      '',
+      'Then look for the same mistake on every other table and fix those too.',
+    ];
   // Wrapped here rather than by whoever prints it: this text is pasted into a
   // chat box as often as it is read in a terminal, and an unwrapped paragraph
   // is a wall in both.
@@ -195,11 +253,20 @@ function describe(finding) {
     severity: severityOf(finding, contents),
     table: finding.table,
     kind: finding.kind,
+    // Carried through because a table can have two different columns that each
+    // accept a duplicate, and the re-check tells one finding from another by
+    // what it is about. Without the column they would share an identity and
+    // fixing one would look like fixing both.
+    column: finding.column,
+    expectation: finding.expectation,
     headline: headlineFor(finding, contents),
     body: bodyFor(finding, contents),
     cause: cause.long,
-    proof: 'I read ' + finding.readable + ' ' + (finding.readable === 1 ? 'row' : 'rows') +
-      ' from "' + finding.table + '" that should not have been readable.',
+    proof: finding.kind === 'duplicated'
+      ? 'I created ' + finding.copies + ' rows in "' + finding.table + '" holding the same ' +
+        finding.column + '.'
+      : 'I read ' + finding.readable + ' ' + (finding.readable === 1 ? 'row' : 'rows') +
+        ' from "' + finding.table + '" that should not have been readable.',
     fixPrompt: fixPromptFor(finding),
     contents: contents,
   };
@@ -227,8 +294,10 @@ function describeAll(findings) {
     }
   }
   // Worst first, and within that the ones open to the whole internet before the
-  // ones that need an account.
-  const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (d.kind === 'exposed' ? 0 : 1);
+  // ones that need an account, and those before the ones that need two requests
+  // to arrive together.
+  const byKind = { exposed: 0, crossed: 1, duplicated: 2 };
+  const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (byKind[d.kind] === undefined ? 9 : byKind[d.kind]);
   return described.sort((a, b) => rank(a) - rank(b));
 }
 
