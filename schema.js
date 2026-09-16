@@ -150,14 +150,73 @@ async function readPolicies(client, schema) {
   return rows;
 }
 
-/** Who was granted what. A policy is irrelevant if the grant is not there. */
+/**
+ * Who was granted what. A policy is irrelevant if the grant is not there.
+ *
+ * Restricted to ordinary tables on purpose. role_table_grants also lists views
+ * and materialised views, and replaying a grant on a view the copy does not
+ * contain fails outright - which took down the scan of any app with a view in
+ * it, and almost every app has one.
+ */
 async function readGrants(client, schema) {
   const { rows } = await client.query(
-    `SELECT table_name, grantee, privilege_type
-       FROM information_schema.role_table_grants
-      WHERE table_schema = $1
-        AND grantee IN ('anon', 'authenticated', 'service_role', 'PUBLIC')
-      ORDER BY table_name, grantee, privilege_type`,
+    `SELECT g.table_name, g.grantee, g.privilege_type
+       FROM information_schema.role_table_grants g
+       JOIN pg_class c ON c.relname = g.table_name
+       JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = g.table_schema
+      WHERE g.table_schema = $1
+        AND c.relkind = 'r'
+        AND g.grantee IN ('anon', 'authenticated', 'service_role', 'PUBLIC')
+      ORDER BY g.table_name, g.grantee, g.privilege_type`,
+    [schema],
+  );
+  return rows;
+}
+
+/**
+ * Views, which are a door of their own.
+ *
+ * A view runs with its creator's rights unless it says otherwise, so a view
+ * over a table that row level security protects hands out every row in that
+ * table to anyone allowed to read the view. The policy is intact, the
+ * dashboard is green, and the data is gone. `security_invoker` is what turns
+ * that off, and it lives in reloptions, so it is copied with the view.
+ */
+async function readViews(client, schema) {
+  const { rows } = await client.query(
+    `SELECT c.relname AS name,
+            pg_get_viewdef(c.oid, true) AS definition,
+            c.relkind = 'm' AS materialised,
+            array_to_string(c.reloptions, ', ') AS options
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = $1 AND c.relkind IN ('v', 'm')
+      ORDER BY c.relname`,
+    [schema],
+  );
+  return rows;
+}
+
+/** Views, with the columns they expose, so a finding can name what leaked. */
+async function readViewsWithColumns(client, schema) {
+  const views = await readViews(client, schema);
+  for (const view of views) {
+    view.columns = await readColumns(client, schema, view.name);
+  }
+  return views;
+}
+
+/** Who was granted what on a view. Separate, because views are created later. */
+async function readViewGrants(client, schema) {
+  const { rows } = await client.query(
+    `SELECT g.table_name, g.grantee, g.privilege_type
+       FROM information_schema.role_table_grants g
+       JOIN pg_class c ON c.relname = g.table_name
+       JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = g.table_schema
+      WHERE g.table_schema = $1
+        AND c.relkind IN ('v', 'm')
+        AND g.grantee IN ('anon', 'authenticated', 'service_role', 'PUBLIC')
+      ORDER BY g.table_name, g.grantee, g.privilege_type`,
     [schema],
   );
   return rows;
@@ -176,14 +235,25 @@ function referenceIn(definition) {
   };
 }
 
-/** The name a stand-in for an outside table is given inside the copy. */
-function stubNameFor(refSchema, refTable) {
-  return 'kn_ext__' + refSchema + '__' + refTable;
-}
-
-/** Is this one of our stand-ins rather than something the customer wrote? */
-function isStub(name) {
-  return /^kn_ext__/.test(String(name));
+/**
+ * The name a stand-in for an outside table is given inside the copy.
+ *
+ * `taken` is every name the customer already uses, and the stand-in keeps
+ * moving until it clashes with none of them. Identifying our own tables by
+ * their prefix alone meant a customer table that happened to start with the
+ * same letters was quietly dropped from every attack - a real hole reported as
+ * nothing at all, which is the failure this whole program exists to avoid.
+ */
+function stubNameFor(refSchema, refTable, taken) {
+  const used = new Set(taken || []);
+  const base = 'kn_ext__' + refSchema + '__' + refTable;
+  let name = base;
+  let nth = 2;
+  while (used.has(name)) {
+    name = base + '__' + nth;
+    nth += 1;
+  }
+  return name;
 }
 
 /**
@@ -233,7 +303,7 @@ async function readExternalTargets(client, schema, tables) {
       schema: entry.schema,
       table: entry.table,
       columns: columns,
-      stub: stubNameFor(entry.schema, entry.table),
+      stub: stubNameFor(entry.schema, entry.table, tables.map((t) => t.name)),
       wanted: Array.from(entry.columns),
     });
   }
@@ -284,6 +354,8 @@ async function readSchema(client, schema) {
     policies: await readPolicies(client, schema),
     grants: await readGrants(client, schema),
     indexes: await readIndexes(client, schema),
+    views: await readViewsWithColumns(client, schema),
+    viewGrants: await readViewGrants(client, schema),
     external: external,
     unsupported: unsupported,
   };
@@ -485,6 +557,27 @@ async function writeSchema(client, plan, target) {
     statements.push(rewriteSchemaRefs(index.definition, plan.schema, target));
   }
 
+  // Views last, because they read from the tables above. Copied rather than
+  // skipped because a view is a way into a table: it runs with its creator
+  // rights unless it says security_invoker, so a view over a protected table
+  // hands out every row in it. Leaving views out meant never looking at that
+  // door at all.
+  for (const view of plan.views || []) {
+    const body = rewriteExternalRefs(rewriteSchemaRefs(view.definition, plan.schema, target), plan.external, target);
+    const options = view.options ? ' WITH (' + view.options + ')' : '';
+    statements.push(
+      'CREATE ' + (view.materialised ? 'MATERIALIZED VIEW ' : 'VIEW ') +
+        quote(target) + '.' + quote(view.name) + options + ' AS ' + body,
+    );
+  }
+
+  for (const grant of plan.viewGrants || []) {
+    const who = grant.grantee === 'PUBLIC' ? 'PUBLIC' : quote(grant.grantee);
+    statements.push(
+      'GRANT ' + grant.privilege_type + ' ON ' + quote(target) + '.' + quote(grant.table_name) + ' TO ' + who,
+    );
+  }
+
   // The copy needs the roles PostgREST switches into to be able to reach it.
   // Granted on the copy's own schema and nowhere else.
   //
@@ -553,7 +646,8 @@ function diffSchemas(source, copy) {
   // The stand-ins exist only in the copy, by design. Comparing them against
   // an original that never had them would report every Supabase app as a
   // copy that came out wrong.
-  const mine = (list) => list.filter((t) => !isStub(t.name));
+  const standIns = new Set((source.external || []).map((e) => e.stub));
+  const mine = (list) => list.filter((t) => !standIns.has(t.name));
   const named = (list) => mine(list).map((t) => t.name).sort().join(', ');
   if (named(source.tables) !== named(copy.tables)) {
     differences.push('tables differ: ' + named(source.tables) + '  vs  ' + named(copy.tables));
@@ -630,10 +724,10 @@ module.exports = {
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,
   readIndexes: readIndexes,
+  readViews: readViews,
   readExternalTargets: readExternalTargets,
   referenceIn: referenceIn,
   stubNameFor: stubNameFor,
-  isStub: isStub,
   IDENTITIES: IDENTITIES,
   quote: quote,
   roleList: roleList,

@@ -98,6 +98,19 @@ function severityOf(finding, contents) {
  * one it is saves them looking in the wrong place.
  */
 function causeOf(finding) {
+  if (finding.isView) {
+    // The one people are caught by, because everything looks right. The table
+    // is protected, the policy is correct, the dashboard is green - and the
+    // view hands the rows out anyway.
+    return {
+      short: 'a view reads with its creator\'s rights, not the visitor\'s',
+      long:
+        'This is a view, and a view runs as whoever created it unless it is ' +
+        'told otherwise. So any row level security on the tables underneath is ' +
+        'checked against the creator, not against the person asking - and the ' +
+        'rules you wrote on those tables do not apply here at all.',
+    };
+  }
   if (finding.kind === 'duplicated') {
     return {
       short: 'nothing in the database makes it unique',
@@ -130,7 +143,7 @@ function headlineFor(finding) {
     return 'Your ' + finding.table + ' table lets the same ' + finding.column + ' exist twice.';
   }
   if (finding.kind === 'exposed') {
-    return 'Your ' + finding.table + ' table can be read by anyone.';
+    return 'Your ' + finding.table + ' ' + (finding.isView ? 'view' : 'table') + ' can be read by anyone.';
   }
   // The table name goes in front of the sentence rather than inside it. Put
   // inside, a table called `customers` produced "One customer can read another
@@ -223,19 +236,33 @@ function fixPromptFor(finding) {
       '',
       'Then look for the same missing constraint on every other table and fix those too.',
     ]
-    : [
-      'My app has a security problem.',
-      '',
-      'The "' + finding.table + '" table ' +
-        (finding.kind === 'exposed'
-          ? 'can be read by anyone who is not logged in, because ' + cause.short + '.'
-          : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
-      '',
-      'Fix it so a person can only read their own rows: compare ' + owner +
-        ' against the id of the signed-in user, and make sure logged-out visitors get nothing.',
-      '',
-      'Then look for the same mistake on every other table and fix those too.',
-    ];
+    : finding.isView
+      ? [
+        'My app has a security problem.',
+        '',
+        'The "' + finding.table + '" view can be read by anyone who is not logged in. ' +
+          'A view runs with the rights of whoever created it, so the row level security ' +
+          'on the tables underneath is never checked against the person asking.',
+        '',
+        'Fix it by recreating the view with security_invoker set on, so it runs as the ' +
+          'visitor and the rules on the underlying tables apply - and make sure those ' +
+          'tables actually have those rules.',
+        '',
+        'Then check every other view in the app for the same thing.',
+      ]
+      : [
+        'My app has a security problem.',
+        '',
+        'The "' + finding.table + '" table ' +
+          (finding.kind === 'exposed'
+            ? 'can be read by anyone who is not logged in, because ' + cause.short + '.'
+            : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
+        '',
+        'Fix it so a person can only read their own rows: compare ' + owner +
+          ' against the id of the signed-in user, and make sure logged-out visitors get nothing.',
+        '',
+        'Then look for the same mistake on every other table and fix those too.',
+      ];
   // Wrapped here rather than by whoever prints it: this text is pasted into a
   // chat box as often as it is read in a terminal, and an unwrapped paragraph
   // is a wall in both.

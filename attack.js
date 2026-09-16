@@ -132,18 +132,25 @@ function allowedByCheck(table, columnName) {
   return found;
 }
 
-/** The foreign keys on a table, read out of Postgres's own wording. */
+/**
+ * The foreign keys on a table, read out of Postgres's own wording.
+ *
+ * Every column of the key, not just the first. A key over (org_id, cart_id)
+ * used to be read as though it were only org_id: the second column got an
+ * invented value, the pair pointed at no row that existed, and the table was
+ * reported as one that could not be checked.
+ */
 function foreignKeys(table) {
   const keys = [];
+  const unquote = (text) => text.trim().split('"').join('');
   for (const constraint of table.constraints || []) {
     if (constraint.kind !== 'f') continue;
     const match = /FOREIGN KEY \(([^)]+)\) REFERENCES ([^(]+)\(([^)]+)\)/i.exec(constraint.definition);
     if (!match) continue;
-    const refTable = match[2].trim().split('.').pop().split('"').join('');
     keys.push({
-      column: match[1].split(',')[0].trim().split('"').join(''),
-      refTable: refTable,
-      refColumn: match[3].split(',')[0].trim().split('"').join(''),
+      columns: match[1].split(',').map(unquote),
+      refTable: unquote(match[2].split('.').pop()),
+      refColumns: match[3].split(',').map(unquote),
     });
   }
   return keys;
@@ -180,13 +187,21 @@ function dependencyOrder(tables) {
   return ordered;
 }
 
-/** A value already present in the parent table, so a foreign key is satisfied. */
-async function existingValue(client, schema, key) {
+/**
+ * One row that is really in the parent table, so a foreign key is satisfied.
+ *
+ * The whole row, not one column of it. A composite key has to point at a pair
+ * that exists together: borrowing each column from a separate row would build
+ * a combination the parent never had.
+ */
+async function existingRow(client, schema, key) {
   try {
+    const columns = key.refColumns.map((name, i) => quote(name) + ' AS v' + i).join(', ');
     const { rows } = await client.query(
-      'SELECT ' + quote(key.refColumn) + ' AS v FROM ' + quote(schema) + '.' + quote(key.refTable) + ' LIMIT 1',
+      'SELECT ' + columns + ' FROM ' + quote(schema) + '.' + quote(key.refTable) + ' LIMIT 1',
     );
-    return rows.length ? rows[0].v : null;
+    if (!rows.length) return null;
+    return key.refColumns.map((name, i) => rows[0]['v' + i]);
   } catch (err) {
     return null;
   }
@@ -208,9 +223,22 @@ async function existingValue(client, schema, key) {
 async function rowFor(client, schema, table, person, distinct, overrides, attempt) {
   const forced = overrides || {};
   const owner = ownerColumn(table);
-  const pointsAt = new Map(foreignKeys(table).map((k) => [k.column, k]));
   const columns = [];
   const values = [];
+
+  // Every column that takes part in a foreign key, and the value it has to
+  // hold. Resolved one key at a time so that all of a composite key's columns
+  // come from the same parent row.
+  const borrowed = new Map();
+  for (const key of foreignKeys(table)) {
+    const row = await existingRow(client, schema, key);
+    if (!row) continue;
+    key.columns.forEach((name, i) => {
+      if (!borrowed.has(name)) borrowed.set(name, row[i]);
+    });
+  }
+  const partOfKey = new Set();
+  for (const key of foreignKeys(table)) key.columns.forEach((name) => partOfKey.add(name));
 
   for (const column of table.columns) {
     if (Object.prototype.hasOwnProperty.call(forced, column.name)) {
@@ -225,15 +253,13 @@ async function rowFor(client, schema, table, person, distinct, overrides, attemp
     }
     // A column pointing at another table has to hold something that is
     // actually there, whatever its type would otherwise suggest.
-    const key = pointsAt.get(column.name);
-    if (key) {
-      const borrowed = await existingValue(client, schema, key);
-      if (borrowed !== null) {
+    if (partOfKey.has(column.name)) {
+      if (borrowed.has(column.name)) {
         columns.push(column.name);
-        values.push(borrowed);
+        values.push(borrowed.get(column.name));
         continue;
       }
-      if (column.not_null) throw new Error('nothing in ' + key.refTable + ' to point ' + column.name + ' at');
+      if (column.not_null) throw new Error('nothing to point ' + column.name + ' at');
       continue;
     }
     // A generated column computes itself and refuses to be written to at all.
@@ -380,9 +406,13 @@ function rowsOwnedBy(rows, owner, person) {
  * not tell", which is the difference the whole product rests on.
  */
 function refusalMeans(message) {
-  return /permission denied for (table|relation|view|sequence)/i.test(String(message))
-    ? 'unreachable'
-    : 'untested';
+  // The multi-word kinds come first. Postgres says "permission denied for
+  // materialized view hits", and an alternation that tried `view` first would
+  // never reach it - so a matview nobody had granted was filed as untested
+  // rather than as the attack being beaten, and a correct app collected a
+  // warning it had not earned.
+  const denied = /permission denied for (materialized view|foreign table|partitioned table|table|relation|view|sequence)/i;
+  return denied.test(String(message)) ? 'unreachable' : 'untested';
 }
 
 /**
@@ -429,6 +459,7 @@ async function impersonate(client, schema, tables) {
         readable: anon.length,
         columns: Object.keys(anon[0] || {}),
         rlsEnabled: table.rlsEnabled,
+        isView: Boolean(table.isView),
       });
     }
 
@@ -471,6 +502,7 @@ module.exports = {
   valueFor: valueFor,
   allowedByCheck: allowedByCheck,
   rowFor: rowFor,
+  existingRow: existingRow,
   insertRow: insertRow,
   seed: seed,
   readAs: readAs,

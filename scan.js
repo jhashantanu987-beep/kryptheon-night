@@ -69,9 +69,26 @@ async function scan(client, sourceSchema, options) {
     // The stand-ins built for tables outside the schema belong to this tool,
     // not to the customer. Attacking them would produce findings about a table
     // that does not exist in their app.
-    const theirs = copyPlan.tables.filter((table) => !schema.isStub(table.name));
+    // Named one by one from what was actually built, not matched on a prefix.
+    // A customer table whose name merely looked like ours used to be dropped
+    // from every attack, and a table nobody attacks has nothing to report.
+    const standIns = new Set((plan.external || []).map((entry) => entry.stub));
+    const theirs = copyPlan.tables.filter((table) => !standIns.has(table.name));
     const sown = await attack.seed(client, copyName, theirs);
-    const impersonation = await attack.impersonate(client, copyName, theirs);
+
+    // Views are read but never seeded: they have no rows of their own, they
+    // show the rows of the tables underneath. That is exactly why they matter
+    // - a view runs with its creator's rights unless it says otherwise, so one
+    // over a protected table hands out every row in it while the policy sits
+    // there intact and the dashboard stays green.
+    const views = (copyPlan.views || []).map((view) => ({
+      name: view.name,
+      columns: view.columns || [],
+      constraints: [],
+      rlsEnabled: false,
+      isView: true,
+    }));
+    const impersonation = await attack.impersonate(client, copyName, theirs.concat(views));
 
     // Every attack genuinely run, named the way a finding is named. The
     // re-check needs this: a finding that disappears because its attack never
@@ -83,7 +100,13 @@ async function scan(client, sourceSchema, options) {
     // could be seeded into returns nothing to a stranger for a reason that has
     // nothing to do with being secure.
     const sownTables = new Set(sown.seeded.map((entry) => entry.table));
-    const attempted = impersonation.completed.filter((key) => sownTables.has(key.split(':')[1]));
+    // A view counts as tested once anything underneath it has rows, since that
+    // is what it has to show.
+    const viewNames = new Set(views.map((view) => view.name));
+    const attempted = impersonation.completed.filter((key) => {
+      const name = key.split(':')[1];
+      return sownTables.has(name) || (viewNames.has(name) && sown.seeded.length > 0);
+    });
 
     // Surfaced, not swallowed. A table with no row in it reads as a safe
     // table, so the one thing that must never happen is reporting an app as
@@ -94,7 +117,7 @@ async function scan(client, sourceSchema, options) {
     // that role decided nothing at all, and zero rows back from a failed query
     // looks exactly like zero rows back from a table that held.
     for (const stuck of impersonation.blocked) {
-      if (!sownTables.has(stuck.table)) continue;
+      if (!sownTables.has(stuck.table) && !viewNames.has(stuck.table)) continue;
       notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });
     }
 
