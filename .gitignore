@@ -6,3 +6,7 @@ node_modules/
 .env
 .env.local
 *.tgz
+
+# A saved run is a list of one app's tables and exactly where it is weak.
+# That is the last thing that should ever reach a repo.
+.kryptheon-last.json

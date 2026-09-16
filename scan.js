@@ -11,10 +11,18 @@
 //   node scan.js "<connection string>" <schema>
 //   node scan.js "<connection string>" <schema> --recheck
 
+const fs = require('fs');
+const path = require('path');
 const { Client } = require('pg');
 const schema = require('./schema.js');
 const attack = require('./attack.js');
 const finding = require('./finding.js');
+const recheck = require('./recheck.js');
+
+// Where the last run is kept so the next one has something to compare against.
+// Beside the person's own project, not in a temp folder, because a re-check a
+// week later has to find it.
+const LAST_RUN = '.kryptheon-last.json';
 
 const line = (text) => process.stdout.write(text + '\n');
 
@@ -67,6 +75,11 @@ async function scan(client, sourceSchema, options) {
       // table, so the one thing that must never happen is reporting an app
       // as clear when part of it was never actually tried.
       notChecked: sown.skipped,
+      // Which tables were genuinely tried. The re-check needs this: a finding
+      // that disappears because its table could not be tested this time is
+      // not a finding that was fixed, and without this list the two are
+      // indistinguishable.
+      checked: sown.seeded.map((entry) => entry.table),
       findings: finding.describeAll(raw),
     };
   } finally {
@@ -76,6 +89,33 @@ async function scan(client, sourceSchema, options) {
     } catch (err) {
       line('  WARNING: the copy ' + copyName + ' could not be deleted: ' + err.message);
     }
+  }
+}
+
+/** The last run, or null if there has not been one worth keeping. */
+function loadLastRun(file) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return saved && Array.isArray(saved.findings) ? saved : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Keeps a run so the next one can be measured against it.
+ *
+ * A run that stopped is never saved. Overwriting a real list of problems with
+ * an empty one from a run that fell over would quietly lose every finding, and
+ * the re-check after that would have nothing to hold anybody to.
+ */
+function saveRun(file, result) {
+  if (result.stopped) return;
+  try {
+    fs.writeFileSync(file, JSON.stringify(result, null, 2));
+  } catch (err) {
+    line('  WARNING: I could not save this run to ' + file + ', so tomorrow I');
+    line('  will have nothing to compare against: ' + err.message);
   }
 }
 
@@ -168,11 +208,26 @@ function wrap(text, width) {
 }
 
 async function main() {
-  const connection = process.argv[2];
-  const target = process.argv[3];
+  const args = process.argv.slice(2).filter((arg) => arg !== '--recheck');
+  const again = process.argv.includes('--recheck');
+  const connection = args[0];
+  const target = args[1];
   if (!connection || !target) {
     console.error('');
-    console.error('  node scan.js "<connection string>" <schema>');
+    console.error('  node scan.js "<connection string>" <schema> [--recheck]');
+    console.error('');
+    process.exit(2);
+  }
+
+  const file = path.resolve(LAST_RUN);
+  const before = again ? loadLastRun(file) : null;
+  if (again && !before) {
+    // Running a fresh scan and calling it a re-check would report every
+    // problem as new and confirm nothing, which reads like an answer.
+    console.error('');
+    console.error('  There is no earlier run here to compare against.');
+    console.error('');
+    console.error('  Run it without --recheck first, fix what it finds, then come back.');
     console.error('');
     process.exit(2);
   }
@@ -181,8 +236,21 @@ async function main() {
   await client.connect();
   try {
     const result = await scan(client, target);
-    report(result);
-    process.exitCode = result.findings.length ? 1 : 0;
+
+    if (!before) {
+      report(result);
+      saveRun(file, result);
+      process.exitCode = result.findings.length ? 1 : 0;
+      return;
+    }
+
+    const verdict = recheck.compare(before, result);
+    recheck.describe(verdict).forEach(line);
+    recheck.badgeLines(verdict, result.attacksRun || 0).forEach(line);
+    // The verdict says what changed; this says what to do about what did not.
+    if (result.findings.length) report(result);
+    saveRun(file, result);
+    process.exitCode = verdict.allClear ? 0 : 1;
   } finally {
     await client.end();
   }
@@ -197,4 +265,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { scan: scan, report: report, wrap: wrap };
+module.exports = { scan: scan, report: report, wrap: wrap, loadLastRun: loadLastRun, saveRun: saveRun };
