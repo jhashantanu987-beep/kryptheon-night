@@ -1,0 +1,17 @@
+{
+  "name": "kryptheon-night",
+  "version": "0.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Attacks a copy of your backend and reports what it found, in plain English.",
+  "scripts": {
+    "check": "node finding.check.js && node schema.check.js",
+    "check:report": "node finding.check.js",
+    "check:copy": "node schema.check.js",
+    "probe": "node probe-rls.js",
+    "demo": "node demo.js"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  }
+}

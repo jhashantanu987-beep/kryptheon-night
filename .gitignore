@@ -1,0 +1,8 @@
+# Installed, not authored
+node_modules/
+
+# A connection string is a credential. It belongs in the environment, never
+# in a file - and never in a repo whose whole subject is other people's data.
+.env
+.env.local
+*.tgz

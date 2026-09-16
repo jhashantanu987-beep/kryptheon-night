@@ -1,0 +1,256 @@
+// Turning what the attack saw into something a person can act on.
+//
+// The detection is the easy tenth. A builder who cannot read code does not buy
+// "crossed:customers:1" - they buy knowing their customer list is open, seeing
+// it happen, and having one thing to paste that closes it.
+//
+// The rule everything here follows: never say more than was actually seen. If
+// the attack read a table with an email column in it, say email. If it did not,
+// do not reach for "personal details" because it sounds more urgent. A report
+// that overstates once is a report nobody trusts again, and trust is the entire
+// product - the re-check at the end is worth exactly as much as the first
+// report was honest.
+
+/* --------------------------------------------------------------------------
+   What was in the table.
+-------------------------------------------------------------------------- */
+
+// Things that identify a person. Matched on whole words so that `company_name`
+// counts and `renamed_at` does not.
+const IDENTITY = [
+  [/\b(email|e_mail|mail)\b/i, 'email addresses'],
+  [/\b(phone|mobile|contact_number|telephone)\b/i, 'phone numbers'],
+  [/\b(full_name|first_name|last_name|given_name|surname|name)\b/i, 'names'],
+  [/\b(address|street|city|postcode|zip|pincode)\b/i, 'addresses'],
+  [/\b(dob|date_of_birth|birth_date|birthday)\b/i, 'dates of birth'],
+];
+
+// Things that are worse than identifying - they let somebody act as the person,
+// or take money.
+const SECRETS = [
+  [/\b(password|passwd|pass_hash|password_hash)\b/i, 'passwords'],
+  [/\b(token|api_key|apikey|secret|private_key|access_key)\b/i, 'access tokens'],
+  [/\b(card|card_number|cvv|iban|account_number|upi)\b/i, 'payment details'],
+];
+
+const MONEY = [/\b(amount|total|price|balance|salary|revenue|invoice)\b/i, 'amounts of money'];
+
+function matched(columns, table) {
+  const names = columns || [];
+  const found = [];
+  for (const [pattern, label] of table) {
+    if (names.some((column) => pattern.test(String(column)))) found.push(label);
+  }
+  return found;
+}
+
+/** What a table holds, in the words a person would use. */
+function readContents(columns) {
+  const identity = matched(columns, IDENTITY);
+  const secrets = matched(columns, SECRETS);
+  const money = matched(columns, [MONEY]);
+  return { identity: identity, secrets: secrets, money: money };
+}
+
+/** A list, written the way a person writes one. */
+function listOf(items) {
+  const list = items.filter(Boolean);
+  if (!list.length) return '';
+  if (list.length === 1) return list[0];
+  return list.slice(0, -1).join(', ') + ' and ' + list[list.length - 1];
+}
+
+/* --------------------------------------------------------------------------
+   How bad it is.
+-------------------------------------------------------------------------- */
+
+/**
+ * Severity, decided by what could be read rather than by how it was read.
+ *
+ * Only two levels on purpose. A scale of five invites the reader to skim past
+ * the bottom three, and everything the night shift reports is something that
+ * should be fixed - there is no such thing as a low finding here.
+ */
+function severityOf(finding, contents) {
+  if (contents.secrets.length) return 'CRITICAL';
+  if (contents.identity.length) return 'CRITICAL';
+  return 'HIGH';
+}
+
+/* --------------------------------------------------------------------------
+   Saying it.
+-------------------------------------------------------------------------- */
+
+/**
+ * Why the door was open - and these two are genuinely different problems.
+ *
+ * Row level security switched off is an oversight. Switched on with a policy
+ * that lets everybody through is worse, because the dashboard shows the table
+ * as protected and the person has already been told they are safe. Saying which
+ * one it is saves them looking in the wrong place.
+ */
+function causeOf(finding) {
+  if (finding.rlsEnabled) {
+    return {
+      short: 'the rule that guards it lets everybody through',
+      long:
+        'The table has row level security switched on, so it looks protected, ' +
+        'but the rule attached to it allows every request. That is why nothing ' +
+        'in your dashboard flags it.',
+    };
+  }
+  return {
+    short: 'it has no protection switched on at all',
+    long:
+      'Row level security has never been switched on for this table, so every ' +
+      'rule you might have written elsewhere does not apply to it.',
+  };
+}
+
+function headlineFor(finding) {
+  if (finding.kind === 'exposed') {
+    return 'Your ' + finding.table + ' table can be read by anyone.';
+  }
+  // The table name goes in front of the sentence rather than inside it. Put
+  // inside, a table called `customers` produced "One customer can read another
+  // customer's customers", which is the kind of line that loses a reader.
+  return 'Your ' + finding.table + ' table lets one customer read another one\'s rows.';
+}
+
+function bodyFor(finding, contents) {
+  const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
+  const rowWord = finding.readable === 1 ? 'row' : 'rows';
+
+  if (finding.kind === 'exposed') {
+    return (
+      'Anyone on the internet, without logging in and without an account, can read ' +
+      'this table. I did it myself just now and got back ' + finding.readable + ' ' + rowWord +
+      (holds ? ', including ' + holds : '') + '.'
+    );
+  }
+  return (
+    'Signed in as one customer, I asked for another customer\'s rows and got ' +
+    finding.readable + ' of them back' + (holds ? ', including ' + holds : '') +
+    '. Every customer you have can do this to every other customer.'
+  );
+}
+
+/**
+ * The thing they paste.
+ *
+ * Written to the tool they already use, which means it has to carry its own
+ * context - the assistant on the other end has not seen any of this. It names
+ * the table, says what is wrong in terms of the code rather than the symptom,
+ * and asks for the same mistake to be swept up elsewhere, because it is almost
+ * never in only one place.
+ */
+/** Wraps one paragraph to a width that reads in a chat box and a terminal. */
+function wrapTo(text, width) {
+  const words = String(text).split(/\s+/);
+  const out = [];
+  let current = '';
+  for (const word of words) {
+    if ((current + ' ' + word).trim().length > width) {
+      out.push(current.trim());
+      current = word;
+    } else {
+      current = (current + ' ' + word).trim();
+    }
+  }
+  if (current) out.push(current.trim());
+  return out;
+}
+
+function fixPromptFor(finding) {
+  const cause = causeOf(finding);
+  const owner = finding.owner ? '"' + finding.owner + '"' : 'the column that says who each row belongs to';
+
+  const lines = [
+    'My app has a security problem.',
+    '',
+    'The "' + finding.table + '" table ' +
+      (finding.kind === 'exposed'
+        ? 'can be read by anyone who is not logged in, because ' + cause.short + '.'
+        : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
+    '',
+    'Fix it so a person can only read their own rows: compare ' + owner +
+      ' against the id of the signed-in user, and make sure logged-out visitors get nothing.',
+    '',
+    'Then look for the same mistake on every other table and fix those too.',
+  ];
+  // Wrapped here rather than by whoever prints it: this text is pasted into a
+  // chat box as often as it is read in a terminal, and an unwrapped paragraph
+  // is a wall in both.
+  return lines
+    .map((paragraph) => (paragraph ? wrapTo(paragraph, 72) : ['']))
+    .reduce((all, part) => all.concat(part), [])
+    .join('\n');
+}
+
+/** Everything the report needs about one thing the attack found. */
+function describe(finding) {
+  const contents = readContents(finding.columns);
+  const cause = causeOf(finding);
+  return {
+    severity: severityOf(finding, contents),
+    table: finding.table,
+    kind: finding.kind,
+    headline: headlineFor(finding, contents),
+    body: bodyFor(finding, contents),
+    cause: cause.long,
+    proof: 'I read ' + finding.readable + ' ' + (finding.readable === 1 ? 'row' : 'rows') +
+      ' from "' + finding.table + '" that should not have been readable.',
+    fixPrompt: fixPromptFor(finding),
+    contents: contents,
+  };
+}
+
+/** The whole report, in the order a person should read it. */
+function describeAll(findings) {
+  // A table anyone can read is also, necessarily, a table one customer can read
+  // of another. Reporting both puts the same table on screen twice and turns
+  // two problems into a list of three that reads like a mistake. The public one
+  // is kept, and it carries the rest.
+  const raw = findings || [];
+  const publiclyOpen = new Set(raw.filter((f) => f.kind === 'exposed').map((f) => f.table));
+  const described = raw
+    .filter((f) => !(f.kind === 'crossed' && publiclyOpen.has(f.table)))
+    .map((f) =>
+      Object.assign(describe(f), {
+        alsoCrossed:
+          f.kind === 'exposed' && raw.some((o) => o.kind === 'crossed' && o.table === f.table),
+      }),
+    );
+  for (const item of described) {
+    if (item.alsoCrossed) {
+      item.body += ' Your signed-in customers can read each other\'s rows for the same reason.';
+    }
+  }
+  // Worst first, and within that the ones open to the whole internet before the
+  // ones that need an account.
+  const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (d.kind === 'exposed' ? 0 : 1);
+  return described.sort((a, b) => rank(a) - rank(b));
+}
+
+/** What is printed when a run finds nothing. Silence would read as a failure. */
+function allClearLines(attacksRun) {
+  return [
+    '',
+    '  Nothing got through.',
+    '',
+    '  I ran ' + attacksRun + ' ' + (attacksRun === 1 ? 'attack' : 'attacks') + ' against a copy of your app',
+    '  and every one of them was refused. Your data held.',
+    '',
+  ];
+}
+
+module.exports = {
+  readContents: readContents,
+  severityOf: severityOf,
+  causeOf: causeOf,
+  describe: describe,
+  describeAll: describeAll,
+  fixPromptFor: fixPromptFor,
+  allClearLines: allClearLines,
+  listOf: listOf,
+};
