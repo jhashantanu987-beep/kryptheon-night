@@ -51,8 +51,27 @@ async function readColumns(client, schema, table) {
     `SELECT a.attname AS name,
             format_type(a.atttypid, a.atttypmod) AS type,
             a.attnotnull AS not_null,
-            pg_get_expr(d.adbin, d.adrelid) AS default_expr
+            pg_get_expr(d.adbin, d.adrelid) AS default_expr,
+            -- 's' for a stored generated column. Its value is computed from the
+            -- others, so it can neither be given a DEFAULT nor be inserted
+            -- into; treating it as an ordinary column crashed the copy outright.
+            NULLIF(a.attgenerated, '') AS generated,
+            a.attidentity <> '' AS identity,
+            -- What can legally go in here, where the type itself says so. An
+            -- enum column takes one of a fixed list and nothing else, and a
+            -- generated test string is not on that list.
+            -- Cast to text[] on purpose. array_agg over enumlabel produces
+            -- name[], which node-postgres has no parser for, so it arrives as
+            -- the raw string "{new,paid,shipped}" - and the first "label" is
+            -- then the character "{". Exactly what pg_policies.roles did.
+            (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder)
+               FROM pg_enum e WHERE e.enumtypid = t.oid) AS enum_labels,
+            -- A domain is a type with a rule attached. The rule cannot be
+            -- guessed at, but the type underneath it can be used.
+            CASE WHEN t.typtype = 'd' THEN format_type(t.typbasetype, a.atttypmod) END AS base_type,
+            t.typcategory = 'A' AS is_array
        FROM pg_attribute a
+       JOIN pg_type t ON t.oid = a.atttypid
        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
       WHERE a.attrelid = format('%I.%I', $1::text, $2::text)::regclass
         AND a.attnum > 0
@@ -393,8 +412,17 @@ async function writeSchema(client, plan, target) {
     const columns = table.columns.map((column) => {
       const parts = [quote(column.name), column.type];
       const fallback = rewriteSchemaRefs(column.default_expr, plan.schema, target);
-      if (fallback) parts.push('DEFAULT ' + fallback);
-      if (column.not_null) parts.push('NOT NULL');
+      if (column.generated) {
+        // A stored generated column carries its expression in default_expr, and
+        // replaying that as a DEFAULT is a syntax error - "cannot use column
+        // reference in DEFAULT expression" - which took the whole scan down.
+        parts.push('GENERATED ALWAYS AS (' + fallback + ') STORED');
+      } else if (column.identity) {
+        parts.push('GENERATED ALWAYS AS IDENTITY');
+      } else if (fallback) {
+        parts.push('DEFAULT ' + fallback);
+      }
+      if (column.not_null && !column.generated && !column.identity) parts.push('NOT NULL');
       return parts.join(' ');
     });
 

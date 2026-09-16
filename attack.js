@@ -56,16 +56,80 @@ function fitTo(text, type) {
  * because a narrow varchar truncates the end, and two rows truncated to the
  * same string is that bug all over again.
  */
-function valueFor(column, owner, distinct) {
-  const type = String(column.type).toLowerCase();
+function valueFor(column, owner, distinct, attempt) {
+  // A domain is somebody's own type with a rule bolted on. The rule cannot be
+  // guessed at from here, but the type underneath it can be filled in.
+  const type = String(column.base_type || column.type).toLowerCase();
   const tag = distinct === undefined || distinct === null ? '' : String(distinct);
   const step = Number(tag) || 0;
+
+  // An enum accepts one of a fixed list and nothing else. Every generated
+  // string was rejected, and the table went down as "not checked".
+  //
+  // Insisting on a real array rather than accepting anything with a length:
+  // the labels arrived once as the string "{new,paid,shipped}", whose first
+  // element is the character "{", and that is a value the database rejects
+  // just as firmly while looking like the code is working.
+  if (Array.isArray(column.enum_labels) && column.enum_labels.length) return column.enum_labels[0];
+  // Anything at all is allowed in an empty array, whatever the element type.
+  if (column.is_array || /\[\]$/.test(type)) return '{}';
+
   if (type === 'uuid') return owner;
-  if (/^(integer|bigint|smallint|numeric|decimal|real|double)/.test(type)) return 1 + step;
+  if (/^(integer|bigint|smallint|numeric|decimal|real|double|money)/.test(type)) return 1 + step;
   if (/^bool/.test(type)) return true;
   if (/^(timestamp|date)/.test(type)) return new Date().toISOString();
+  if (/^time/.test(type)) return '12:00:00';
+  if (/^interval/.test(type)) return '1 day';
   if (/^json/.test(type)) return '{}';
-  return fitTo(tag ? tag + ' kryptheon test' : 'kryptheon test', type);
+  if (/^(inet|cidr)/.test(type)) return '192.0.2.' + (1 + step);
+  if (/^macaddr8/.test(type)) return '08:00:2b:01:02:03:04:0' + (5 + step);
+  if (/^macaddr/.test(type)) return '08:00:2b:01:02:0' + (3 + step);
+  if (/^(tsvector|tsquery)/.test(type)) return 'kryptheon';
+  if (/^bytea/.test(type)) return Buffer.from('kryptheon');
+  if (/^xml/.test(type)) return '<kryptheon/>';
+  if (/^bit/.test(type)) return '0';
+  if (/^(point|line|lseg|box|path|polygon|circle)/.test(type)) return '(0,0)';
+
+  // Text is where the rules live that cannot be read: a domain that insists on
+  // an @, a CHECK on a length, a regex for a product code. Rather than pretend
+  // to understand them, the seeder works down a short ladder of shapes and
+  // keeps whichever one the database accepts.
+  const shapes = [
+    tag ? tag + ' kryptheon test' : 'kryptheon test',
+    'kryptheon' + (tag || '') + '@example.com',
+    'KN' + (tag || '1'),
+    String(step + 1),
+    'https://example.com/kryptheon',
+  ];
+  return fitTo(shapes[Math.min(Math.max(attempt || 0, 0), shapes.length - 1)], type);
+}
+
+/**
+ * Values a CHECK constraint will actually accept for one column.
+ *
+ * `status text CHECK (status IN ('open','closed'))` is one of the most common
+ * things anyone writes, and Postgres stores it as
+ * `CHECK ((status = ANY (ARRAY['open'::text, 'closed'::text])))`. Reading the
+ * literals back out turns a table that could never be seeded into one that can.
+ *
+ * Only this one shape is understood, deliberately. A CHECK can contain
+ * anything, and pretending to satisfy an arbitrary one would mean inventing
+ * rows that the app itself would reject.
+ */
+function allowedByCheck(table, columnName) {
+  const found = [];
+  const escaped = String(columnName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const anyOf = new RegExp('\\b' + escaped + '\\b[^)]*?=\\s*ANY\\s*\\(\\s*ARRAY\\[([^\\]]*)\\]', 'i');
+  for (const constraint of table.constraints || []) {
+    if (constraint.kind !== 'c') continue;
+    const match = anyOf.exec(String(constraint.definition));
+    if (!match) continue;
+    for (const piece of match[1].split(',')) {
+      const literal = /^\s*'((?:[^']|'')*)'/.exec(piece);
+      if (literal) found.push(literal[1].split("''").join("'"));
+    }
+  }
+  return found;
 }
 
 /** The foreign keys on a table, read out of Postgres's own wording. */
@@ -141,7 +205,7 @@ async function existingValue(client, schema, key) {
  * column elsewhere in the table would refuse the insert, and the refusal would
  * be read as the app defending itself.
  */
-async function rowFor(client, schema, table, person, distinct, overrides) {
+async function rowFor(client, schema, table, person, distinct, overrides, attempt) {
   const forced = overrides || {};
   const owner = ownerColumn(table);
   const pointsAt = new Map(foreignKeys(table).map((k) => [k.column, k]));
@@ -172,11 +236,19 @@ async function rowFor(client, schema, table, person, distinct, overrides) {
       if (column.not_null) throw new Error('nothing in ' + key.refTable + ' to point ' + column.name + ' at');
       continue;
     }
+    // A generated column computes itself and refuses to be written to at all.
+    if (column.generated || column.identity) continue;
     // Anything with a default can supply its own value.
     if (column.default_expr) continue;
     if (!column.not_null) continue;
     columns.push(column.name);
-    values.push(valueFor(column, person, distinct));
+    // A CHECK that lists what it will accept beats anything invented here.
+    const allowed = allowedByCheck(table, column.name);
+    values.push(
+      allowed.length
+        ? allowed[Math.min(Math.max(attempt || 0, 0), allowed.length - 1)]
+        : valueFor(column, person, distinct, attempt),
+    );
   }
 
   return { columns: columns, values: values };
@@ -184,13 +256,24 @@ async function rowFor(client, schema, table, person, distinct, overrides) {
 
 /** Puts a built row in. Separate so the same row can be raced against itself. */
 function insertRow(client, schema, table, row) {
+  const where = 'INSERT INTO ' + quote(schema) + '.' + quote(table);
+  // A table of nothing but an id and its defaults leaves no columns to name,
+  // and "INSERT INTO t () VALUES ()" is a syntax error. Postgres has a spelling
+  // for exactly this, and without it every settings and flags table in the
+  // world came back as one that could not be checked.
+  if (!row.columns.length) return client.query(where + ' DEFAULT VALUES');
   const placeholders = row.values.map((_, i) => '$' + (i + 1));
   return client.query(
-    'INSERT INTO ' + quote(schema) + '.' + quote(table) +
-      ' (' + row.columns.map(quote).join(', ') + ') VALUES (' + placeholders.join(', ') + ')',
+    where + ' (' + row.columns.map(quote).join(', ') + ') VALUES (' + placeholders.join(', ') + ')',
     row.values,
   );
 }
+
+// How many differently-shaped values to try before giving up on a table. The
+// rules that reject the first attempt - a domain insisting on an @, a CHECK on
+// a length - cannot be read out of the catalogue, so the only honest way to
+// satisfy them is to offer something else and see.
+const SHAPES_TO_TRY = 5;
 
 /**
  * Two rows per table: one belonging to each fake person.
@@ -215,18 +298,35 @@ async function seed(client, schema, tables) {
     // that get left open.
     const people = owner ? [USER_A, USER_B] : [USER_A];
 
-    try {
-      let nth = 0;
-      for (const person of people) {
-        nth += 1;
-        const row = await rowFor(client, schema, table, person, nth);
-        await insertRow(client, schema, table.name, row);
+    // Each attempt offers a differently-shaped set of values. A table whose
+    // rules reject all of them is reported, never quietly passed over.
+    let refused = null;
+    let landed = false;
+    for (let attempt = 0; attempt < SHAPES_TO_TRY && !landed; attempt++) {
+      try {
+        let nth = 0;
+        for (const person of people) {
+          nth += 1;
+          const row = await rowFor(client, schema, table, person, nth, null, attempt);
+          await insertRow(client, schema, table.name, row);
+        }
+        landed = true;
+      } catch (err) {
+        refused = err.message;
+        // A half-seeded table would make the next attempt collide with its own
+        // first row, so anything that did go in is taken back out.
+        await client
+          .query('DELETE FROM ' + quote(schema) + '.' + quote(table.name))
+          .catch(() => {});
       }
+    }
+
+    if (landed) {
       seeded.push({ table: table.name, owner: owner });
-    } catch (err) {
+    } else {
       // Recorded, never swallowed. The report has to say this table was not
       // checked rather than let an empty table pass for a safe one.
-      skipped.push({ table: table.name, why: err.message });
+      skipped.push({ table: table.name, why: refused });
     }
   }
   return { seeded: seeded, skipped: skipped };
@@ -369,6 +469,7 @@ module.exports = {
   foreignKeys: foreignKeys,
   dependencyOrder: dependencyOrder,
   valueFor: valueFor,
+  allowedByCheck: allowedByCheck,
   rowFor: rowFor,
   insertRow: insertRow,
   seed: seed,
