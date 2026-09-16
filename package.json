@@ -5,7 +5,7 @@
   "type": "commonjs",
   "description": "Attacks a copy of your backend and reports what it found, in plain English.",
   "scripts": {
-    "check": "node finding.check.js && node recheck.check.js && node schema.check.js && node collision.check.js && node loop.check.js",
+    "check": "node finding.check.js && node recheck.check.js && node untouched.check.js && node blocked.check.js && node schema.check.js && node collision.check.js && node loop.check.js",
     "check:report": "node finding.check.js",
     "check:recheck": "node recheck.check.js",
     "check:copy": "node schema.check.js",
@@ -13,7 +13,9 @@
     "check:loop": "node loop.check.js",
     "probe": "node probe-rls.js",
     "probe:collision": "node probe-collision.js",
-    "demo": "node demo.js"
+    "demo": "node demo.js",
+    "check:promise": "node untouched.check.js",
+    "check:blocked": "node blocked.check.js"
   },
   "dependencies": {
     "pg": "^8.23.0"

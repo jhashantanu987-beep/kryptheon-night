@@ -67,23 +67,32 @@ async function scan(client, sourceSchema, options) {
 
     say('  Copy matches. Seeding two people and attacking it ...');
     const sown = await attack.seed(client, copyName, copyPlan.tables);
-    const raw = await attack.impersonate(client, copyName, copyPlan.tables);
+    const impersonation = await attack.impersonate(client, copyName, copyPlan.tables);
 
     // Every attack genuinely run, named the way a finding is named. The
     // re-check needs this: a finding that disappears because its attack never
     // ran this time is not a finding that was fixed, and without this list the
     // two are indistinguishable.
-    const attempted = [];
-    for (const entry of sown.seeded) {
-      attempted.push('exposed:' + entry.table);
-      // Crossed is only ever looked for where a row says who it belongs to.
-      if (entry.owner) attempted.push('crossed:' + entry.table);
-    }
+    //
+    // Two conditions, both required. The read has to have produced a verdict,
+    // AND the table has to have had a row in it - because a table nothing
+    // could be seeded into returns nothing to a stranger for a reason that has
+    // nothing to do with being secure.
+    const sownTables = new Set(sown.seeded.map((entry) => entry.table));
+    const attempted = impersonation.completed.filter((key) => sownTables.has(key.split(':')[1]));
 
     // Surfaced, not swallowed. A table with no row in it reads as a safe
     // table, so the one thing that must never happen is reporting an app as
     // clear when part of it was never actually tried.
     const notChecked = sown.skipped.slice();
+
+    // A read that errored for any reason other than the table being closed to
+    // that role decided nothing at all, and zero rows back from a failed query
+    // looks exactly like zero rows back from a table that held.
+    for (const stuck of impersonation.blocked) {
+      if (!sownTables.has(stuck.table)) continue;
+      notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });
+    }
 
     let collisions = { findings: [], notTried: [], raced: [] };
     if (opts.openSession) {
@@ -124,7 +133,7 @@ async function scan(client, sourceSchema, options) {
       attacksRun: attempted.length,
       notChecked: notChecked,
       attempted: attempted,
-      findings: finding.describeAll(raw.concat(collisions.findings)),
+      findings: finding.describeAll(impersonation.findings.concat(collisions.findings)),
     };
   } finally {
     try {

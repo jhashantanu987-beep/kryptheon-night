@@ -177,8 +177,10 @@ async function main() {
     const sownSource = await attack.seed(client, SOURCE, plan.tables);
     const sownCopy = await attack.seed(client, COPY, copyPlan.tables);
 
-    const onSource = await attack.impersonate(client, SOURCE, plan.tables);
-    const onCopy = await attack.impersonate(client, COPY, copyPlan.tables);
+    const runSource = await attack.impersonate(client, SOURCE, plan.tables);
+    const runCopy = await attack.impersonate(client, COPY, copyPlan.tables);
+    const onSource = runSource.findings;
+    const onCopy = runCopy.findings;
 
     record('4. the attack finds the two broken tables, and only those', () => {
       const problems = [];
@@ -207,8 +209,8 @@ async function main() {
     });
 
     record('6. the copy gives the same verdict as the original', () => {
-      const a = attack.summarise(onSource);
-      const b = attack.summarise(onCopy);
+      const a = attack.summarise(runSource);
+      const b = attack.summarise(runCopy);
       if (a === b) return [];
       return [
         'the copy behaves differently, so every finding would be about the wrong database:',

@@ -232,6 +232,36 @@ function rewriteSchemaRefs(expr, fromSchema, toSchema) {
   return String(expr).split(quote(fromSchema) + '.').join(quote(toSchema) + '.').split(fromSchema + '.').join(toSchema + '.');
 }
 
+/** Which of these roles this database actually has. */
+async function existingRoles(client, wanted) {
+  const { rows } = await client.query('SELECT rolname FROM pg_roles WHERE rolname = ANY($1)', [wanted]);
+  return rows.map((row) => row.rolname);
+}
+
+/**
+ * Nothing may be written outside the copy. Ever.
+ *
+ * The product is sold on one sentence - we never touch your live app - and
+ * this is the line that keeps it true. It is a structural guard rather than a
+ * careful habit, because the two statements that broke the promise were
+ * written carefully and sat there for weeks: every check built its own
+ * auth.uid() first, so replacing the customer's looked exactly like doing
+ * nothing.
+ *
+ * Every statement has to name the copy schema, quoted or not. A statement that
+ * does not is not run, and the scan stops rather than guessing.
+ */
+function mustStayInside(statements, target) {
+  const bare = new RegExp('(^|[^A-Za-z0-9_"])' + target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\.');
+  for (const statement of statements) {
+    if (statement.includes(quote(target)) || bare.test(statement)) continue;
+    throw new Error(
+      'refusing to run a statement that does not stay inside the copy ' + target + ': ' + statement,
+    );
+  }
+  return statements;
+}
+
 /**
  * Builds the schema again, in a database we own.
  *
@@ -239,9 +269,7 @@ function rewriteSchemaRefs(expr, fromSchema, toSchema) {
  * cannot be created before the table it guards, and a grant given after a
  * policy would widen access the original did not have.
  */
-async function writeSchema(client, plan, target, options) {
-  const opts = options || {};
-  const authSchema = opts.authSchema || 'auth';
+async function writeSchema(client, plan, target) {
   const statements = [];
 
   await client.query('CREATE SCHEMA ' + quote(target));
@@ -295,16 +323,20 @@ async function writeSchema(client, plan, target, options) {
     statements.push(rewriteSchemaRefs(index.definition, plan.schema, target));
   }
 
-  // The roles PostgREST switches into, and the auth.uid() the policies read.
-  // Without these the policies would fail to create, or would create and then
-  // never match anything - which would look like a very secure application.
-  statements.push('CREATE SCHEMA IF NOT EXISTS ' + quote(authSchema));
-  statements.push(
-    'CREATE OR REPLACE FUNCTION ' + quote(authSchema) + '.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
-      "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$",
-  );
-  statements.push('GRANT USAGE ON SCHEMA ' + quote(authSchema) + ' TO anon, authenticated');
-  statements.push('GRANT USAGE ON SCHEMA ' + quote(target) + ' TO anon, authenticated');
+  // The copy needs the roles PostgREST switches into to be able to reach it.
+  // Granted on the copy's own schema and nowhere else.
+  //
+  // What used to be here, and must never come back: CREATE SCHEMA auth,
+  // CREATE OR REPLACE FUNCTION auth.uid(), and GRANT USAGE ON SCHEMA auth.
+  // Those ran against the customer's live database. The first overwrote their
+  // own authentication function; the third opened a schema they may have
+  // deliberately closed. The policies reference auth.uid() and that is fine -
+  // calling their function is a read, and a read is all we are ever allowed.
+  // If it is missing, their app does not work either, and the copy failing to
+  // build says so honestly instead of papering over it.
+  for (const role of await existingRoles(client, ['anon', 'authenticated'])) {
+    statements.push('GRANT USAGE ON SCHEMA ' + quote(target) + ' TO ' + quote(role));
+  }
 
   for (const grant of plan.grants) {
     const who = grant.grantee === 'PUBLIC' ? 'PUBLIC' : quote(grant.grantee);
@@ -336,6 +368,7 @@ async function writeSchema(client, plan, target, options) {
     statements.push(parts.join(' '));
   }
 
+  mustStayInside(statements, target);
   for (const statement of statements) {
     await client.query(statement);
   }

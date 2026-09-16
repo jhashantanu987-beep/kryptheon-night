@@ -237,9 +237,18 @@ async function readAs(client, schema, table, role, userId) {
   await client.query('BEGIN');
   try {
     await client.query('SET LOCAL role TO ' + role);
+    // A logged-out visitor is not "no claims". Supabase hands PostgREST the
+    // anon key, which is itself a JWT, so request.jwt.claims arrives as a real
+    // JSON object that simply has no `sub` in it.
+    //
+    // Sending an empty string instead made auth.uid() throw on the cast, and a
+    // read that throws returns no rows - which is exactly what a properly
+    // secured table returns. Every table whose policy calls auth.uid(), which
+    // is nearly every table anyone writes, came back looking safe without the
+    // rule ever being evaluated.
     await client.query('SELECT set_config($1, $2, true)', [
       'request.jwt.claims',
-      userId ? JSON.stringify({ sub: userId, role: role }) : '',
+      JSON.stringify(userId ? { sub: userId, role: role } : { role: role }),
     ]);
     const result = await client.query('SELECT * FROM ' + quote(schema) + '.' + quote(table));
     return result.rows;
@@ -257,6 +266,26 @@ function rowsOwnedBy(rows, owner, person) {
 }
 
 /**
+ * A refusal is only an answer when it is the right refusal.
+ *
+ * "permission denied for table orders" means this caller cannot reach the
+ * table at all. That is the attack being defeated, and it is good news worth
+ * recording as a pass.
+ *
+ * Everything else - a schema the policy needs and the role cannot use, a
+ * function the policy calls that is not there, a timeout - means the rule was
+ * never evaluated. No verdict exists. Both come back as an error and return
+ * zero rows, and zero rows is exactly what a perfectly secured table returns,
+ * so telling them apart is the difference between "you are safe" and "I could
+ * not tell", which is the difference the whole product rests on.
+ */
+function refusalMeans(message) {
+  return /permission denied for (table|relation|view|sequence)/i.test(String(message))
+    ? 'unreachable'
+    : 'untested';
+}
+
+/**
  * What each table gives away, and to whom.
  *
  * Two separate findings, because they are two different conversations with the
@@ -269,24 +298,43 @@ function rowsOwnedBy(rows, owner, person) {
  */
 async function impersonate(client, schema, tables) {
   const findings = [];
+  const completed = [];
+  const blocked = [];
+
+  /** Did this read produce a verdict, and if not, why not? */
+  const settle = (key, table, answer, as) => {
+    if (Array.isArray(answer)) {
+      completed.push(key);
+      return true;
+    }
+    if (refusalMeans(answer.blocked) === 'unreachable') {
+      // Refused outright. The attack ran and lost, which is the result we want
+      // for a table that is properly closed.
+      completed.push(key);
+      return false;
+    }
+    blocked.push({ table: table, key: key, why: as + ': ' + answer.blocked });
+    return false;
+  };
 
   for (const table of tables) {
     const owner = ownerColumn(table);
     const anon = await readAs(client, schema, table.name, 'anon', null);
     const asA = await readAs(client, schema, table.name, 'authenticated', USER_A);
 
-    const anonRows = Array.isArray(anon) ? anon.length : 0;
-    if (anonRows > 0) {
+    if (settle('exposed:' + table.name, table.name, anon, 'as a logged-out visitor') && anon.length > 0) {
       findings.push({
         kind: 'exposed',
         table: table.name,
-        readable: anonRows,
+        readable: anon.length,
         columns: Object.keys(anon[0] || {}),
         rlsEnabled: table.rlsEnabled,
       });
     }
 
-    if (owner && Array.isArray(asA)) {
+    // Crossed is only ever looked for where a row says who it belongs to, so
+    // on a table with no owner there is no attack to record either way.
+    if (owner && settle('crossed:' + table.name, table.name, asA, 'as a signed-in customer')) {
       const theirs = rowsOwnedBy(asA, owner, USER_B);
       if (theirs > 0) {
         findings.push({
@@ -301,11 +349,12 @@ async function impersonate(client, schema, tables) {
     }
   }
 
-  return findings;
+  return { findings: findings, completed: completed, blocked: blocked };
 }
 
 /** A stable shape for comparing one run against another. */
-function summarise(findings) {
+function summarise(result) {
+  const findings = Array.isArray(result) ? result : (result && result.findings) || [];
   return findings
     .map((f) => f.kind + ':' + f.table + ':' + f.readable)
     .sort()
@@ -315,6 +364,7 @@ function summarise(findings) {
 module.exports = {
   USER_A: USER_A,
   USER_B: USER_B,
+  refusalMeans: refusalMeans,
   ownerColumn: ownerColumn,
   foreignKeys: foreignKeys,
   dependencyOrder: dependencyOrder,
