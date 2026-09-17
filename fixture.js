@@ -15,11 +15,60 @@
 //
 // So: look first, create only what is missing, and undo exactly that much.
 
+// How old a fixture has to be before it is treated as abandoned. The same six
+// hours the product uses for its own copies, and for the same reason: long
+// enough that a suite running in another window is never swept out from under
+// itself.
+const ABANDONED_AFTER = 6 * 60 * 60 * 1000;
+
+/**
+ * Drops fixtures an earlier run could not clean up after itself.
+ *
+ * A check tidies up in a `finally`, and that covers every ordinary failure. It
+ * does not cover the process being killed - a mutation run timing out, a
+ * dropped connection, somebody pressing ctrl-c - and then the small app it
+ * built stays in the database. One turned up four hours after the run that
+ * made it, found by the very check that watches for this.
+ *
+ * The name carries the moment it was made, so its age can be read without
+ * asking Postgres, which does not record when a schema was created.
+ */
+async function sweepOldFixtures(client) {
+  let rows = [];
+  try {
+    ({ rows } = await client.query(
+      "SELECT nspname FROM pg_namespace WHERE nspname ~ '^kn_[a-z]+_' ORDER BY 1",
+    ));
+  } catch (err) {
+    return [];
+  }
+
+  const dropped = [];
+  for (const row of rows) {
+    const stamp = /_([0-9a-z]+)$/.exec(row.nspname);
+    if (!stamp) continue;
+    const made = parseInt(stamp[1], 36);
+    if (!Number.isFinite(made) || Date.now() - made < ABANDONED_AFTER) continue;
+    try {
+      await client.query('DROP SCHEMA IF EXISTS "' + String(row.nspname).split('"').join('""') + '" CASCADE');
+      dropped.push(row.nspname);
+    } catch (err) {
+      // Somebody else's to deal with. Better than failing a run over tidiness.
+    }
+  }
+  return dropped;
+}
+
 /**
  * Makes sure `auth.uid()` exists, and hands back a way to undo only what was
  * created here.
+ *
+ * Every database-backed check calls this before it builds anything, so it is
+ * also where the stale fixtures of killed runs get cleared away.
  */
 async function ensureAuth(client) {
+  await sweepOldFixtures(client);
+
   const { rows: schemaRows } = await client.query("SELECT 1 FROM pg_namespace WHERE nspname = 'auth'");
   const madeSchema = schemaRows.length === 0;
   if (madeSchema) await client.query('CREATE SCHEMA auth');
@@ -63,4 +112,9 @@ async function ensureRoles(client, schemaName, quote) {
   }
 }
 
-module.exports = { ensureAuth: ensureAuth, ensureRoles: ensureRoles };
+module.exports = {
+  ensureAuth: ensureAuth,
+  ensureRoles: ensureRoles,
+  sweepOldFixtures: sweepOldFixtures,
+  ABANDONED_AFTER: ABANDONED_AFTER,
+};

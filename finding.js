@@ -72,6 +72,12 @@ function listOf(items) {
  * should be fixed - there is no such thing as a low finding here.
  */
 function severityOf(finding, contents) {
+  if (finding.kind === 'orphaned') {
+    // Nothing is exposed and nothing is destroyed, so this is not the same
+    // order of thing as a table anyone can empty. It stays serious because
+    // the data it strands is data somebody asked to have deleted.
+    return 'HIGH';
+  }
   if (finding.kind === 'writable') {
     // Deleting and rewriting are unrecoverable in a way that reading is not:
     // a leak is bad, but a customer table somebody emptied is gone. Being able
@@ -105,6 +111,16 @@ function severityOf(finding, contents) {
  * one it is saves them looking in the wrong place.
  */
 function causeOf(finding) {
+  if (finding.kind === 'orphaned') {
+    return {
+      short: 'nothing in the database ties the two tables together',
+      long:
+        'There is no foreign key between these two tables, so the database has '+
+        'no idea they are related. It will not refuse a row that points at '+
+        'nothing, it will not stop somebody being deleted while their rows are '+
+        'still here, and it will never find these rows again afterwards.',
+    };
+  }
   if (finding.kind === 'writable') {
     if (finding.rlsEnabled) {
       return {
@@ -168,6 +184,10 @@ function causeOf(finding) {
 const WRITE_WORDS = { add: 'add rows to', change: 'change rows in', delete: 'delete rows from' };
 
 function headlineFor(finding) {
+  if (finding.kind === 'orphaned') {
+    return 'Your ' + finding.table + ' table can point at a ' +
+      finding.parent.replace(/s$/, '') + ' that does not exist.';
+  }
   if (finding.kind === 'writable') {
     // Worst first, because the headline is often all that gets read.
     const order = ['delete', 'change', 'add'];
@@ -197,6 +217,18 @@ const COST_OF_A_DUPLICATE = {
 function bodyFor(finding, contents) {
   const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
   const rowWord = finding.readable === 1 ? 'row' : 'rows';
+
+  if (finding.kind === 'orphaned') {
+    // Said as the thing a person will actually meet: a customer asks to be
+    // deleted, and their rows are still here afterwards.
+    return (
+      'I added a row to ' + finding.table + ' naming a ' +
+      finding.parent.replace(/s$/, '') + " that is not in your " + finding.parent +
+      ' table, and it was accepted. So when one of them is deleted, the rows here ' +
+      'stay behind pointing at nobody - and a signup or checkout that stops halfway ' +
+      'leaves the same thing. The row I added was undone straight away.'
+    );
+  }
 
   if (finding.kind === 'writable') {
     const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
@@ -274,7 +306,28 @@ function fixPromptFor(finding) {
   const cause = causeOf(finding);
   const owner = finding.owner ? '"' + finding.owner + '"' : 'the column that says who each row belongs to';
 
-  const lines = finding.kind === 'writable'
+  const lines = finding.kind === 'orphaned'
+    ? [
+      'My app has a data problem.',
+      '',
+      'The "' + finding.table + '" table has a "' + finding.column +
+        '" column that is meant to point at "' + finding.parent + '".' +
+        ' There is no foreign key between them, so the database does not know they ' +
+        'are related. I proved it by adding a row naming one that does not exist, ' +
+        'and it was accepted.',
+      '',
+      'Add a foreign key from "' + finding.table + '"."' + finding.column +
+        '" to "' + finding.parent + '"."' + finding.parentKey + '".',
+      '',
+      'Decide on purpose what should happen when the parent row is deleted: ON ' +
+        'DELETE CASCADE if the children should go too, ON DELETE SET NULL if they ' +
+        'should stay without an owner, or nothing at all if the delete should be ' +
+        'refused while children exist.',
+      '',
+      'There may already be rows pointing at nothing, and the constraint will not ' +
+        'be created until those are dealt with. Find them first.',
+    ]
+    : finding.kind === 'writable'
     ? [
       'My app has a security problem.',
       '',
@@ -363,6 +416,8 @@ function describe(finding) {
     // what it is about. Without the column they would share an identity and
     // fixing one would look like fixing both.
     column: finding.column,
+    parent: finding.parent,
+    parentKey: finding.parentKey,
     expectation: finding.expectation,
     headline: headlineFor(finding, contents),
     body: bodyFor(finding, contents),
@@ -404,7 +459,7 @@ function describeAll(findings) {
   // ones that need an account, and those before the ones that need two requests
   // to arrive together.
   // Writes above reads: a table somebody emptied is worse than one they read.
-  const byKind = { writable: 0, exposed: 1, crossed: 2, duplicated: 3 };
+  const byKind = { writable: 0, exposed: 1, crossed: 2, duplicated: 3, orphaned: 4 };
   const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (byKind[d.kind] === undefined ? 9 : byKind[d.kind]);
   return described.sort((a, b) => rank(a) - rank(b));
 }

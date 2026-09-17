@@ -1,6 +1,6 @@
 # Running the checks
 
-Twelve suites. Run them after every change, not at the end.
+Fourteen suites. Run them after every change, not at the end.
 
     set KN_DATABASE_URL=postgresql://...
     npm run check
@@ -11,11 +11,13 @@ Twelve suites. Run them after every change, not at the end.
 | `recheck.check.js` | no | "fixed" is only ever said when it is true |
 | `untouched.check.js` | yes | nothing outside the copy is changed, at all |
 | `blocked.check.js` | yes | a read that failed is not a table that held |
+| `usable.check.js` | yes | what a person sees when they get the command wrong |
 | `orphans.check.js` | yes | a scan that died leaves nothing behind |
 | `external.check.js` | yes | an app pointing at `auth.users` can be scanned |
 | `schema.check.js` | yes | the copy behaves like the app, not just looks like it |
 | `collision.check.js` | yes | "this can happen twice" is only said when it can |
 | `tamper.check.js` | yes | "a stranger can change this" is only said when it can |
+| `orphan.check.js` | yes | "this can point at nothing" is only said where a key belongs |
 | `shapes.check.js` | yes | every shape a real app has can be tested at all |
 | `verdicts.check.js` | yes | the answer is right, not merely produced |
 | `loop.check.js` | yes | the whole thing, through the real command |
@@ -72,6 +74,17 @@ the catalogue.
 about findings at all: every table must come out exactly as it went in. After
 that it is restraint again - a `SELECT` policy and nothing else genuinely
 denies writes, and an app built that way must come back clean.
+
+**usable.check.js** - six ways of getting the command wrong, all through the
+real command line. A misspelled schema name used to find no tables, attack
+none of them, print the all-clear and exit 0. A typo cannot be allowed to
+produce the sentence the product is sold on.
+
+**orphan.check.js** - the interruption attack tells somebody their schema is
+missing a constraint, which is a claim about how their app is meant to work.
+So eleven of its thirteen cases are about saying nothing: a column pointing at
+Stripe, a name that matches a table whose key is a different type, an audit
+row whose whole job is to remember somebody who has been deleted.
 
 **shapes.check.js** - twenty-five small apps, each built around a shape real
 projects have and no fixture did: an enum, a `text[]`, a generated column, a
@@ -163,8 +176,22 @@ data is safe when it is not, is not. That is why:
 - unique indexes were not copied at all
 - a `WITH CHECK` turning a write away was filed as "could not test", putting a
   warning on every table that had got it right
+- a typo in the schema name printed the all-clear and exited 0
+- a run that stopped exited 0, so a script would have read it as a pass
+- the connection string could only be given on the command line, where it
+  lands in shell history and the process list
+- hiding our own copies from the suggestion list also hid them from the
+  existence check, so the scan refused every schema whose name began the same
+  way - which was all 25 shape fixtures, a minute after the fix landed
 
 ## What is deliberately not reported
+
+Whether a request that was cut off halfway left the app inconsistent. That
+depends on whether the code wrapped its writes in a transaction, and this tool
+never sees the code. What it can answer is the database half: whether a
+half-finished state is allowed to survive at all, which is what a foreign key
+decides. So the interruption attack reports orphans and says nothing about
+transactions.
 
 The lost update - two withdrawals of 100 from a balance of 100 that both
 succeed. Every Postgres database on default isolation behaves that way for a
@@ -178,6 +205,15 @@ A check that still passes when the thing it guards is broken is not a check, so
 every guard is removed one at a time to confirm a check fails. The scratchpad
 runners assert each anchor matches exactly once first, because a mutation that
 quietly changed nothing looks exactly like a check that passed.
+
+The interruption attack is the clearest case of why. Its first run caught 3 of
+10, and every survivor was a real gap. The checks were asking what got
+reported and never what got considered, so a column pointing at Stripe was
+quietly producing a "could not check" line nobody had earned. Three survived
+only because the fixture had no table that could catch them: no candidate that
+gets refused, none refused for a reason other than a foreign key, and no
+parent already holding the value the attack uses to mean nobody. That last one
+would have invented a hole out of a coincidence.
 
 Survivors have been worth more than the passes. Two in `recheck.js` turned up
 the overlapping `allClear` guards. One in `collision.js` showed the fixture had

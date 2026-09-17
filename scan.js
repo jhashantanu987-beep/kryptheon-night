@@ -19,6 +19,7 @@ const attack = require('./attack.js');
 const finding = require('./finding.js');
 const collision = require('./collision.js');
 const tamper = require('./tamper.js');
+const orphan = require('./orphan.js');
 const recheck = require('./recheck.js');
 
 // Where the last run is kept so the next one has something to compare against.
@@ -240,6 +241,18 @@ async function scan(client, sourceSchema, options) {
       notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });
     }
 
+    // Can a half-finished write survive? Rolled back like the writes above.
+    say('  Looking for rows that could point at nothing ...');
+    const stranded = await orphan.orphan(client, copyName, theirs, sown.seeded);
+    for (const key of stranded.completed) attempted.push(key);
+    for (const missed of stranded.notTried) {
+      notChecked.push({
+        table: missed.table + '.' + missed.column,
+        key: 'orphaned:' + missed.table + ':' + missed.column,
+        why: missed.why,
+      });
+    }
+
     let collisions = { findings: [], notTried: [], raced: [] };
     if (opts.openSession) {
       say('  Racing two requests against each other ...');
@@ -279,7 +292,9 @@ async function scan(client, sourceSchema, options) {
       attacksRun: attempted.length,
       notChecked: notChecked,
       attempted: attempted,
-      findings: finding.describeAll(impersonation.findings.concat(writes.findings, collisions.findings)),
+      findings: finding.describeAll(
+        impersonation.findings.concat(writes.findings, stranded.findings, collisions.findings),
+      ),
     };
   } finally {
     try {

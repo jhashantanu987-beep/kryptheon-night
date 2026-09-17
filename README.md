@@ -75,6 +75,7 @@ fix. Close everything, with nothing left untested, and it hands out a badge.
 | **Impersonation** | can a stranger, or another customer, read this? |
 | **Collision** | can the same thing exist twice? |
 | **Tampering** | can a stranger add, change or delete your data? |
+| **Interruption** | can a half-finished write survive? |
 
 Tampering writes, and every write is rolled back inside the transaction that
 made it — the tables come out exactly as they went in, and that is checked.
@@ -104,7 +105,7 @@ schema to `anon`. Both on a live database, while every other check was green.
     npm install
     KN_DATABASE_URL="postgresql://..."  npm run check
 
-Twelve suites, every one of them against a real Postgres. See
+Fourteen suites, every one of them against a real Postgres. See
 [CHECKING.md](CHECKING.md) — what each is guarding, the bugs they caught, and
 why a check that leaves the database different from how it found it is not a
 check.
