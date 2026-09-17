@@ -18,9 +18,13 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const schema = require('./schema.js');
+const fixture = require('./fixture.js');
 
 const HERE = __dirname;
 const CONN = process.argv[2] || process.env.KN_DATABASE_URL;
+
+// Undoes only the auth schema this run created, and only if it created it.
+let undoAuth = async () => {};
 const SAVED = path.join(HERE, '.kryptheon-last.json');
 
 /** Runs scan.js the way a person does, and hands back what they would see. */
@@ -55,12 +59,7 @@ async function buildApp(client, app) {
     await client.query('GRANT ' + role + ' TO current_user');
     await client.query('GRANT USAGE ON SCHEMA ' + schema.quote(app) + ' TO ' + role);
   }
-  await client.query('CREATE SCHEMA IF NOT EXISTS auth');
-  await client.query(
-    'CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
-      "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub','')::uuid $$",
-  );
-  await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated');
+  undoAuth = await fixture.ensureAuth(client);
 
   // profiles is the table that was done properly: its policy is right and its
   // email is unique, so neither attack should have anything to say about it.
@@ -191,6 +190,7 @@ function must(condition, what) {
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(appB) + ' CASCADE');
     try { fs.unlinkSync(SAVED); } catch (err) { /* already gone */ }
+    await undoAuth();
     await client.end();
   }
 

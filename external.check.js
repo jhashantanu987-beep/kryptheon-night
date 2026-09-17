@@ -24,9 +24,15 @@
 
 const { Client } = require('pg');
 const schema = require('./schema.js');
+const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
+
+// Undoes only the auth schema this run created, and only if it created it.
+let undoAuth = async () => {};
+// And the auth.users table, on the same terms.
+let madeAuthUsers = false;
 const APP = 'kn_external_' + Date.now().toString(36);
 
 const results = [];
@@ -46,19 +52,25 @@ async function buildApp(client) {
     await client.query('GRANT ' + role + ' TO current_user');
     await client.query('GRANT USAGE ON SCHEMA ' + schema.quote(APP) + ' TO ' + role);
   }
-  await client.query('CREATE SCHEMA IF NOT EXISTS auth');
-  await client.query(
-    'CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
-      "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$",
-  );
-  await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated');
+  undoAuth = await fixture.ensureAuth(client);
 
-  // The customer's own authentication table, with a real person in it.
-  await client.query('CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY, email text)');
-  await client.query(
-    "INSERT INTO auth.users VALUES ('dddddddd-0000-4000-8000-00000000000d', 'real.person@example.com') " +
-      'ON CONFLICT DO NOTHING',
+  // The customer own authentication table, with a real person in it.
+  //
+  // Created only if it is not already there, and remembered so the cleanup
+  // can take away exactly what it added. Leaving an auth.users behind in
+  // somebody else auth schema would be this check doing the very thing it
+  // exists to prove the product never does.
+  const { rows: already } = await client.query(
+    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace " +
+      "WHERE n.nspname = 'auth' AND c.relname = 'users'",
   );
+  madeAuthUsers = already.length === 0;
+  if (madeAuthUsers) {
+    await client.query('CREATE TABLE auth.users (id uuid PRIMARY KEY, email text)');
+    await client.query(
+      "INSERT INTO auth.users VALUES ('dddddddd-0000-4000-8000-00000000000d', 'real.person@example.com')",
+    );
+  }
 
   await client.query(
     'CREATE TABLE ' + q('profiles') +
@@ -158,7 +170,8 @@ async function main() {
     })());
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE').catch(() => {});
-    await client.query('DROP SCHEMA IF EXISTS auth CASCADE').catch(() => {});
+    if (madeAuthUsers) await client.query('DROP TABLE IF EXISTS auth.users CASCADE').catch(() => {});
+    await undoAuth();
     await client.end();
   }
 

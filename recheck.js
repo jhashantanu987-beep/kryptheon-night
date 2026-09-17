@@ -27,7 +27,12 @@
  * having fixed both.
  */
 function keyOf(item) {
-  return item.kind + ':' + item.table + (item.column ? ':' + item.column : '');
+  // A third part when there is one: the column for a duplicate, or who the
+  // caller was for a write. Closing a table to strangers does not close it to
+  // signed-in customers, and sharing one identity would report the second as
+  // fixed the moment the first was.
+  const detail = item.column || item.who || '';
+  return item.kind + ':' + item.table + (detail ? ':' + detail : '');
 }
 
 /**

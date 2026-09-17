@@ -8,11 +8,11 @@
 // quietly alters the database it was pointed at is not a product, it is an
 // incident - and the person who bought it finds out from their users.
 //
-// So: a realistic app is built, with rows in it and its own auth.uid() carrying
-// a marker. Everything outside the throwaway copy is photographed - functions,
-// privileges, tables, columns, policies, row level security flags, roles, and
-// the row counts themselves. The real scan runs. Everything is photographed
-// again. Any difference at all is a failure, and the difference is printed.
+// So: a realistic app is built, with rows in it. Everything outside the
+// throwaway copy is photographed - functions, privileges, tables, columns,
+// policies, row level security flags, roles, sequences, and the row contents
+// themselves. The real scan runs. Everything is photographed again. Any
+// difference at all is a failure, and the difference is printed.
 //
 // The copy schema is always named kn_<something>, so anything matching that is
 // excluded from both photographs - and then the absence of any kn_ schema
@@ -26,11 +26,13 @@
 
 const { Client } = require('pg');
 const schema = require('./schema.js');
+const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 const APP = 'kn_untouched_app_' + Date.now().toString(36);
-const MARKER = 'kryptheon-must-not-replace-this';
+// Undoes only the auth schema this run created, and only if it created it.
+let undoAuth = async () => {};
 
 // The copy is always kn_<generated>. The app here is deliberately named with
 // the same prefix so it is excluded too - what is being watched is the rest of
@@ -114,17 +116,14 @@ async function buildApp(client) {
     await client.query('GRANT USAGE ON SCHEMA ' + schema.quote(APP) + ' TO ' + role);
   }
 
-  // The customer's own auth.uid(), with a marker inside it. If the scan
-  // replaces it the marker disappears and the functions photograph changes.
-  await client.query('CREATE SCHEMA IF NOT EXISTS auth');
-  await client.query(
-    'CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
-      "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid " +
-      '/* ' + MARKER + ' */ $$',
-  );
-  // Open, the way a working Supabase project has it - the policies could not
-  // be evaluated otherwise and the scan would have nothing to say.
-  await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated');
+  // An auth.uid() to compare against afterwards. Created only if the database
+  // does not already have one: this check exists to prove nothing outside the
+  // copy is altered, and building it by overwriting somebody's authentication
+  // function would be the very thing it is meant to catch.
+  //
+  // Either way the photograph holds the definition's hash, so a replacement
+  // shows up whether the function came from here or was already there.
+  undoAuth = await fixture.ensureAuth(client);
 
   await client.query('CREATE TABLE ' + q('profiles') + ' (id uuid PRIMARY KEY, email text NOT NULL)');
   await client.query(
@@ -227,15 +226,16 @@ async function main() {
       return found.length ? found : [];
     })());
 
-    check("3. the customer's own auth.uid() is still theirs", (() => {
+check("3. the auth.uid() that was there before is still there afterwards", (() => {
+      // Named separately from check 2 even though the photograph would catch
+      // it anyway, because this is the one that matters: replacing it breaks
+      // a live application, not just a promise.
       const problems = [];
-      const stillMarked = after.functions.some((row) => row.includes('"name":"uid"'));
-      if (!stillMarked) problems.push('auth.uid() is gone entirely');
-      // The body hash is in the photograph, so a replacement shows up in check
-      // 2 as well - this one names it, because it is the one that matters.
-      const wasBody = before.functions.find((row) => row.includes('"name":"uid"'));
-      const nowBody = after.functions.find((row) => row.includes('"name":"uid"'));
-      if (wasBody && nowBody && wasBody !== nowBody) problems.push('auth.uid() was replaced with a different function');
+      const was = before.functions.find((row) => /"schema":"auth","name":"uid"/.test(row));
+      const now = after.functions.find((row) => /"schema":"auth","name":"uid"/.test(row));
+      if (!was) return ['there was no auth.uid() to protect'];
+      if (!now) problems.push('auth.uid() is gone entirely');
+      else if (was !== now) problems.push('auth.uid() was replaced with a different function');
       return problems;
     })());
 
@@ -259,7 +259,6 @@ async function main() {
   } finally {
     try {
       await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE');
-      await client.query('DROP SCHEMA IF EXISTS auth CASCADE');
     } catch (err) {
       console.error('  WARNING: cleanup failed: ' + err.message);
     }

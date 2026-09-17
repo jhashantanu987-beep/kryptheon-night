@@ -72,6 +72,13 @@ function listOf(items) {
  * should be fixed - there is no such thing as a low finding here.
  */
 function severityOf(finding, contents) {
+  if (finding.kind === 'writable') {
+    // Deleting and rewriting are unrecoverable in a way that reading is not:
+    // a leak is bad, but a customer table somebody emptied is gone. Being able
+    // only to add rows is serious and not the same thing.
+    const canDestroy = (finding.can || []).some((what) => what === 'delete' || what === 'change');
+    return canDestroy ? 'CRITICAL' : 'HIGH';
+  }
   if (finding.kind === 'duplicated') {
     // Judged by what the duplicate lets somebody do, not by what else sits in
     // the table. A second row holding the same session token is critical even
@@ -98,6 +105,25 @@ function severityOf(finding, contents) {
  * one it is saves them looking in the wrong place.
  */
 function causeOf(finding) {
+  if (finding.kind === 'writable') {
+    if (finding.rlsEnabled) {
+      return {
+        short: 'the rule on it allows writes as well as reads',
+        long:
+          'The table has row level security switched on, but the rule attached ' +
+          'to it covers every command rather than only reading - so the same ' +
+          'rule that lets people see the rows also lets them change them.',
+      };
+    }
+    return {
+      short: 'row level security was never switched on',
+      long:
+        'Row level security has never been switched on for this table. Supabase ' +
+        'grants insert, update and delete on the public schema by default, and ' +
+        'row level security is what takes them back - so until it is on, those ' +
+        'permissions are simply in force.',
+    };
+  }
   if (finding.isView) {
     // The one people are caught by, because everything looks right. The table
     // is protected, the policy is correct, the dashboard is green - and the
@@ -138,7 +164,17 @@ function causeOf(finding) {
   };
 }
 
+/** What a caller could do, written the way a person would say it. */
+const WRITE_WORDS = { add: 'add rows to', change: 'change rows in', delete: 'delete rows from' };
+
 function headlineFor(finding) {
+  if (finding.kind === 'writable') {
+    // Worst first, because the headline is often all that gets read.
+    const order = ['delete', 'change', 'add'];
+    const does = order.filter((what) => (finding.can || []).includes(what)).map((what) => WRITE_WORDS[what]);
+    return (finding.who === 'anyone' ? 'Anyone' : 'Any signed-in customer') + ' can ' +
+      listOf(does) + ' your ' + finding.table + ' table.';
+  }
   if (finding.kind === 'duplicated') {
     return 'Your ' + finding.table + ' table lets the same ' + finding.column + ' exist twice.';
   }
@@ -161,6 +197,27 @@ const COST_OF_A_DUPLICATE = {
 function bodyFor(finding, contents) {
   const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
   const rowWord = finding.readable === 1 ? 'row' : 'rows';
+
+  if (finding.kind === 'writable') {
+    const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
+    const who = finding.who === 'anyone'
+      ? 'Without logging in and without an account, I '
+      : 'Signed in as one of your customers, I ';
+    const did = [];
+    if ((finding.can || []).includes('add')) did.push('added a row');
+    if ((finding.can || []).includes('change')) {
+      did.push('changed ' + (finding.changed.change || 1) + " of another customer's rows");
+    }
+    if ((finding.can || []).includes('delete')) {
+      did.push('deleted ' + (finding.changed.delete || 1) + " of another customer's rows");
+    }
+    // Said immediately, because "I deleted your rows" is a sentence that stops
+    // somebody reading, and they need the next line more than the first.
+    return who + listOf(did) + ' on a copy of your app' +
+      (holds ? ', in a table holding ' + holds : '') +
+      '. Every one of those was undone straight away - nothing on the copy was ' +
+      'kept, and your live app was never touched.';
+  }
 
   if (finding.kind === 'duplicated') {
     // Said as what was done, not as what it implies. Two connections, one
@@ -217,7 +274,28 @@ function fixPromptFor(finding) {
   const cause = causeOf(finding);
   const owner = finding.owner ? '"' + finding.owner + '"' : 'the column that says who each row belongs to';
 
-  const lines = finding.kind === 'duplicated'
+  const lines = finding.kind === 'writable'
+    ? [
+      'My app has a security problem.',
+      '',
+      'The "' + finding.table + '" table can be written to by ' +
+        (finding.who === 'anyone' ? 'anyone who is not logged in' : 'any signed-in user, including other users rows') +
+        ', because ' + cause.short + '. I proved it: I ' +
+        (finding.can || []).map((what) => ({ add: 'added a row', change: 'changed rows', delete: 'deleted rows' })[what])
+          .join(', ') + '.',
+      '',
+      'Switch row level security on for this table, then write separate rules for ' +
+        'reading, inserting, updating and deleting. A rule written FOR SELECT does ' +
+        'not cover writes, and a rule written FOR ALL covers far more than reading.',
+      '',
+      'For insert and update, use WITH CHECK comparing ' + owner +
+        ' to the id of the signed-in user, so nobody can write a row under somebody ' +
+        "else's name.",
+      '',
+      'Then check every other table for the same thing - a table with no row level ' +
+        'security on it is writable by default.',
+    ]
+    : finding.kind === 'duplicated'
     ? [
       'My app has a security problem.',
       '',
@@ -289,6 +367,8 @@ function describe(finding) {
     headline: headlineFor(finding, contents),
     body: bodyFor(finding, contents),
     cause: cause.long,
+    who: finding.who,
+    can: finding.can,
     proof: finding.kind === 'duplicated'
       ? 'I created ' + finding.copies + ' rows in "' + finding.table + '" holding the same ' +
         finding.column + '.'
@@ -323,13 +403,20 @@ function describeAll(findings) {
   // Worst first, and within that the ones open to the whole internet before the
   // ones that need an account, and those before the ones that need two requests
   // to arrive together.
-  const byKind = { exposed: 0, crossed: 1, duplicated: 2 };
+  // Writes above reads: a table somebody emptied is worse than one they read.
+  const byKind = { writable: 0, exposed: 1, crossed: 2, duplicated: 3 };
   const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (byKind[d.kind] === undefined ? 9 : byKind[d.kind]);
   return described.sort((a, b) => rank(a) - rank(b));
 }
 
 /** What is printed when a run finds nothing. Silence would read as a failure. */
 function allClearLines(attacksRun) {
+  // Nothing attacked is not the same as nothing got through. The callers all
+  // stop before this now, but the sentence is the one thing in the product
+  // that must never be printed by accident, so it guards itself too.
+  if (!attacksRun) {
+    return ['', '  I did not manage to attack anything, so there is nothing to report.', ''];
+  }
   return [
     '',
     '  Nothing got through.',

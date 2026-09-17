@@ -8,8 +8,8 @@
 // this tool put there itself, which is what makes the report safe to send.
 //
 // Run with:
-//   node scan.js "<connection string>" <schema>
-//   node scan.js "<connection string>" <schema> --recheck
+//   KN_DATABASE_URL=postgresql://...   node scan.js <schema>
+//   KN_DATABASE_URL=postgresql://...   node scan.js <schema> --recheck
 
 const fs = require('fs');
 const path = require('path');
@@ -18,6 +18,7 @@ const schema = require('./schema.js');
 const attack = require('./attack.js');
 const finding = require('./finding.js');
 const collision = require('./collision.js');
+const tamper = require('./tamper.js');
 const recheck = require('./recheck.js');
 
 // Where the last run is kept so the next one has something to compare against.
@@ -26,6 +27,81 @@ const recheck = require('./recheck.js');
 const LAST_RUN = '.kryptheon-last.json';
 
 const line = (text) => process.stdout.write(text + '\n');
+
+// How long a copy has to be lying around before it is treated as abandoned.
+// Long enough that a scan running in another window is never swept out from
+// under itself; short enough that nobody finds week-old schemas in their
+// database.
+const ABANDONED_AFTER = 6 * 60 * 60 * 1000;
+
+/**
+ * Drops copies an earlier run left behind.
+ *
+ * The copy's name carries the moment it was made, so its age can be read
+ * without asking Postgres - which does not record when a schema was created.
+ * Anything younger than a few hours is left strictly alone: it may well belong
+ * to a scan that is running right now.
+ */
+async function sweepOldCopies(client, mine) {
+  const dropped = [];
+  let rows = [];
+  try {
+    ({ rows } = await client.query(
+      "SELECT nspname FROM pg_namespace WHERE nspname ~ '^kn_[0-9a-z]+$' AND nspname <> $1",
+      [mine],
+    ));
+  } catch (err) {
+    return dropped;
+  }
+
+  for (const row of rows) {
+    const made = parseInt(String(row.nspname).slice(3), 36);
+    if (!Number.isFinite(made) || Date.now() - made < ABANDONED_AFTER) continue;
+    try {
+      await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(row.nspname) + ' CASCADE');
+      dropped.push(row.nspname);
+    } catch (err) {
+      // Not ours to force. Better to leave it than to fail somebody's scan.
+    }
+  }
+  return dropped;
+}
+
+/**
+ * Every schema in the database, and how many tables are in each.
+ *
+ * Nothing filtered out. The first version left out anything named like one of
+ * our copies, which made the scan refuse to look at a schema whose name merely
+ * began the same way - and that took the entire shapes suite down a minute
+ * after this function was written. What to hide is a question for the
+ * suggestion below, not for whether a schema exists.
+ */
+async function schemasWithTables(client) {
+  const { rows } = await client.query(
+    `SELECT n.nspname AS schema, count(c.oid) FILTER (WHERE c.relkind = 'r')::int AS tables
+       FROM pg_namespace n
+       LEFT JOIN pg_class c ON c.relnamespace = n.oid
+      WHERE n.nspname NOT LIKE 'pg\\_%'
+        AND n.nspname <> 'information_schema'
+      GROUP BY 1
+      ORDER BY 2 DESC, 1`,
+  );
+  return rows;
+}
+
+/**
+ * What to try instead.
+ *
+ * A person who mistyped a schema name is about to mistype it again. Listing
+ * what is actually there costs one query and saves the second attempt - but
+ * not the throwaway copies, which are ours and about to be deleted.
+ */
+function suggest(schemas) {
+  const worth = schemas.filter((entry) => entry.tables > 0 && !/^kn_[0-9a-z]+$/.test(entry.schema));
+  if (!worth.length) return '\n    This database has no schema with tables in it.';
+  return '\n    Schemas in this database with tables in them: ' +
+    worth.map((entry) => entry.schema + ' (' + entry.tables + ')').join(', ');
+}
 
 /**
  * Runs the whole thing and hands back what got through.
@@ -38,8 +114,41 @@ async function scan(client, sourceSchema, options) {
   const copyName = 'kn_' + Date.now().toString(36);
   const say = opts.quiet ? () => {} : line;
 
+  // Anything an earlier run could not clean up after itself. The copy is
+  // dropped in a `finally`, but a `finally` needs a connection: when the link
+  // dies mid-scan the process goes with it and the copy is simply left in the
+  // customer's database. Found by exactly that happening on a real schema.
+  const swept = await sweepOldCopies(client, copyName);
+  if (swept.length) say('  Cleared ' + swept.length + ' copy left by an earlier run.');
+
+  // Is there anything here at all?
+  //
+  // Typed `pubic` instead of `public`, this used to read a schema that does
+  // not exist, find no tables, attack none of them, and print "Nothing got
+  // through. Your data held." A typo produced the one sentence the entire
+  // product is sold on, and exited 0 so a script would call it a pass.
+  const elsewhere = await schemasWithTables(client);
+  const here = elsewhere.find((entry) => entry.schema === sourceSchema);
+  if (!here) {
+    return {
+      stopped: 'There is no schema called "' + sourceSchema + '" in this database.' +
+        suggest(elsewhere),
+      findings: [],
+    };
+  }
+
   say('  Reading the shape of ' + sourceSchema + ' ...');
   const plan = await schema.readSchema(client, sourceSchema);
+
+  if (!plan.tables.length) {
+    // Nothing wrong with the database, but nothing was tested either, and
+    // those are not the same answer.
+    return {
+      stopped: 'The schema "' + sourceSchema + '" has no tables in it, so there was nothing to attack.' +
+        suggest(elsewhere.filter((entry) => entry.schema !== sourceSchema)),
+      findings: [],
+    };
+  }
 
   if (plan.unsupported.length) {
     // Attacking a copy that is missing pieces would produce verdicts about a
@@ -121,6 +230,16 @@ async function scan(client, sourceSchema, options) {
       notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });
     }
 
+    // Can a stranger change any of it? Every write here is rolled back, so the
+    // copy comes out of this exactly as it went in and anything running after
+    // reads the same database the earlier attacks did.
+    say('  Trying to change data that is not ours ...');
+    const writes = await tamper.tamper(client, copyName, theirs, sown.seeded);
+    for (const key of writes.completed) attempted.push(key);
+    for (const stuck of writes.blocked) {
+      notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });
+    }
+
     let collisions = { findings: [], notTried: [], raced: [] };
     if (opts.openSession) {
       say('  Racing two requests against each other ...');
@@ -160,7 +279,7 @@ async function scan(client, sourceSchema, options) {
       attacksRun: attempted.length,
       notChecked: notChecked,
       attempted: attempted,
-      findings: finding.describeAll(impersonation.findings.concat(collisions.findings)),
+      findings: finding.describeAll(impersonation.findings.concat(writes.findings, collisions.findings)),
     };
   } finally {
     try {
@@ -290,11 +409,22 @@ function wrap(text, width) {
 async function main() {
   const args = process.argv.slice(2).filter((arg) => arg !== '--recheck');
   const again = process.argv.includes('--recheck');
-  const connection = args[0];
-  const target = args[1];
+
+  // The connection string is the key to the customer's whole database, and
+  // typed on the command line it goes into shell history and into the process
+  // list where anybody on the machine can read it. The environment variable is
+  // the way it should be given; the argument still works because taking it
+  // away would break anyone already using it.
+  const fromEnvironment = process.env.KN_DATABASE_URL;
+  const connection = args.length > 1 ? args[0] : fromEnvironment;
+  const target = args.length > 1 ? args[1] : args[0];
+
   if (!connection || !target) {
     console.error('');
+    console.error('  KN_DATABASE_URL=postgresql://...   node scan.js <schema> [--recheck]');
     console.error('  node scan.js "<connection string>" <schema> [--recheck]');
+    console.error('');
+    console.error('  <schema> is usually "public".');
     console.error('');
     process.exit(2);
   }
@@ -328,7 +458,10 @@ async function main() {
     if (!before) {
       report(result);
       saveRun(file, result);
-      process.exitCode = result.findings.length ? 1 : 0;
+      // Three answers, three codes: 0 clean, 1 problems found, 2 could not
+      // run. A scan that stopped used to exit 0 with no findings, which is
+      // what any script watching it would read as a pass.
+      process.exitCode = result.stopped ? 2 : result.findings.length ? 1 : 0;
       return;
     }
 
@@ -338,7 +471,7 @@ async function main() {
     // The verdict says what changed; this says what to do about what did not.
     if (result.findings.length) report(result);
     saveRun(file, result);
-    process.exitCode = verdict.allClear ? 0 : 1;
+    process.exitCode = result.stopped ? 2 : verdict.allClear ? 0 : 1;
   } finally {
     await client.end();
   }
@@ -353,4 +486,12 @@ if (require.main === module) {
   });
 }
 
-module.exports = { scan: scan, report: report, wrap: wrap, loadLastRun: loadLastRun, saveRun: saveRun };
+module.exports = {
+  scan: scan,
+  report: report,
+  wrap: wrap,
+  loadLastRun: loadLastRun,
+  saveRun: saveRun,
+  sweepOldCopies: sweepOldCopies,
+  ABANDONED_AFTER: ABANDONED_AFTER,
+};

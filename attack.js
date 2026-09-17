@@ -18,6 +18,14 @@ const { quote } = require('./schema.js');
 const USER_A = '11111111-1111-4111-8111-111111111111';
 const USER_B = '22222222-2222-4222-8222-222222222222';
 
+// Two more who own nothing at all. The seeded pair already hold a row each,
+// so an attack that inserts under their name collides with the row the seeder
+// put there - on a table keyed by the person, that is a primary key clash, and
+// it was being read as the app refusing the attack. These are for any attack
+// that has to add a row of its own.
+const USER_C = '55555555-5555-4555-8555-555555555555';
+const USER_D = '66666666-6666-4666-8666-666666666666';
+
 // The names an owner column is actually given, in the order they are worth
 // believing. `id` is last and only counts on a table that looks like a profile,
 // where the row id IS the person.
@@ -328,6 +336,7 @@ async function seed(client, schema, tables) {
     // rules reject all of them is reported, never quietly passed over.
     let refused = null;
     let landed = false;
+    let worked = 0;
     for (let attempt = 0; attempt < SHAPES_TO_TRY && !landed; attempt++) {
       try {
         let nth = 0;
@@ -337,6 +346,7 @@ async function seed(client, schema, tables) {
           await insertRow(client, schema, table.name, row);
         }
         landed = true;
+        worked = attempt;
       } catch (err) {
         refused = err.message;
         // A half-seeded table would make the next attempt collide with its own
@@ -348,7 +358,11 @@ async function seed(client, schema, tables) {
     }
 
     if (landed) {
-      seeded.push({ table: table.name, owner: owner });
+      // The shape that worked is kept: any later attack that has to insert into
+      // this table can use the same one instead of rediscovering it, and be
+      // sure a refusal is the app defending itself rather than a CHECK it
+      // never satisfied.
+      seeded.push({ table: table.name, owner: owner, attempt: worked });
     } else {
       // Recorded, never swallowed. The report has to say this table was not
       // checked rather than let an empty table pass for a safe one.
@@ -495,6 +509,8 @@ function summarise(result) {
 module.exports = {
   USER_A: USER_A,
   USER_B: USER_B,
+  USER_C: USER_C,
+  USER_D: USER_D,
   refusalMeans: refusalMeans,
   ownerColumn: ownerColumn,
   foreignKeys: foreignKeys,

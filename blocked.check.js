@@ -27,9 +27,13 @@
 
 const { Client } = require('pg');
 const schema = require('./schema.js');
+const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
+
+// Undoes only the auth schema this run created, and only if it created it.
+let undoAuth = async () => {};
 const STAMP = Date.now().toString(36);
 
 const results = [];
@@ -48,18 +52,30 @@ async function groundwork(client, name, options) {
     await client.query('GRANT ' + role + ' TO current_user');
     await client.query('GRANT USAGE ON SCHEMA ' + schema.quote(name) + ' TO ' + role);
   }
-  await client.query('CREATE SCHEMA IF NOT EXISTS auth');
+  undoAuth = await fixture.ensureAuth(client);
+
+  // The policy below calls a function nobody may execute. It lives in this
+  // check's own schema and auth.uid() is never touched.
+  //
+  // It used to revoke EXECUTE on auth.uid() itself. That was fine only while
+  // the checks dropped the auth schema afterwards; the moment they stopped
+  // doing that - because dropping somebody's auth schema is unforgivable - the
+  // revoke simply stayed behind, poisoning every check that ran later. On a
+  // real project it would have taken row level security out for the entire
+  // application and left it that way. A check that leaves the database worse
+  // than it found it is not a check.
   await client.query(
-    'CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
+    'CREATE FUNCTION ' + schema.quote(name) + '.whoami() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
       "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$",
   );
-  await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated');
   if (opts.canCallAuth === false) {
-    // Measured, not guessed: taking USAGE off the schema changes nothing,
+    // Measured, not guessed: taking USAGE off a schema changes nothing,
     // because a policy's function reference is resolved when the policy is
     // created. What actually stops the rule being evaluated is EXECUTE on the
     // function itself, and that is what a locked-down project revokes.
-    await client.query('REVOKE EXECUTE ON FUNCTION auth.uid() FROM PUBLIC, anon, authenticated');
+    await client.query(
+      'REVOKE EXECUTE ON FUNCTION ' + schema.quote(name) + '.whoami() FROM PUBLIC, anon, authenticated',
+    );
   }
 }
 
@@ -96,7 +112,8 @@ async function main() {
     await client.query('GRANT SELECT ON ' + qa('customers') + ' TO anon, authenticated');
     await client.query('ALTER TABLE ' + qa('customers') + ' ENABLE ROW LEVEL SECURITY');
     await client.query(
-      'CREATE POLICY own ON ' + qa('customers') + ' FOR SELECT TO anon, authenticated USING (owner = auth.uid())',
+      'CREATE POLICY own ON ' + qa('customers') +
+        ' FOR SELECT TO anon, authenticated USING (owner = ' + schema.quote(CANNOT) + '.whoami())',
     );
 
     const cannot = await scan(client, CANNOT, { quiet: true, openSession: openSessionFor(CONNECTION) });
@@ -135,7 +152,7 @@ async function main() {
       const problems = [];
       const entry = (cannot.notChecked || []).find((m) => m.table === 'customers');
       if (!entry) return ['nothing to carry a reason'];
-      if (!/permission denied for function/i.test(String(entry.why))) {
+      if (!/permission denied for function whoami/i.test(String(entry.why))) {
         problems.push('the reason does not point at what actually failed: ' + entry.why);
       }
       return problems;
@@ -168,7 +185,7 @@ async function main() {
     for (const name of [CANNOT, CLOSED]) {
       await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(name) + ' CASCADE').catch(() => {});
     }
-    await client.query('DROP SCHEMA IF EXISTS auth CASCADE').catch(() => {});
+    await undoAuth();
     await client.end();
   }
 

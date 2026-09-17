@@ -25,9 +25,13 @@
 
 const { Client } = require('pg');
 const schema = require('./schema.js');
+const fixture = require('./fixture.js');
 const attack = require('./attack.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
+
+// Undoes only the auth schema this run created, and only if it created it.
+let undoAuth = async () => {};
 
 const SOURCE = 'kn_src_' + Date.now();
 const COPY = 'kn_copy_' + Date.now();
@@ -50,12 +54,7 @@ async function buildSourceApp(client) {
 
   // The auth.uid() a real Supabase project has, so the policies below are
   // written exactly as a real one would write them.
-  await client.query('CREATE SCHEMA IF NOT EXISTS auth');
-  await client.query(
-    'CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
-      "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$",
-  );
-  await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated');
+  undoAuth = await fixture.ensureAuth(client);
 
   const q = (name) => schema.quote(SOURCE) + '.' + schema.quote(name);
 
@@ -314,6 +313,7 @@ async function main() {
         console.error('could not drop ' + name + ': ' + e.message);
       }
     }
+    await undoAuth();
     await client.end();
   }
 

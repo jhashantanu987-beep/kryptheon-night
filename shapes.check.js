@@ -19,9 +19,15 @@
 // which is why it now lives here and runs with everything else.
 const { Client } = require('pg');
 const schema = require('./schema.js');
+const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
 
 const CONN = process.argv[2] || process.env.KN_DATABASE_URL;
+
+// Undoes only the auth schema this run created, and only if it created it.
+let undoAuth = async () => {};
+// And the auth.users table, on the same terms.
+let madeAuthUsers = false;
 
 /** Each shape is a real thing an app actually has. */
 const SHAPES = [
@@ -173,6 +179,10 @@ const SHAPES = [
   {
     name: 'foreign key into auth.users (the Supabase default)',
     sql: (q) => [
+      // Created by the loop below only if it is not already there, and
+      // remembered so it can be taken away again. An auth.users left behind in
+      // somebody else's auth schema is exactly the litter this whole file
+      // exists to catch the product dropping.
       'CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY)',
       'CREATE TABLE ' + q('profiles') + ' (id uuid PRIMARY KEY REFERENCES auth.users(id), display_name text NOT NULL)',
     ],
@@ -211,12 +221,7 @@ async function groundwork(client, name) {
     await client.query('GRANT ' + role + ' TO current_user');
     await client.query('GRANT USAGE ON SCHEMA ' + schema.quote(name) + ' TO ' + role);
   }
-  await client.query('CREATE SCHEMA IF NOT EXISTS auth');
-  await client.query(
-    'CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
-      "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$",
-  );
-  await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated');
+  undoAuth = await fixture.ensureAuth(client);
 }
 
 (async () => {
@@ -226,6 +231,12 @@ async function groundwork(client, name) {
   }
   const client = new Client({ connectionString: CONN });
   await client.connect();
+
+  const { rows: already } = await client.query(
+    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace " +
+      "WHERE n.nspname = 'auth' AND c.relname = 'users'",
+  );
+  madeAuthUsers = already.length === 0;
 
   const leads = [];
   let n = 0;
@@ -283,7 +294,8 @@ async function groundwork(client, name) {
     }
   }
 
-  await client.query('DROP SCHEMA IF EXISTS auth CASCADE').catch(() => {});
+  if (madeAuthUsers) await client.query('DROP TABLE IF EXISTS auth.users CASCADE').catch(() => {});
+  await undoAuth();
   await client.end();
 
   console.log('');

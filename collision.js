@@ -205,12 +205,15 @@ async function collide(client, one, two, schema, tables, indexes) {
 
     let rows;
     try {
+      // Two people the seeder never used, or on a table keyed by the person
+      // these rows clash with the seeded ones and the clash gets read as the
+      // app refusing a duplicate it never even saw.
       // Numeric tags, so every other generated value differs between the two
       // rows. They have to collide on the column under test and on nothing
       // else, or a refusal elsewhere would be read as the app defending itself.
       rows = [
-        await attack.rowFor(client, schema, table, attack.USER_A, 101, override),
-        await attack.rowFor(client, schema, table, attack.USER_B, 102, override),
+        await attack.rowFor(client, schema, table, attack.USER_C, 101, override),
+        await attack.rowFor(client, schema, table, attack.USER_D, 102, override),
       ];
     } catch (err) {
       if (!target.covered) notTried.push({ table: target.table, column: target.column, why: err.message });

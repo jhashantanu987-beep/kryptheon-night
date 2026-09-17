@@ -20,9 +20,13 @@
 // not just go unreported - it took the whole scan down.
 const { Client } = require('pg');
 const schema = require('./schema.js');
+const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
 
 const CONN = process.argv[2] || process.env.KN_DATABASE_URL;
+
+// Undoes only the auth schema this run created, and only if it created it.
+let undoAuth = async () => {};
 
 const SHAPES = [
   {
@@ -214,12 +218,7 @@ async function groundwork(client, name) {
     await client.query('GRANT ' + role + ' TO current_user');
     await client.query('GRANT USAGE ON SCHEMA ' + schema.quote(name) + ' TO ' + role);
   }
-  await client.query('CREATE SCHEMA IF NOT EXISTS auth');
-  await client.query(
-    'CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
-      "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$",
-  );
-  await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated');
+  undoAuth = await fixture.ensureAuth(client);
 }
 
 (async () => {
@@ -282,7 +281,7 @@ async function groundwork(client, name) {
     }
   }
 
-  await client.query('DROP SCHEMA IF EXISTS auth CASCADE').catch(() => {});
+  await undoAuth();
   await client.end();
 
   console.log('');
