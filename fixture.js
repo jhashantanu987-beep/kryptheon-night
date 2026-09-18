@@ -21,6 +21,10 @@
 // itself.
 const ABANDONED_AFTER = 6 * 60 * 60 * 1000;
 
+// What a check writes on an auth.users it created, so a later run can tell
+// its own litter from a customer's table without guessing at the columns.
+const MADE_HERE = 'made by the kryptheon checks, ';
+
 /**
  * Drops fixtures an earlier run could not clean up after itself.
  *
@@ -37,7 +41,10 @@ async function sweepOldFixtures(client) {
   let rows = [];
   try {
     ({ rows } = await client.query(
-      "SELECT nspname FROM pg_namespace WHERE nspname ~ '^kn_[a-z]+_' ORDER BY 1",
+      // Digits allowed in the word on purpose. kn_hunt2_ has one, and with
+      // letters only this pattern quietly did not match its own fixtures -
+      // which reads exactly like a sweep that found nothing to do.
+      "SELECT nspname FROM pg_namespace WHERE nspname ~ '^kn_[a-z0-9]+_' ORDER BY 1",
     ));
   } catch (err) {
     return [];
@@ -56,6 +63,26 @@ async function sweepOldFixtures(client) {
       // Somebody else's to deal with. Better than failing a run over tidiness.
     }
   }
+  // And an auth.users a killed run left behind in somebody else's auth
+  // schema. Only one carrying our own mark, and only once it is old enough
+  // that no run in another window could still be using it. A customer's own
+  // auth.users has no such comment, so there is nothing to guess at - and
+  // guessing at it by its columns is exactly the mistake this module exists
+  // to stop.
+  try {
+    const { rows: note } = await client.query(
+      "SELECT obj_description('auth.users'::regclass, 'pg_class') AS mark",
+    );
+    const mark = note.length ? String(note[0].mark || '') : '';
+    const made = mark.startsWith(MADE_HERE) ? parseInt(mark.slice(MADE_HERE.length), 36) : NaN;
+    if (Number.isFinite(made) && Date.now() - made >= ABANDONED_AFTER) {
+      await client.query('DROP TABLE IF EXISTS auth.users CASCADE');
+      dropped.push('auth.users');
+    }
+  } catch (err) {
+    // No auth schema, no such table, or not ours to touch.
+  }
+
   return dropped;
 }
 
@@ -100,6 +127,34 @@ async function ensureAuth(client) {
   };
 }
 
+/**
+ * The auth.users a check needs an app to point at.
+ *
+ * Created only when there is nothing there, and marked as ours on the way
+ * in. Without the mark, "only remove what you created" has a hole: a run
+ * that dies between creating this and dropping it leaves a table that every
+ * later run reads as "already there, not mine", for ever. One did, and it
+ * took a watcher on a throwaway branch to prove it was not the live suite.
+ */
+async function ensureAuthUsers(client, definition) {
+  const { rows } = await client.query(
+    'SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace' +
+      " WHERE n.nspname = 'auth' AND c.relname = 'users'",
+  );
+  if (rows.length) return { made: false, undo: async function undo() {} };
+
+  await client.query('CREATE TABLE auth.users (' + definition + ')');
+  await client.query(
+    "COMMENT ON TABLE auth.users IS '" + MADE_HERE + Date.now().toString(36) + "'",
+  );
+  return {
+    made: true,
+    undo: async function undo() {
+      await client.query('DROP TABLE IF EXISTS auth.users CASCADE').catch(() => {});
+    },
+  };
+}
+
 /** The two roles PostgREST switches into, created only if they are missing. */
 async function ensureRoles(client, schemaName, quote) {
   for (const role of ['anon', 'authenticated']) {
@@ -114,6 +169,7 @@ async function ensureRoles(client, schemaName, quote) {
 
 module.exports = {
   ensureAuth: ensureAuth,
+  ensureAuthUsers: ensureAuthUsers,
   ensureRoles: ensureRoles,
   sweepOldFixtures: sweepOldFixtures,
   ABANDONED_AFTER: ABANDONED_AFTER,

@@ -12,13 +12,21 @@
 // loudly rather than to produce an approximate copy quietly - see
 // `unsupported` below, which is checked by the caller and is not advisory.
 //
-// What is deliberately not copied: data (none of it, ever - that is the whole
-// promise), triggers, views and functions. Unique indexes ARE copied, because
-// they decide whether the same thing can exist twice - an app that enforces
-// uniqueness with CREATE UNIQUE INDEX rather than a UNIQUE constraint would
-// otherwise arrive at the copy with none of it, and be reported as broken for
-// having got it right. Data being absent is the point; the rest is noted and
-// will matter when the Scale and Interruption attacks arrive.
+// What is deliberately not copied: data. None of it, ever - that is the whole
+// promise. Also not copied: triggers and functions.
+//
+// What IS copied, each because leaving it out changed an answer:
+//
+//   unique indexes - they decide whether the same thing can exist twice. An
+//     app that enforces uniqueness with CREATE UNIQUE INDEX rather than a
+//     UNIQUE constraint would arrive at the copy with none of it, and be
+//     reported as broken for having got it right.
+//   views - a view runs with its creator's rights unless it says otherwise,
+//     so one over a protected table hands out every row in it. Skipping them
+//     meant never looking at that door.
+//   enums and domains - the app's own types. Borrowed from the original,
+//     they made the copy depend on it; and a view that mentions an enum took
+//     the scan down outright.
 
 /* --------------------------------------------------------------------------
    Reading.
@@ -229,6 +237,47 @@ async function readViewGrants(client, schema) {
   return rows;
 }
 
+/**
+ * The types the app made for itself: enums, and domains.
+ *
+ * Copied, so that the copy stands on its own. It used to borrow them from the
+ * schema it was copied from, which worked right up until a view mentioned one:
+ * pg_get_viewdef writes a literal as 'paid'::app.order_status, the rewrite
+ * turned app into the copy, and the copy had no such type. Any app with a view
+ * over an enum column - which is a great many of them - crashed the scan
+ * outright, with a stack trace where the report should have been.
+ *
+ * Borrowing was quietly wrong anyway. A copy that reaches back into the
+ * original for anything is a copy that can change under the attack.
+ */
+async function readTypes(client, schema) {
+  const { rows } = await client.query(
+    `SELECT t.typname AS name,
+            t.typtype AS kind,
+            CASE WHEN t.typtype = 'e' THEN (
+              SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder)
+                FROM pg_enum e WHERE e.enumtypid = t.oid
+            ) END AS labels,
+            CASE WHEN t.typtype = 'd'
+                 THEN format_type(t.typbasetype, t.typtypmod) END AS base_type,
+            CASE WHEN t.typtype = 'd' THEN (
+              SELECT array_agg(pg_get_constraintdef(c.oid) ORDER BY c.conname)
+                FROM pg_constraint c WHERE c.contypid = t.oid
+            ) END AS constraints,
+            t.typnotnull AS not_null,
+            CASE WHEN t.typtype = 'd' THEN t.typdefault END AS default_value
+       FROM pg_type t
+       JOIN pg_namespace n ON n.oid = t.typnamespace
+      WHERE n.nspname = $1
+        AND t.typtype IN ('e', 'd')
+      -- Enums first. A domain can be built on one, and a domain created
+      -- before the enum it stands on is a type that does not exist yet.
+      ORDER BY CASE WHEN t.typtype = 'e' THEN 0 ELSE 1 END, t.typname`,
+    [schema],
+  );
+  return rows;
+}
+
 /** What a foreign key points at, pulled out of Postgres's own wording. */
 function referenceIn(definition) {
   const match = /FOREIGN KEY\s*\(([^)]+)\)\s*REFERENCES\s+([^\s(]+)\s*\(([^)]+)\)/i.exec(String(definition));
@@ -360,6 +409,7 @@ async function readSchema(client, schema) {
     tables: built,
     policies: await readPolicies(client, schema),
     grants: await readGrants(client, schema),
+    types: await readTypes(client, schema),
     indexes: await readIndexes(client, schema),
     views: await readViewsWithColumns(client, schema),
     viewGrants: await readViewGrants(client, schema),
@@ -483,13 +533,33 @@ function mustStayInside(statements, target) {
  * policy would widen access the original did not have.
  */
 async function writeSchema(client, plan, target) {
-  const statements = [];
+  const statements = ['CREATE SCHEMA ' + quote(target)];
 
-  await client.query('CREATE SCHEMA ' + quote(target));
+  // The app's own types first: a column, a check, a view or a cast can all
+  // name one, and nothing that mentions a type can be created before it.
+  for (const made of plan.types || []) {
+    if (made.kind === 'e') {
+      statements.push(
+        'CREATE TYPE ' + quote(target) + '.' + quote(made.name) + ' AS ENUM (' +
+          (made.labels || []).map((label) => "'" + String(label).split("'").join("''") + "'").join(', ') + ')',
+      );
+    } else {
+      const here = (text) => rewriteSchemaRefs(text, plan.schema, target);
+      // A domain can stand on another of the app's own types, and its rule can
+      // name one too, so both go through the same rewrite a column does.
+      const parts = ['CREATE DOMAIN ' + quote(target) + '.' + quote(made.name) + ' AS ' + here(made.base_type)];
+      if (made.default_value) parts.push('DEFAULT ' + here(made.default_value));
+      if (made.not_null) parts.push('NOT NULL');
+      for (const rule of made.constraints || []) parts.push(here(rule));
+      statements.push(parts.join(' '));
+    }
+  }
 
   for (const table of plan.tables) {
     const columns = table.columns.map((column) => {
-      const parts = [quote(column.name), column.type];
+      // The type is rewritten like everything else now that the copy has its
+      // own. Left alone, the copy leaned on the original for them.
+      const parts = [quote(column.name), rewriteSchemaRefs(column.type, plan.schema, target)];
       const fallback = rewriteSchemaRefs(column.default_expr, plan.schema, target);
       if (column.generated) {
         // A stored generated column carries its expression in default_expr, and
@@ -641,6 +711,13 @@ async function writeSchema(client, plan, target) {
    Checking the copy is the original.
 -------------------------------------------------------------------------- */
 
+/** A piece of SQL with its own schema name taken off, quoted or not. */
+function withoutSchema(text, plan) {
+  return String(text == null ? '' : text)
+    .split(quote(plan.schema) + '.').join('')
+    .split(plan.schema + '.').join('');
+}
+
 /**
  * Where a copy differs from what it was copied from.
  *
@@ -674,10 +751,30 @@ function diffSchemas(source, copy) {
       differences.push(table.name + ': forced row level security does not match');
     }
 
-    const shape = (t) => t.columns.map((c) => c.name + ' ' + c.type + (c.not_null ? ' NOT NULL' : '')).join(' | ');
-    if (shape(table) !== shape(mirror)) {
-      differences.push(table.name + ' columns differ:\n      ' + shape(table) + '\n      ' + shape(mirror));
+    // The schema name comes off the type first. A column of the app's own enum
+    // reads as app.order_status in the original and as <copy>.order_status in
+    // the copy - the same type, built twice, and calling that a difference
+    // would stop every scan of an app that has one.
+    const shape = (plan, t) =>
+      t.columns.map((c) => c.name + ' ' + withoutSchema(c.type, plan) + (c.not_null ? ' NOT NULL' : '')).join(' | ');
+    if (shape(source, table) !== shape(copy, mirror)) {
+      differences.push(table.name + ' columns differ:\n      ' + shape(source, table) + '\n      ' + shape(copy, mirror));
     }
+  }
+
+  // The app's own types. An enum that arrived with a label missing narrows
+  // what the attacks are able to insert, and nothing else here would notice.
+  const typeText = (plan) =>
+    (plan.types || [])
+      .map((made) =>
+        made.name + ' ' + made.kind + ' ' + (made.labels || []).join(',') + ' ' +
+        withoutSchema(made.base_type, plan) + ' ' +
+        (made.constraints || []).map((rule) => withoutSchema(rule, plan)).join(' '))
+      .sort();
+  const sourceTypes = typeText(source);
+  const copyTypes = typeText(copy);
+  for (const made of sourceTypes) {
+    if (!copyTypes.includes(made)) differences.push('a type did not come across whole: ' + made);
   }
 
   // Uniqueness decides whether the Collision attack has anything to report, so
@@ -686,7 +783,7 @@ function diffSchemas(source, copy) {
   // The schema name is stripped before comparing, since it differs by design.
   const indexText = (plan) =>
     (plan.indexes || [])
-      .map((index) => String(index.definition).split(quote(plan.schema) + '.').join('').split(plan.schema + '.').join(''))
+      .map((index) => withoutSchema(index.definition, plan))
       .sort();
   const sourceIndexes = indexText(source);
   const copyIndexes = indexText(copy);
@@ -730,10 +827,12 @@ module.exports = {
   writeSchema: writeSchema,
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,
+  readTypes: readTypes,
   readIndexes: readIndexes,
   readViews: readViews,
   readExternalTargets: readExternalTargets,
   referenceIn: referenceIn,
+  rewriteSchemaRefs: rewriteSchemaRefs,
   stubNameFor: stubNameFor,
   IDENTITIES: IDENTITIES,
   quote: quote,

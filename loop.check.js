@@ -107,7 +107,9 @@ function must(condition, what) {
   await client.connect();
 
   /* ------------------------- 1: a real fix ------------------------- */
-  const appA = 'loop_a_' + Date.now().toString(36);
+  // kn_ on purpose: that prefix is what fixture.js sweeps, and a name
+  // outside it is one no later run can ever clear away.
+  const appA = 'kn_loop_a_' + Date.now().toString(36);
   try {
     try { fs.unlinkSync(SAVED); } catch (err) { /* there was nothing saved */ }
     await buildApp(client, appA);
@@ -157,7 +159,7 @@ function must(condition, what) {
   }
 
   /* ------------------------ 2: a faked fix ------------------------ */
-  const appB = 'loop_b_' + Date.now().toString(36);
+  const appB = 'kn_loop_b_' + Date.now().toString(36);
   try {
     try { fs.unlinkSync(SAVED); } catch (err) { /* cleared between apps */ }
     await buildApp(client, appB);

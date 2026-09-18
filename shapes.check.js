@@ -26,8 +26,9 @@ const CONN = process.argv[2] || process.env.KN_DATABASE_URL;
 
 // Undoes only the auth schema this run created, and only if it created it.
 let undoAuth = async () => {};
-// And the auth.users table, on the same terms.
-let madeAuthUsers = false;
+// And the auth.users table, on the same terms. fixture.js marks the one it
+// makes, so a run that dies here does not strand it for every later run.
+let authUsers = { made: false, undo: async () => {} };
 
 /** Each shape is a real thing an app actually has. */
 const SHAPES = [
@@ -144,6 +145,20 @@ const SHAPES = [
     ],
   },
   {
+    // An enum and a view each had a shape of their own here, and both passed.
+    // Together they took the whole scan down: pg_get_viewdef writes the
+    // literal as 'paid'::app.order_status, the rewrite pointed that at the
+    // copy, and the copy had no such type. A great many apps are this shape.
+    name: 'a view that mentions an enum',
+    sql: (q, s) => [
+      'CREATE TYPE ' + schema.quote(s) + ".shipment AS ENUM ('packing', 'sent')",
+      'CREATE TABLE ' + q('parcels') + ' (id serial PRIMARY KEY, owner uuid NOT NULL, state ' +
+        schema.quote(s) + '.shipment NOT NULL)',
+      'CREATE VIEW ' + q('sent_parcels') + ' AS SELECT id, owner FROM ' + q('parcels') +
+        " WHERE state = 'sent'",
+    ],
+  },
+  {
     name: 'a BEFORE INSERT trigger',
     sql: (q, s) => [
       'CREATE TABLE ' + q('audit') + ' (id serial PRIMARY KEY, owner uuid NOT NULL, note text NOT NULL)',
@@ -232,11 +247,7 @@ async function groundwork(client, name) {
   const client = new Client({ connectionString: CONN });
   await client.connect();
 
-  const { rows: already } = await client.query(
-    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace " +
-      "WHERE n.nspname = 'auth' AND c.relname = 'users'",
-  );
-  madeAuthUsers = already.length === 0;
+  authUsers = await fixture.ensureAuthUsers(client, 'id uuid PRIMARY KEY');
 
   const leads = [];
   let n = 0;
@@ -294,7 +305,7 @@ async function groundwork(client, name) {
     }
   }
 
-  if (madeAuthUsers) await client.query('DROP TABLE IF EXISTS auth.users CASCADE').catch(() => {});
+  await authUsers.undo();
   await undoAuth();
   await client.end();
 

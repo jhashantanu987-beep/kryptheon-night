@@ -13,11 +13,13 @@ Fourteen suites. Run them after every change, not at the end.
 | `blocked.check.js` | yes | a read that failed is not a table that held |
 | `usable.check.js` | yes | what a person sees when they get the command wrong |
 | `orphans.check.js` | yes | a scan that died leaves nothing behind |
+| `guests.check.js` | yes | a check that died leaves nothing behind either |
 | `external.check.js` | yes | an app pointing at `auth.users` can be scanned |
 | `schema.check.js` | yes | the copy behaves like the app, not just looks like it |
 | `collision.check.js` | yes | "this can happen twice" is only said when it can |
 | `tamper.check.js` | yes | "a stranger can change this" is only said when it can |
 | `orphan.check.js` | yes | "this can point at nothing" is only said where a key belongs |
+| `twin.check.js` | yes | the two engines are one engine, and stay one |
 | `shapes.check.js` | yes | every shape a real app has can be tested at all |
 | `verdicts.check.js` | yes | the answer is right, not merely produced |
 | `loop.check.js` | yes | the whole thing, through the real command |
@@ -86,9 +88,29 @@ So eleven of its thirteen cases are about saying nothing: a column pointing at
 Stripe, a name that matches a table whose key is a different type, an audit
 row whose whole job is to remember somebody who has been deleted.
 
-**shapes.check.js** - twenty-five small apps, each built around a shape real
+**guests.check.js** - the rule below, tested rather than asserted. Its
+eight cases are four pairs of opposite mistakes: sweeping away a table a
+run in another window is using, and leaving one a dead run stranded;
+dropping a customer's auth.users, and failing to drop our own. It refuses
+to run at all where an auth.users is already sitting, and says so as a
+failure, because a check nobody ran must not read like one that passed.
+
+**twin.check.js** - the attacks are moving into SQL so the night shift can
+run inside the customer's own database and no password ever leaves it. That
+only works if there is one engine. Two implementations of the same idea is
+how a bug gets fixed once and survives in the other copy. So: one awkward
+fixture, read by both, compared key for key - and then the two copies they
+build compared as well, because the copy is what the attacks actually run
+against. Not close enough. Identical.
+
+It earned itself on its first run, on a list of role names that arrived as
+a string in one engine and a list in the other. It later caught a copy whose
+columns still pointed at the original's enum type.
+
+**shapes.check.js** - twenty-six small apps, each built around a shape real
 projects have and no fixture did: an enum, a `text[]`, a generated column, a
-domain type, a composite key, a table that is only an id. Skipped counts as a
+domain type, a composite key, a table that is only an id, a view that
+mentions an enum. Skipped counts as a
 failure here on purpose.
 
 **verdicts.check.js** - seventeen apps that each declare the honest answer up
@@ -124,6 +146,25 @@ at a database that already had an `auth` schema:
   it stopped being dropped, the revoke stayed and poisoned every later check.
   On a real project it would have taken row level security out for the whole
   application and left it that way. It now builds its own function to revoke.
+
+A fourth was found later, and it was in the rule itself. "Only remove what
+you created" is decided at the start of a run, so a run that dies between
+creating `auth.users` and dropping it leaves a table every later run reads
+as "already there, not mine" - for ever, by design. One turned up on the
+live database after a suite that was, in fact, clean.
+
+Proving which run leaked it needed a measurement, not an argument: a Neon
+branch, the table moved aside there, and a watcher polling every two seconds
+while the whole suite ran. It named both checks and cleared both of them -
+`external.check.js` at +269s, `shapes.check.js` at +1564s, each removing its
+own within the minute. The leftover predated all of it.
+
+So a check now writes a comment on the `auth.users` it makes, and a later
+run sweeps only a table carrying that mark and old enough that no run in
+another window could still be using it. A customer's table has no such
+comment, so there is nothing to guess at - and guessing at it by its columns
+is the same mistake wearing a different hat. `guests.check.js` is what keeps
+that honest in both directions.
 
 ## The failure that matters
 

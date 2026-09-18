@@ -41,6 +41,14 @@ async function buildApp(client) {
 
   await client.query('CREATE TYPE ' + schema.quote(APP) + ".order_status AS ENUM ('new', 'paid', 'shipped')");
   await client.query('CREATE DOMAIN ' + schema.quote(APP) + ".email_address AS text CHECK (VALUE LIKE '%@%')");
+  // A domain standing on the app's own enum. Two things only this shape
+  // reaches: the types have to be created enum-first or the domain has
+  // nothing to stand on, and the domain's base type has to be rewritten to
+  // point at the copy's enum rather than the original's.
+  await client.query(
+    'CREATE DOMAIN ' + schema.quote(APP) + '.settled_status AS ' + schema.quote(APP) + '.order_status' +
+      " CHECK (VALUE <> 'new')",
+  );
 
   await client.query(
     'CREATE TABLE ' + q('profiles') +
@@ -52,6 +60,7 @@ async function buildApp(client) {
       ' status ' + schema.quote(APP) + '.order_status NOT NULL,' +
       ' tags text[] NOT NULL, total numeric(10,2) NOT NULL,' +
       " note text NOT NULL DEFAULT 'none'," +
+      ' settled ' + schema.quote(APP) + '.settled_status,' +
       // Concatenating text, not casting a number to it: a numeric-to-text cast
       // is only stable, and Postgres refuses a generated column built on
       // anything that could change its mind.
@@ -120,7 +129,9 @@ function differences(mine, theirs, where) {
 }
 
 /** Only the parts of the shape the SQL engine has been taught so far. */
-const SO_FAR = ['schema', 'tables', 'policies', 'grants', 'indexes', 'views', 'viewGrants'];
+const SO_FAR = [
+  'schema', 'tables', 'types', 'policies', 'grants', 'indexes', 'views', 'viewGrants', 'external', 'unsupported',
+];
 
 function onlySoFar(shape) {
   const kept = {};
@@ -175,6 +186,56 @@ async function main() {
       return differences(onlySoFar(fromNode), onlySoFar(fromSql));
     })());
 
+    /* ---------------- and now the copy each of them builds ---------------- */
+
+    // The reading half agreeing is not enough. What the attacks run against is
+    // the copy, so two copies that differ mean two sets of verdicts about two
+    // different databases - and nothing outside would say which was which.
+    const byNode = APP + '_node';
+    const bySql = APP + '_sql';
+    let copyDifferences = null;
+    let nodeStatements = null;
+    let sqlStatements = null;
+
+    try {
+      nodeStatements = await schema.writeSchema(client, fromNode, byNode);
+
+      await sqlengine.withEngine(client, async (target) => {
+        sqlStatements = await sqlengine.writeSchema(client, target, fromSql, bySql);
+      });
+
+      const readBack = async (where) => {
+        const shape = onlySoFar(await schema.readSchema(client, where));
+        // Each engine names its copy differently by design, and that name is not
+        // only in `schema`: it is inside every index definition, sequence
+        // default, column type and view body too. Taken out everywhere, or each
+        // of those reads as a difference and the real ones are lost in the noise.
+        return JSON.parse(JSON.stringify(shape).split(where).join('<copy>'));
+      };
+      copyDifferences = differences(await readBack(byNode), await readBack(bySql));
+    } catch (err) {
+      copyDifferences = ['building a copy fell over: ' + err.message];
+    }
+
+    check('5. both engines want to run the same statements', (() => {
+      if (!nodeStatements || !sqlStatements) return ['one of them did not get that far'];
+      // Compared as a set: the Node side emits sequences per table as it goes
+      // and the SQL side does the same, but a difference in what is run is a
+      // difference in what gets built.
+      const mine = nodeStatements.map((s) => s.replace(new RegExp(byNode, 'g'), '<copy>')).sort();
+      const theirs = sqlStatements.map((s) => s.replace(new RegExp(bySql, 'g'), '<copy>')).sort();
+      const found = [];
+      for (const s of theirs) if (!mine.includes(s)) found.push('only sql runs: ' + s);
+      for (const s of mine) if (!theirs.includes(s)) found.push('only node runs: ' + s);
+      return found;
+    })());
+
+    check('6. and the two copies come out identical', (() => {
+      // The one that matters most in this slice. Everything after it - seeding,
+      // every attack, every verdict - is about whatever this built.
+      return copyDifferences === null ? ['it never ran'] : copyDifferences;
+    })());
+
     const { rows: left } = await client.query(
       "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'kn\\_engine\\_%'",
     );
@@ -185,6 +246,8 @@ async function main() {
     })());
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE').catch(() => {});
+    await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP + '_node') + ' CASCADE').catch(() => {});
+    await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP + '_sql') + ' CASCADE').catch(() => {});
     await undoAuth();
     await client.end();
   }

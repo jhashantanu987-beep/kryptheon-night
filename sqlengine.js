@@ -53,6 +53,30 @@ async function readSchema(client, target, source) {
 }
 
 /**
+ * What the engine would run to rebuild one schema as another.
+ *
+ * Handed back without running any of it, so the guard can look at every
+ * statement before one of them touches the database - and so a check can read
+ * what would have happened without anything happening.
+ */
+async function copyStatements(client, target, plan, into) {
+  const { rows } = await client.query(
+    'SELECT ' + quote(target) + '.copy_statements($1::jsonb, $2) AS statements',
+    [JSON.stringify(plan), into],
+  );
+  return rows[0].statements;
+}
+
+/** Builds the copy, and hands back every statement it ran. */
+async function writeSchema(client, target, plan, into) {
+  const { rows } = await client.query(
+    'SELECT ' + quote(target) + '.write_schema($1::jsonb, $2) AS statements',
+    [JSON.stringify(plan), into],
+  );
+  return rows[0].statements;
+}
+
+/**
  * Installs the engine, does something with it, and takes it away.
  *
  * The schema is named for the moment it was made, the same as the copy is, so
@@ -75,5 +99,7 @@ module.exports = {
   install: install,
   uninstall: uninstall,
   readSchema: readSchema,
+  copyStatements: copyStatements,
+  writeSchema: writeSchema,
   withEngine: withEngine,
 };

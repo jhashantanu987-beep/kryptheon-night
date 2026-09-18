@@ -31,8 +31,9 @@ const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 
 // Undoes only the auth schema this run created, and only if it created it.
 let undoAuth = async () => {};
-// And the auth.users table, on the same terms.
-let madeAuthUsers = false;
+// And the auth.users table, on the same terms. fixture.js marks the one it
+// makes, so a run that dies here does not strand it for every later run.
+let authUsers = { made: false, undo: async () => {} };
 const APP = 'kn_external_' + Date.now().toString(36);
 
 const results = [];
@@ -60,13 +61,8 @@ async function buildApp(client) {
   // can take away exactly what it added. Leaving an auth.users behind in
   // somebody else auth schema would be this check doing the very thing it
   // exists to prove the product never does.
-  const { rows: already } = await client.query(
-    "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace " +
-      "WHERE n.nspname = 'auth' AND c.relname = 'users'",
-  );
-  madeAuthUsers = already.length === 0;
-  if (madeAuthUsers) {
-    await client.query('CREATE TABLE auth.users (id uuid PRIMARY KEY, email text)');
+  authUsers = await fixture.ensureAuthUsers(client, 'id uuid PRIMARY KEY, email text');
+  if (authUsers.made) {
     await client.query(
       "INSERT INTO auth.users VALUES ('dddddddd-0000-4000-8000-00000000000d', 'real.person@example.com')",
     );
@@ -170,7 +166,7 @@ async function main() {
     })());
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE').catch(() => {});
-    if (madeAuthUsers) await client.query('DROP TABLE IF EXISTS auth.users CASCADE').catch(() => {});
+    await authUsers.undo();
     await undoAuth();
     await client.end();
   }
