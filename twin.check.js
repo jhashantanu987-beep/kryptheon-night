@@ -19,6 +19,7 @@
 const { Client } = require('pg');
 const schema = require('./schema.js');
 const fixture = require('./fixture.js');
+const attack = require('./attack.js');
 const sqlengine = require('./sqlengine.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
@@ -71,11 +72,21 @@ async function buildApp(client) {
       ' (org_id integer NOT NULL, user_id uuid NOT NULL, role text NOT NULL, PRIMARY KEY (org_id, user_id))',
   );
   await client.query('CREATE TABLE ' + q('flags') + ' (id serial PRIMARY KEY)');
+  // A varchar CHECK, whose rule Postgres writes through a cast; a value
+  // with a comma in it; and a declared width a generated value has to be
+  // cut down to. The first two were each written off as a table that could
+  // not be checked.
+  await client.query(
+    'CREATE TABLE ' + q('tickets') +
+      ' (id serial PRIMARY KEY, user_id uuid NOT NULL,' +
+      " state varchar(12) NOT NULL CHECK (state IN ('open', 'closed, really', 'it''s shut'))," +
+      ' code char(4))',
+  );
   await client.query('CREATE TABLE ' + q('sessions') + ' (id serial PRIMARY KEY, session_token text NOT NULL)');
   await client.query('CREATE UNIQUE INDEX sessions_token_key ON ' + q('sessions') + ' (session_token)');
   await client.query('CREATE VIEW ' + q('paid_orders') + ' AS SELECT id, owner, total FROM ' + q('orders') + " WHERE status = 'paid'");
 
-  for (const t of ['profiles', 'orders', 'members', 'flags', 'sessions']) {
+  for (const t of ['profiles', 'orders', 'members', 'flags', 'sessions', 'tickets']) {
     await client.query('GRANT SELECT ON ' + q(t) + ' TO anon, authenticated');
   }
   await client.query('GRANT SELECT ON ' + q('paid_orders') + ' TO anon');
@@ -236,12 +247,86 @@ async function main() {
       return copyDifferences === null ? ['it never ran'] : copyDifferences;
     })());
 
+    /* ------------- and the decisions seeding makes from it ------------- */
+
+    // Before a row can be written, three things have to be decided: who the
+    // row belongs to, what a CHECK will actually accept, and how wide a
+    // generated value may be. They are decisions taken from the shape and
+    // nothing else, so both engines can be asked the same question and their
+    // answers compared exactly - which says more than comparing seeded rows,
+    // where a disagreement only shows up as a row that looks different.
+    let seedingDifferences = null;
+    let engineForSeeding = null;
+    try {
+      await sqlengine.withEngine(client, async (target) => {
+        engineForSeeding = target;
+        const found = [];
+        const ask = async (fn, args) => {
+          const places = args.map((ignored, i) => '$' + (i + 1)).join(', ');
+          const { rows } = await client.query(
+            'SELECT ' + schema.quote(target) + '.' + fn + '(' + places + ') AS answer',
+            args,
+          );
+          return rows[0].answer;
+        };
+
+        for (const table of fromNode.tables) {
+          const mine = attack.ownerColumn(table);
+          const theirs = await ask('owner_column', [JSON.stringify(table)]);
+          if (mine !== theirs) {
+            found.push('owner of ' + table.name + ': node ' + JSON.stringify(mine) +
+              ', sql ' + JSON.stringify(theirs));
+          }
+          for (const column of table.columns) {
+            const m = attack.allowedByCheck(table, column.name);
+            const t = (await ask('allowed_by_check', [JSON.stringify(table), column.name])) || [];
+            if (JSON.stringify(m) !== JSON.stringify(t)) {
+              found.push('what a check allows in ' + table.name + '.' + column.name +
+                ': node ' + JSON.stringify(m) + ', sql ' + JSON.stringify(t));
+            }
+          }
+        }
+
+        // Widths, including the shapes that declare none and the ones whose
+        // brackets hold something that is not a width at all.
+        for (const [text, kind] of [
+          ['kryptheon test', 'character varying(6)'],
+          ['kryptheon test', 'character(4)'],
+          ['kryptheon test', 'text'],
+          ['kryptheon test', 'numeric(10,2)'],
+          ['abc', 'character varying(3)'],
+          ['', 'character varying(5)'],
+          ['kryptheon', 'timestamp with time zone'],
+        ]) {
+          const m = attack.fitTo(text, kind);
+          const t = await ask('fit_to', [text, kind]);
+          if (m !== t) {
+            found.push('fitting ' + JSON.stringify(text) + ' to ' + kind +
+              ': node ' + JSON.stringify(m) + ', sql ' + JSON.stringify(t));
+          }
+        }
+        seedingDifferences = found;
+      });
+    } catch (err) {
+      seedingDifferences = ['asking the two engines fell over: ' + err.message];
+    }
+
+    check('7. both engines decide the same things before seeding a row', (() => {
+      return seedingDifferences === null ? ['it never ran'] : seedingDifferences;
+    })());
+
     const { rows: left } = await client.query(
-      "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'kn\\_engine\\_%'",
+      'SELECT nspname FROM pg_namespace WHERE nspname = ANY($1)',
+      [[installed, engineForSeeding].filter(Boolean)],
     );
     check('4. the engine takes itself away again', (() => {
       // It gets installed into the customer's database to answer one question.
       // Leaving it there is the same litter the scan used to leave.
+      //
+      // Asked about the engines THIS run installed, by name. Asking whether
+      // any engine schema exists anywhere is a question about the whole
+      // database: one abandoned hours ago by a killed process made this fail
+      // and keep failing, blaming a run that had behaved perfectly.
       return left.length ? ['still there: ' + left.map((r) => r.nspname).join(', ')] : [];
     })());
   } finally {

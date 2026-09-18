@@ -743,3 +743,109 @@ BEGIN
   END LOOP;
   RETURN statements;
 END $$;
+
+-- --------------------------------------------------------------------------
+-- Slice 3: seeding, in SQL.
+--
+-- Mirrors attack.js. The three functions here are the deterministic half of
+-- deciding what to put in a row: who a row belongs to, how wide a value may
+-- be, and what a CHECK constraint will actually accept. They take the shape
+-- read_schema hands back and nothing else, so the twin check can compare them
+-- answer for answer with no database state in the way.
+-- --------------------------------------------------------------------------
+
+/*
+ * The column that says who a row belongs to, or NULL if nothing does.
+ *
+ * The order is what these names are worth believing, not alphabetical. `id`
+ * is last and only counts on a table that looks like a profile, where the row
+ * id IS the person.
+ */
+CREATE OR REPLACE FUNCTION __KN__.owner_column(tab jsonb)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  wanted text;
+  found text;
+BEGIN
+  FOREACH wanted IN ARRAY ARRAY['user_id', 'owner_id', 'owner', 'profile_id',
+                                'account_id', 'created_by', 'author_id'] LOOP
+    SELECT c->>'name' INTO found
+      FROM jsonb_array_elements(tab->'columns') c
+     WHERE c->>'type' = 'uuid' AND c->>'name' = wanted
+     LIMIT 1;
+    IF found IS NOT NULL THEN RETURN found; END IF;
+  END LOOP;
+
+  -- A profiles table keyed by the person themselves.
+  IF (tab->>'name') ~* '(profile|user|account|member)' THEN
+    SELECT c->>'name' INTO found
+      FROM jsonb_array_elements(tab->'columns') c
+     WHERE c->>'type' = 'uuid' AND c->>'name' = 'id'
+     LIMIT 1;
+    IF found IS NOT NULL THEN RETURN found; END IF;
+  END IF;
+
+  RETURN NULL;
+END $$;
+
+/* Keeps a generated value inside a declared width like varchar(20). */
+CREATE OR REPLACE FUNCTION __KN__.fit_to(text_ text, kind text)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  width text := (regexp_match(btrim(coalesce(kind, '')), '^[a-z ]*\((\d+)\)$'))[1];
+BEGIN
+  IF width IS NULL THEN RETURN text_; END IF;
+  IF length(text_) > width::integer THEN RETURN left(text_, width::integer); END IF;
+  RETURN text_;
+END $$;
+
+/*
+ * Values a CHECK constraint will actually accept for one column.
+ *
+ * `status text CHECK (status IN ('open','closed'))` is one of the most common
+ * things anyone writes, and Postgres stores it as
+ * `CHECK ((status = ANY (ARRAY['open'::text, 'closed'::text])))`. Reading the
+ * literals back out turns a table that could never be seeded into one that can.
+ *
+ * Only this one shape is understood, deliberately. A CHECK can contain
+ * anything, and pretending to satisfy an arbitrary one would mean inventing
+ * rows the app itself would reject.
+ */
+CREATE OR REPLACE FUNCTION __KN__.allowed_by_check(tab jsonb, column_name text)
+RETURNS text[] LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  found text[] := ARRAY[]::text[];
+  con jsonb;
+  inside text;
+  literal text;
+BEGIN
+  FOR con IN SELECT * FROM jsonb_array_elements(coalesce(tab->'constraints', '[]'::jsonb)) LOOP
+    CONTINUE WHEN con->>'kind' <> 'c';
+    -- Both spellings of the same rule. On a text column Postgres writes
+    --   state = ANY (ARRAY['open'::text, ...])
+    -- and on a varchar column it writes
+    --   (state)::text = ANY ((ARRAY['open'::character varying, ...])::text[])
+    -- which the first pattern could not cross: it stopped at the bracket that
+    -- closes the cast, so every varchar column with an IN list was seeded with
+    -- an invented value, refused by its own constraint, and its table reported
+    -- as one that could not be checked.
+    --
+    -- What may sit between the column and the = is spelled out rather than
+    -- left to a negated class: anything looser reaches across the next AND and
+    -- hands one column's allowed values to another.
+    inside := (regexp_match(
+      con->>'definition',
+      '\m' || regexp_replace(column_name, '([.*+?^${}()|\[\]\\])', '\\\1', 'g')
+        || '\M\)?(?:::[a-z ]+)?\s*=\s*ANY\s*\(+\s*ARRAY\[(.*?)\]',
+      'i'))[1];
+    CONTINUE WHEN inside IS NULL;
+    -- Picked out one at a time rather than split on commas, which came apart
+    -- in the middle of any value that had a comma in it.
+    FOR literal IN
+      SELECT (m)[1] FROM regexp_matches(inside, '''((?:[^'']|'''')*)''', 'g') m
+    LOOP
+      found := found || replace(literal, '''''', '''');
+    END LOOP;
+  END LOOP;
+  RETURN found;
+END $$;

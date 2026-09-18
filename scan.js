@@ -48,7 +48,12 @@ async function sweepOldCopies(client, mine) {
   let rows = [];
   try {
     ({ rows } = await client.query(
-      "SELECT nspname FROM pg_namespace WHERE nspname ~ '^kn_[0-9a-z]+$' AND nspname <> $1",
+      // Copies, and the engine schemas the SQL door installs. A copy is
+      // kn_<moment>; an engine is kn_engine_<moment>. The engine used to be
+      // outside this pattern entirely, so one abandoned by a dropped
+      // connection sat in the customer's database for ever - which is the
+      // one thing this product promises never to do.
+      "SELECT nspname FROM pg_namespace WHERE nspname ~ '^kn_(engine_)?[0-9a-z]+$' AND nspname <> $1",
       [mine],
     ));
   } catch (err) {
@@ -56,7 +61,10 @@ async function sweepOldCopies(client, mine) {
   }
 
   for (const row of rows) {
-    const made = parseInt(String(row.nspname).slice(3), 36);
+    // The moment is whatever follows the last underscore, which is the
+    // whole name after kn_ for a copy and the tail for an engine.
+    const parts = String(row.nspname).split('_');
+    const made = parseInt(parts[parts.length - 1], 36);
     if (!Number.isFinite(made) || Date.now() - made < ABANDONED_AFTER) continue;
     try {
       await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(row.nspname) + ' CASCADE');

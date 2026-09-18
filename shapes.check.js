@@ -84,6 +84,28 @@ const SHAPES = [
     ],
   },
   {
+    // The same rule on a varchar column, which Postgres stores as
+    //   (state)::text = ANY ((ARRAY['open'::character varying, ...])::text[])
+    // The text spelling had a shape here and passed. This one could not be
+    // seeded at all, so every table with it was reported as one that could
+    // not be checked - a hole left unexamined on an app that has nothing
+    // unusual about it.
+    name: 'check constraint on a varchar column',
+    sql: (q) => [
+      'CREATE TABLE ' + q('passes') + ' (id serial PRIMARY KEY, owner uuid NOT NULL,' +
+        " state varchar(12) NOT NULL CHECK (state IN ('open', 'closed')))",
+    ],
+  },
+  {
+    // A value with a comma in it. The allowed list used to be split on
+    // commas, which took this one apart into halves that fit nothing.
+    name: 'check constraint whose values contain commas',
+    sql: (q) => [
+      'CREATE TABLE ' + q('shipments') + ' (id serial PRIMARY KEY, owner uuid NOT NULL,' +
+        " label text NOT NULL CHECK (label IN ('packed, sealed', 'sent')))",
+    ],
+  },
+  {
     name: 'check constraint on a text column',
     sql: (q) => [
       'CREATE TABLE ' + q('tickets') + " (id serial PRIMARY KEY, owner uuid NOT NULL, status text NOT NULL CHECK (status IN ('open', 'closed')))",

@@ -12,7 +12,7 @@ Fourteen suites. Run them after every change, not at the end.
 | `untouched.check.js` | yes | nothing outside the copy is changed, at all |
 | `blocked.check.js` | yes | a read that failed is not a table that held |
 | `usable.check.js` | yes | what a person sees when they get the command wrong |
-| `orphans.check.js` | yes | a scan that died leaves nothing behind |
+| `orphans.check.js` | yes | a scan that died leaves nothing behind, copy or engine |
 | `guests.check.js` | yes | a check that died leaves nothing behind either |
 | `external.check.js` | yes | an app pointing at `auth.users` can be scanned |
 | `schema.check.js` | yes | the copy behaves like the app, not just looks like it |
@@ -107,10 +107,24 @@ It earned itself on its first run, on a list of role names that arrived as
 a string in one engine and a list in the other. It later caught a copy whose
 columns still pointed at the original's enum type.
 
-**shapes.check.js** - twenty-six small apps, each built around a shape real
+It now also compares the decisions seeding makes before it writes a row:
+who a row belongs to, what a CHECK will actually accept, and how wide a
+generated value may be. Those are decisions taken from the shape and
+nothing else, so both engines can be asked the same question and their
+answers compared exactly - which says more than comparing seeded rows,
+where a disagreement only shows up as a row that looks different.
+
+Its own check that the engine takes itself away used to ask whether any
+engine schema existed anywhere. An engine abandoned hours earlier by a
+killed process made it fail, and keep failing, blaming a run that had
+behaved perfectly. It now asks about the engines that run installed, by
+name - the same rule as everything else here: know your own litter.
+
+**shapes.check.js** - twenty-eight small apps, each built around a shape real
 projects have and no fixture did: an enum, a `text[]`, a generated column, a
 domain type, a composite key, a table that is only an id, a view that
-mentions an enum. Skipped counts as a
+mentions an enum, a CHECK on a varchar column, a CHECK whose values have
+commas in them. Skipped counts as a
 failure here on purpose.
 
 **verdicts.check.js** - seventeen apps that each declare the honest answer up
@@ -165,6 +179,48 @@ another window could still be using it. A customer's table has no such
 comment, so there is nothing to guess at - and guessing at it by its columns
 is the same mistake wearing a different hat. `guests.check.js` is what keeps
 that honest in both directions.
+
+## What the sweep could not see
+
+Three times now, something was named outside the pattern that clears it
+away, and each time the sweep looked as though it had nothing to do -
+which is indistinguishable from a clean database.
+
+- `loop.check.js` built its apps as `loop_a_` and `loop_b_`, outside the
+  `kn_` prefix anything sweeps. One stranded by a dropped connection was
+  found sitting on the live database.
+- the fixture sweep read `^kn_[a-z]+_`, which never matched `kn_hunt2_`:
+  it could not see its own fixtures.
+- the product sweep read `^kn_[0-9a-z]+$`, which matches a copy but not
+  the `kn_engine_<moment>` the SQL door installs into the customer's own
+  database. One left by a dropped connection would have stayed there for
+  good - and nothing left behind is the whole promise.
+
+Each is guarded by a pair of opposite mistakes rather than a single case,
+because a sweep has two ways to be wrong: leaving the rubbish, and taking
+away something a run in another window is using right now.
+
+## Two shapes of the same rule
+
+Postgres writes a constraint back in its own words, and its own words are
+not always the same words. `CHECK (state IN (...))` on a **text** column is
+stored as
+
+    state = ANY (ARRAY['open'::text, 'closed'::text])
+
+and on a **varchar** column as
+
+    (state)::text = ANY ((ARRAY['open'::character varying, ...])::text[])
+
+Only the first was understood. The second could not be read, so the column
+was seeded with an invented value, refused by its own constraint, and the
+whole table reported as one that could not be checked - on an app with
+nothing unusual about it. The text spelling had a shape in the checks and
+passed; nobody had written the varchar one.
+
+The allowed values were also split on commas, which took `packed, sealed`
+apart into two halves that fit nothing. They are picked out one at a time
+now.
 
 ## The failure that matters
 

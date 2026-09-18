@@ -127,14 +127,32 @@ function valueFor(column, owner, distinct, attempt) {
 function allowedByCheck(table, columnName) {
   const found = [];
   const escaped = String(columnName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const anyOf = new RegExp('\\b' + escaped + '\\b[^)]*?=\\s*ANY\\s*\\(\\s*ARRAY\\[([^\\]]*)\\]', 'i');
+  // Both spellings of the same rule. On a text column Postgres writes
+  //   state = ANY (ARRAY['open'::text, ...])
+  // and on a varchar column it writes
+  //   (state)::text = ANY ((ARRAY['open'::character varying, ...])::text[])
+  // which the first pattern could not cross: it stopped at the bracket that
+  // closes the cast. A varchar column with an IN list is an ordinary thing to
+  // write, and every table with one was seeded with an invented value, refused
+  // by its own constraint, and reported as a table that could not be checked.
+  //
+  // What may sit between the column and the = is spelled out rather than left
+  // to a negated class: anything looser reaches across the next AND and hands
+  // one column's allowed values to another.
+  const anyOf = new RegExp(
+    '\\b' + escaped + '\\b\\)?(?:::[a-z ]+)?\\s*=\\s*ANY\\s*\\(+\\s*ARRAY\\[(.*?)\\]',
+    'i',
+  );
   for (const constraint of table.constraints || []) {
     if (constraint.kind !== 'c') continue;
     const match = anyOf.exec(String(constraint.definition));
     if (!match) continue;
-    for (const piece of match[1].split(',')) {
-      const literal = /^\s*'((?:[^']|'')*)'/.exec(piece);
-      if (literal) found.push(literal[1].split("''").join("'"));
+    // Picked out one at a time rather than split on commas, which came apart
+    // in the middle of any value that had a comma in it.
+    const literals = /'((?:[^']|'')*)'/g;
+    let literal;
+    while ((literal = literals.exec(match[1])) !== null) {
+      found.push(literal[1].split("''").join("'"));
     }
   }
   return found;
@@ -513,6 +531,7 @@ module.exports = {
   USER_D: USER_D,
   refusalMeans: refusalMeans,
   ownerColumn: ownerColumn,
+  fitTo: fitTo,
   foreignKeys: foreignKeys,
   dependencyOrder: dependencyOrder,
   valueFor: valueFor,

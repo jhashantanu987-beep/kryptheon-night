@@ -26,6 +26,11 @@ function copyNamedFor(when) {
   return 'kn_' + when.toString(36);
 }
 
+/** And an engine schema, which the SQL door installs and must take away. */
+function engineNamedFor(when) {
+  return 'kn_engine_' + when.toString(36);
+}
+
 const results = [];
 function check(name, problems) {
   results.push({ name: name, problems: problems });
@@ -53,9 +58,14 @@ async function main() {
   // Named like a copy but not shaped like one: somebody else's schema that
   // happens to start the same way must not be touched.
   const notOurs = 'kn_someone_elses_' + Date.now().toString(36);
+  // The engine the SQL door installs. It was outside the sweep entirely,
+  // so one left by a dropped connection stayed in the customer's database
+  // for good - and the whole promise is that nothing is left behind.
+  const oldEngine = engineNamedFor(Date.now() - ABANDONED_AFTER - 60000);
+  const newEngine = engineNamedFor(Date.now() - 60000);
 
   try {
-    for (const name of [abandoned, running, notOurs]) {
+    for (const name of [abandoned, running, notOurs, oldEngine, newEngine]) {
       await client.query('CREATE SCHEMA ' + schema.quote(name));
       await client.query('CREATE TABLE ' + schema.quote(name) + '.leftover (id int)');
     }
@@ -83,6 +93,28 @@ async function main() {
       results[results.length - 1].problems.push('and the schema is gone');
     }
 
+    check('5. an engine an earlier run abandoned is cleared away too', (() => {
+      const problems = [];
+      if (!dropped.includes(oldEngine)) {
+        problems.push('it did not report clearing it: ' + JSON.stringify(dropped));
+      }
+      return problems;
+    })());
+    if (await exists(client, oldEngine)) {
+      results[results.length - 1].problems.push('the schema is still in the database');
+    }
+
+    check('6. an engine young enough to be in use is left alone', (() => {
+      // A scan running in another window has one installed right now, and
+      // taking it out from under that scan breaks a run that was going fine.
+      const problems = [];
+      if (dropped.includes(newEngine)) problems.push('it dropped an engine installed a minute ago');
+      return problems;
+    })());
+    if (!(await exists(client, newEngine))) {
+      results[results.length - 1].problems.push('and the schema is gone');
+    }
+
     check('4. a schema that merely starts the same way is not ours to drop', (() => {
       const problems = [];
       if (dropped.includes(notOurs)) problems.push('it dropped a schema it did not make');
@@ -92,7 +124,7 @@ async function main() {
       results[results.length - 1].problems.push('and the schema is gone');
     }
   } finally {
-    for (const name of [abandoned, running, notOurs, mine]) {
+    for (const name of [abandoned, running, notOurs, mine, oldEngine, newEngine]) {
       await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(name) + ' CASCADE').catch(() => {});
     }
     await client.end();
