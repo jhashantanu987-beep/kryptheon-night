@@ -138,7 +138,14 @@ async function readPolicies(client, schema) {
     `SELECT tablename AS table_name,
             policyname AS name,
             permissive,
-            roles,
+            -- Cast on purpose. pg_policies.roles is name[], which
+            -- node-postgres has no parser for, so it arrives as the raw
+            -- string "{anon,authenticated}" - and code that treats it as a
+            -- list gets the characters of that string instead of the roles.
+            -- roleList() was written to undo that; casting here means there is
+            -- nothing to undo. The third time this exact shape has cost a bug,
+            -- and the one the two engines disagreed about on their first run.
+            roles::text[] AS roles,
             cmd,
             qual,
             with_check
