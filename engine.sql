@@ -599,7 +599,9 @@ BEGIN
       out := out || ('CREATE TYPE ' || here || '.' || __KN__.always_quote(made->>'name')
         || ' AS ENUM (' || coalesce((SELECT string_agg(
                                        '''' || replace(label, '''', '''''') || '''', ', ' ORDER BY at)
-                                       FROM jsonb_array_elements_text(made->'labels')
+                                       FROM jsonb_array_elements_text(
+                                              CASE WHEN jsonb_typeof(made->'labels') = 'array'
+                                                   THEN made->'labels' ELSE '[]'::jsonb END)
                                               WITH ORDINALITY AS l(label, at)), '') || ')');
     ELSE
       out := out || (('CREATE DOMAIN ' || here || '.' || __KN__.always_quote(made->>'name')
@@ -607,7 +609,9 @@ BEGIN
         || coalesce(' DEFAULT ' || __KN__.rewrite_schema_refs(made->>'default_value', source, target), '')
         || CASE WHEN (made->>'not_null')::boolean THEN ' NOT NULL' ELSE '' END
         || coalesce((SELECT string_agg(' ' || __KN__.rewrite_schema_refs(rule, source, target), '' ORDER BY at)
-                       FROM jsonb_array_elements_text(made->'constraints')
+                       FROM jsonb_array_elements_text(
+                              CASE WHEN jsonb_typeof(made->'constraints') = 'array'
+                                   THEN made->'constraints' ELSE '[]'::jsonb END)
                               WITH ORDINALITY AS r(rule, at)), ''));
     END IF;
   END LOOP;
@@ -848,4 +852,74 @@ BEGIN
     END LOOP;
   END LOOP;
   RETURN found;
+END $$;
+
+/*
+ * Something valid to put in a column, so a row can exist at all.
+ *
+ * Mirrors valueFor in attack.js. What comes back is the TEXT of the value,
+ * which the insert casts to the column's own type - the Node side hands the
+ * same thing to the driver as a parameter instead. Both are "the value that
+ * belongs here", written the way each engine has to write it.
+ *
+ * `distinct` is what keeps two seeded rows from being identical. Without it
+ * every row carried the same text, so a table with a unique email column
+ * refused the second insert and the whole table was reported as "not checked"
+ * - a well-built app treated as an unknown one. The tag goes at the front
+ * because a narrow varchar truncates the end, and two rows truncated to the
+ * same string is that bug all over again.
+ */
+CREATE OR REPLACE FUNCTION __KN__.value_for(col jsonb, owner text, distinct_ text, attempt integer)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  -- A domain is somebody's own type with a rule bolted on. The rule cannot be
+  -- guessed at from here, but the type underneath it can be filled in.
+  kind text := lower(coalesce(col->>'base_type', col->>'type'));
+  tag text := coalesce(distinct_, '');
+  step integer := coalesce(nullif(tag, '')::numeric::integer, 0);
+  shapes text[];
+  nth integer;
+BEGIN
+  -- An enum accepts one of a fixed list and nothing else. Every generated
+  -- string was rejected, and the table went down as "not checked".
+  IF jsonb_typeof(col->'enum_labels') = 'array'
+     AND jsonb_array_length(col->'enum_labels') > 0 THEN
+    RETURN col->'enum_labels'->>0;
+  END IF;
+  -- Anything at all is allowed in an empty array, whatever the element type.
+  IF (col->>'is_array')::boolean OR kind ~ '\[\]$' THEN RETURN '{}'; END IF;
+
+  IF kind = 'uuid' THEN RETURN owner; END IF;
+  IF kind ~ '^(integer|bigint|smallint|numeric|decimal|real|double|money)' THEN
+    RETURN (1 + step)::text;
+  END IF;
+  IF kind ~ '^bool' THEN RETURN 'true'; END IF;
+  IF kind ~ '^(timestamp|date)' THEN
+    RETURN to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+  END IF;
+  IF kind ~ '^time' THEN RETURN '12:00:00'; END IF;
+  IF kind ~ '^interval' THEN RETURN '1 day'; END IF;
+  IF kind ~ '^json' THEN RETURN '{}'; END IF;
+  IF kind ~ '^(inet|cidr)' THEN RETURN '192.0.2.' || (1 + step)::text; END IF;
+  IF kind ~ '^macaddr8' THEN RETURN '08:00:2b:01:02:03:04:0' || (5 + step)::text; END IF;
+  IF kind ~ '^macaddr' THEN RETURN '08:00:2b:01:02:0' || (3 + step)::text; END IF;
+  IF kind ~ '^(tsvector|tsquery)' THEN RETURN 'kryptheon'; END IF;
+  IF kind ~ '^bytea' THEN RETURN 'kryptheon'; END IF;
+  IF kind ~ '^xml' THEN RETURN '<kryptheon/>'; END IF;
+  IF kind ~ '^bit' THEN RETURN '0'; END IF;
+  IF kind ~ '^(point|line|lseg|box|path|polygon|circle)' THEN RETURN '(0,0)'; END IF;
+
+  -- Text is where the rules live that cannot be read: a domain that insists on
+  -- an @, a CHECK on a length, a regex for a product code. Rather than pretend
+  -- to understand them, the seeder works down a short ladder of shapes and
+  -- keeps whichever one the database accepts.
+  shapes := ARRAY[
+    CASE WHEN tag <> '' THEN tag || ' kryptheon test' ELSE 'kryptheon test' END,
+    'kryptheon' || tag || '@example.com',
+    'KN' || CASE WHEN tag <> '' THEN tag ELSE '1' END,
+    (step + 1)::text,
+    'https://example.com/kryptheon'
+  ];
+  nth := least(greatest(coalesce(attempt, 0), 0), array_length(shapes, 1) - 1);
+  RETURN __KN__.fit_to(shapes[nth + 1], kind);
 END $$;

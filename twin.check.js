@@ -24,6 +24,18 @@ const sqlengine = require('./sqlengine.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 const APP = 'kn_twin_' + Date.now().toString(36);
+// The table that holds one column of every type the seeder has a rule for.
+const EVERYTHING = 'everything';
+// Any one of the seeded people; which of them is not what is under test.
+const SOMEBODY = '11111111-1111-4111-8111-111111111111';
+
+/** What a value the Node side would hand the driver looks like written down. */
+function asText(value) {
+  if (value === null || value === undefined) return null;
+  if (Buffer.isBuffer(value)) return value.toString();
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
 
 // Undoes only the auth schema this run created, and only if it created it.
 let undoAuth = async () => {};
@@ -42,6 +54,8 @@ async function buildApp(client) {
 
   await client.query('CREATE TYPE ' + schema.quote(APP) + ".order_status AS ENUM ('new', 'paid', 'shipped')");
   await client.query('CREATE DOMAIN ' + schema.quote(APP) + ".email_address AS text CHECK (VALUE LIKE '%@%')");
+  await client.query('CREATE DOMAIN ' + schema.quote(APP) + '.positive_count AS integer CHECK (VALUE > 0)');
+  await client.query('CREATE DOMAIN ' + schema.quote(APP) + '.short_code AS varchar(4)');
   // A domain standing on the app's own enum. Two things only this shape
   // reaches: the types have to be created enum-first or the domain has
   // nothing to stand on, and the domain's base type has to be rewritten to
@@ -84,9 +98,22 @@ async function buildApp(client) {
   );
   await client.query('CREATE TABLE ' + q('sessions') + ' (id serial PRIMARY KEY, session_token text NOT NULL)');
   await client.query('CREATE UNIQUE INDEX sessions_token_key ON ' + q('sessions') + ' (session_token)');
+  await client.query(
+    'CREATE TABLE ' + q('everything') + ' (' +
+      'a_uuid uuid, a_int integer, a_big bigint, a_num numeric(10,2), a_real real,' +
+      ' a_bool boolean, a_ts timestamptz, a_date date, a_time time, a_interval interval,' +
+      ' a_json jsonb, a_inet inet, a_cidr cidr, a_mac macaddr, a_mac8 macaddr8,' +
+      ' a_tsv tsvector, a_bytea bytea, a_xml xml, a_bit bit(1), a_point point,' +
+      ' a_text text, a_varchar varchar(9), a_char char(3), a_money money,' +
+      ' a_enum ' + schema.quote(APP) + '.order_status,' +
+      ' a_domain ' + schema.quote(APP) + '.email_address,' +
+      ' a_counted ' + schema.quote(APP) + '.positive_count,' +
+      ' a_short ' + schema.quote(APP) + '.short_code,' +
+      ' a_array text[])',
+  );
   await client.query('CREATE VIEW ' + q('paid_orders') + ' AS SELECT id, owner, total FROM ' + q('orders') + " WHERE status = 'paid'");
 
-  for (const t of ['profiles', 'orders', 'members', 'flags', 'sessions', 'tickets']) {
+  for (const t of ['profiles', 'orders', 'members', 'flags', 'sessions', 'tickets', 'everything']) {
     await client.query('GRANT SELECT ON ' + q(t) + ' TO anon, authenticated');
   }
   await client.query('GRANT SELECT ON ' + q('paid_orders') + ' TO anon');
@@ -305,6 +332,33 @@ async function main() {
               ': node ' + JSON.stringify(m) + ', sql ' + JSON.stringify(t));
           }
         }
+        // And the value each engine would put in a column. The Node side
+        // hands a value to the driver as a parameter and the SQL side
+        // returns the text the insert casts, so they are compared as text:
+        // the thing that, put in that column, is the value.
+        const everything = fromNode.tables.find((t) => t.name === EVERYTHING);
+        for (const column of (everything || { columns: [] }).columns) {
+          const moment = /^(timestamp|date)/.test(String(column.base_type || column.type).toLowerCase());
+          for (const [distinct, attempt] of [[null, 0], ['2', 0], ['3', 1], ['2', 4], [null, 9]]) {
+            const m = asText(attack.valueFor(column, SOMEBODY, distinct, attempt));
+            const t = await ask('value_for', [JSON.stringify(column), SOMEBODY, distinct, attempt]);
+            // A moment is the one thing that cannot match exactly: each
+            // engine reads its own clock. Both have to produce one, though.
+            if (moment) {
+              if (Number.isNaN(Date.parse(m)) || Number.isNaN(Date.parse(t))) {
+                found.push('a moment for ' + column.name + ': node ' + JSON.stringify(m) +
+                  ', sql ' + JSON.stringify(t));
+              }
+              continue;
+            }
+            if (m !== t) {
+              found.push('what goes in ' + column.name + ' (' + column.type + ')' +
+                ' with tag ' + JSON.stringify(distinct) + ' on try ' + attempt +
+                ': node ' + JSON.stringify(m) + ', sql ' + JSON.stringify(t));
+            }
+          }
+        }
+
         seedingDifferences = found;
       });
     } catch (err) {

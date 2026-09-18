@@ -189,6 +189,21 @@ const SHAPES = [
     ],
   },
   {
+    // A domain with no rule on it, over a type that is not text. The one
+    // below carries a CHECK and sits over text, and both of those hid
+    // something: an empty list of rules reads as null rather than as a
+    // list, and a domain over text lands on the same value as text does
+    // whether or not the type underneath is looked at.
+    name: 'a domain with no rule, over a narrow type',
+    sql: (q, s) => [
+      'CREATE DOMAIN ' + schema.quote(s) + '.short_code AS varchar(4)',
+      'CREATE DOMAIN ' + schema.quote(s) + '.positive_count AS integer CHECK (VALUE > 0)',
+      'CREATE TABLE ' + q('coupons') + ' (id serial PRIMARY KEY, owner uuid NOT NULL,' +
+        ' code ' + schema.quote(s) + '.short_code NOT NULL,' +
+        ' uses ' + schema.quote(s) + '.positive_count NOT NULL)',
+    ],
+  },
+  {
     name: 'a domain type',
     sql: (q, s) => [
       'CREATE DOMAIN ' + schema.quote(s) + '.email_address AS text CHECK (VALUE LIKE ' + "'%@%'" + ')',
