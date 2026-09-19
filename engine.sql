@@ -1035,3 +1035,264 @@ BEGIN
   END LOOP;
   RETURN out;
 END $$;
+
+-- --------------------------------------------------------------------------
+-- Seeding, the half that writes.
+--
+-- Everything above this decides things from the shape and nothing else. From
+-- here on rows really go in, which is why the twin check stops comparing
+-- answers and starts comparing the two copies that come out.
+-- --------------------------------------------------------------------------
+
+/* The two people the copy is seeded with. */
+CREATE OR REPLACE FUNCTION __KN__.user_a() RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT '11111111-1111-4111-8111-111111111111';
+$$;
+CREATE OR REPLACE FUNCTION __KN__.user_b() RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT '22222222-2222-4222-8222-222222222222';
+$$;
+
+/*
+ * One row that is really in the parent table, so a foreign key is satisfied.
+ *
+ * The whole row, not one column of it. A composite key has to point at a pair
+ * that exists together: borrowing each column from a separate row would build
+ * a combination the parent never had.
+ */
+CREATE OR REPLACE FUNCTION __KN__.existing_row(source text, key jsonb)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  picked text[];
+  names text;
+BEGIN
+  SELECT string_agg(__KN__.always_quote(name), ', ' ORDER BY at) INTO names
+    FROM jsonb_array_elements_text(key->'refColumns') WITH ORDINALITY AS c(name, at);
+  IF names IS NULL THEN RETURN NULL; END IF;
+
+  EXECUTE 'SELECT ARRAY[' || replace(names, ', ', '::text, ') || '::text] FROM '
+    || __KN__.always_quote(source) || '.' || __KN__.always_quote(key->>'refTable')
+    || ' LIMIT 1'
+    INTO picked;
+  IF picked IS NULL THEN RETURN NULL; END IF;
+  RETURN to_jsonb(picked);
+EXCEPTION WHEN OTHERS THEN
+  -- A parent that cannot be read is a key that cannot be satisfied, and the
+  -- table that holds it is reported rather than guessed at.
+  RETURN NULL;
+END $$;
+
+/*
+ * A row that will actually go in.
+ *
+ * Owner column set to the person, foreign keys pointing at rows that really
+ * exist, every NOT NULL column filled, and anything with a default left to
+ * supply its own value.
+ *
+ * `overrides` is what the Collision attack needs: it forces one column to a
+ * chosen value while everything else stays distinct, so when two inserts race
+ * they collide on that column and on nothing else. Without it a second unique
+ * column elsewhere in the table would refuse the insert, and the refusal would
+ * be read as the app defending itself.
+ */
+CREATE OR REPLACE FUNCTION __KN__.row_for(
+  source text, tab jsonb, person text, distinct_ text, overrides jsonb, attempt integer)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  forced jsonb := coalesce(overrides, '{}'::jsonb);
+  owner text := __KN__.owner_column(tab);
+  columns jsonb := '[]'::jsonb;
+  values_ jsonb := '[]'::jsonb;
+  borrowed jsonb := '{}'::jsonb;
+  part_of_key jsonb := '[]'::jsonb;
+  key jsonb;
+  row_ jsonb;
+  col jsonb;
+  name text;
+  allowed text[];
+  nth integer;
+  at integer;
+BEGIN
+  -- Every column that takes part in a foreign key, and the value it has to
+  -- hold. Resolved one key at a time so that all of a composite key's columns
+  -- come from the same parent row.
+  FOR key IN SELECT * FROM jsonb_array_elements(__KN__.foreign_keys(tab)) LOOP
+    row_ := __KN__.existing_row(source, key);
+    CONTINUE WHEN row_ IS NULL;
+    at := 0;
+    FOR name IN SELECT jsonb_array_elements_text(key->'columns') LOOP
+      IF NOT (borrowed ? name) THEN
+        borrowed := jsonb_set(borrowed, ARRAY[name], coalesce(row_->at, 'null'::jsonb));
+      END IF;
+      at := at + 1;
+    END LOOP;
+  END LOOP;
+  FOR key IN SELECT * FROM jsonb_array_elements(__KN__.foreign_keys(tab)) LOOP
+    part_of_key := part_of_key || (key->'columns');
+  END LOOP;
+
+  FOR col IN SELECT * FROM jsonb_array_elements(tab->'columns') LOOP
+    name := col->>'name';
+
+    IF forced ? name THEN
+      columns := columns || to_jsonb(name);
+      values_ := values_ || jsonb_build_array(forced->name);
+      CONTINUE;
+    END IF;
+
+    IF name = owner THEN
+      columns := columns || to_jsonb(name);
+      values_ := values_ || jsonb_build_array(to_jsonb(person));
+      CONTINUE;
+    END IF;
+
+    -- A column pointing at another table has to hold something that is
+    -- actually there, whatever its type would otherwise suggest.
+    IF part_of_key ? name THEN
+      IF borrowed ? name THEN
+        columns := columns || to_jsonb(name);
+        values_ := values_ || jsonb_build_array(borrowed->name);
+        CONTINUE;
+      END IF;
+      IF (col->>'not_null')::boolean THEN
+        RAISE EXCEPTION 'nothing to point % at', name;
+      END IF;
+      CONTINUE;
+    END IF;
+
+    -- A generated column computes itself and refuses to be written to at all.
+    --
+    -- Two halves, and only one of them can be observed. An identity column
+    -- carries no default_expr, so without the identity half the seeder writes
+    -- to it and Postgres refuses the row - both engines are caught doing it.
+    -- A stored generated column keeps its expression IN default_expr, so the
+    -- line below skips it whether or not this one does: removing the generated
+    -- half changes nothing any fixture could see. It stays because that is a
+    -- fact about how readColumns fills the shape, not about Postgres, and the
+    -- day it changes this is the only thing standing in the way.
+    CONTINUE WHEN col->>'generated' IS NOT NULL OR (col->>'identity')::boolean;
+    -- Anything with a default can supply its own value.
+    CONTINUE WHEN col->>'default_expr' IS NOT NULL;
+    CONTINUE WHEN NOT (col->>'not_null')::boolean;
+
+    columns := columns || to_jsonb(name);
+    -- A CHECK that lists what it will accept beats anything invented here.
+    allowed := __KN__.allowed_by_check(tab, name);
+    IF array_length(allowed, 1) > 0 THEN
+      nth := least(greatest(coalesce(attempt, 0), 0), array_length(allowed, 1) - 1);
+      values_ := values_ || jsonb_build_array(to_jsonb(allowed[nth + 1]));
+    ELSE
+      values_ := values_ || jsonb_build_array(
+        to_jsonb(__KN__.value_for(col, person, distinct_, attempt)));
+    END IF;
+  END LOOP;
+
+  RETURN jsonb_build_object('columns', columns, 'values', values_);
+END $$;
+
+/* Puts a built row in. Separate so the same row can be raced against itself. */
+CREATE OR REPLACE FUNCTION __KN__.insert_row(source text, table_name text, row_ jsonb)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  where_ text := 'INSERT INTO ' || __KN__.always_quote(source) || '.' || __KN__.always_quote(table_name);
+  names text;
+  places text;
+BEGIN
+  -- A table of nothing but an id and its defaults leaves no columns to name,
+  -- and "INSERT INTO t () VALUES ()" is a syntax error. Postgres has a
+  -- spelling for exactly this, and without it every settings and flags table
+  -- in the world came back as one that could not be checked.
+  IF jsonb_array_length(row_->'columns') = 0 THEN
+    EXECUTE where_ || ' DEFAULT VALUES';
+    RETURN;
+  END IF;
+
+  SELECT string_agg(__KN__.always_quote(name), ', ' ORDER BY at) INTO names
+    FROM jsonb_array_elements_text(row_->'columns') WITH ORDINALITY AS c(name, at);
+  -- Written as literals rather than passed as parameters: EXECUTE ... USING
+  -- needs a fixed argument list, and the number of columns is not known until
+  -- the row is built. quote_nullable casts nothing and lets the column's own
+  -- type decide, which is what the driver does for the other engine.
+  SELECT string_agg(quote_nullable(v), ', ' ORDER BY at) INTO places
+    FROM jsonb_array_elements_text(row_->'values') WITH ORDINALITY AS c(v, at);
+
+  EXECUTE where_ || ' (' || names || ') VALUES (' || places || ')';
+END $$;
+
+/*
+ * Two people, in every table, in an order that can actually be satisfied.
+ *
+ * A table whose rules reject every shape offered is reported, never quietly
+ * passed over: an empty table and an open one look identical from outside.
+ */
+CREATE OR REPLACE FUNCTION __KN__.seed(source text, tables jsonb)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  seeded jsonb := '[]'::jsonb;
+  skipped jsonb := '[]'::jsonb;
+  tab jsonb;
+  owner text;
+  people text[];
+  person text;
+  refused text;
+  landed boolean;
+  worked integer;
+  attempt integer;
+  nth integer;
+  shapes_to_try constant integer := 5;
+BEGIN
+  FOR tab IN SELECT * FROM jsonb_array_elements(__KN__.dependency_order(tables)) LOOP
+    owner := __KN__.owner_column(tab);
+
+    -- A table with nobody's name on it still gets a row. Without one, an open
+    -- door cannot be told from an empty room: a logged-out stranger reads zero
+    -- rows either way, and the tool reports the app as safe. Settings tables,
+    -- waitlists and contact forms are exactly this shape, and exactly the ones
+    -- that get left open.
+    IF owner IS NULL THEN
+      people := ARRAY[__KN__.user_a()];
+    ELSE
+      people := ARRAY[__KN__.user_a(), __KN__.user_b()];
+    END IF;
+
+    refused := NULL;
+    landed := false;
+    worked := 0;
+
+    attempt := 0;
+    WHILE attempt < shapes_to_try AND NOT landed LOOP
+      BEGIN
+        nth := 0;
+        FOREACH person IN ARRAY people LOOP
+          nth := nth + 1;
+          PERFORM __KN__.insert_row(source, tab->>'name',
+            __KN__.row_for(source, tab, person, nth::text, NULL, attempt));
+        END LOOP;
+        landed := true;
+        worked := attempt;
+      EXCEPTION WHEN OTHERS THEN
+        refused := SQLERRM;
+        -- The block is a subtransaction, so anything that did go in on this
+        -- attempt is already gone. The other engine has to delete it by hand;
+        -- what matters is that the next attempt does not collide with a row
+        -- this one left behind.
+      END;
+      attempt := attempt + 1;
+    END LOOP;
+
+    IF landed THEN
+      -- The shape that worked is kept: any later attack that has to insert
+      -- into this table can use the same one instead of rediscovering it, and
+      -- be sure a refusal is the app defending itself rather than a CHECK it
+      -- never satisfied.
+      seeded := seeded || jsonb_build_array(jsonb_build_object(
+        'table', tab->>'name', 'owner', owner, 'attempt', worked));
+    ELSE
+      -- Recorded, never swallowed. The report has to say this table was not
+      -- checked rather than let an empty table pass for a safe one.
+      skipped := skipped || jsonb_build_array(jsonb_build_object(
+        'table', tab->>'name', 'why', refused));
+    END IF;
+  END LOOP;
+
+  RETURN jsonb_build_object('seeded', seeded, 'skipped', skipped);
+END $$;

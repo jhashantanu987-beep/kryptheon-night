@@ -289,6 +289,15 @@ async function rowFor(client, schema, table, person, distinct, overrides, attemp
       continue;
     }
     // A generated column computes itself and refuses to be written to at all.
+    //
+    // Two halves, and only one of them can be observed. An identity column
+    // carries no default_expr, so without the identity half the seeder writes
+    // to it and Postgres refuses the row - both engines are caught doing it.
+    // A stored generated column keeps its expression IN default_expr, so the
+    // line below skips it whether or not this one does: removing the generated
+    // half changes nothing any fixture could see. It stays because that is a
+    // fact about how readColumns fills the shape, not about Postgres, and the
+    // day it changes this is the only thing standing in the way.
     if (column.generated || column.identity) continue;
     // Anything with a default can supply its own value.
     if (column.default_expr) continue;

@@ -45,6 +45,30 @@ function check(name, problems) {
   results.push({ name: name, problems: problems });
 }
 
+/** Every row of every table of a copy, as text, in an order that does not vary. */
+async function contentsOf(client, where) {
+  const { rows: tables } = await client.query(
+    'SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace' +
+      " WHERE n.nspname = $1 AND c.relkind = 'r' ORDER BY c.relname",
+    [where],
+  );
+  const out = {};
+  for (const one of tables) {
+    const { rows: cols } = await client.query(
+      "SELECT attname FROM pg_attribute WHERE attrelid = format('%I.%I', $1::text, $2::text)::regclass" +
+        ' AND attnum > 0 AND NOT attisdropped ORDER BY attnum',
+      [where, one.relname],
+    );
+    const named = cols.map((col) => schema.quote(col.attname) + '::text').join(", ' | ', ");
+    const { rows } = await client.query(
+      "SELECT concat_ws('', " + named + ') AS line FROM ' +
+        schema.quote(where) + '.' + schema.quote(one.relname) + ' ORDER BY 1',
+    );
+    out[one.relname] = rows.map((r) => r.line);
+  }
+  return out;
+}
+
 /** An app made of everything that has ever been read wrong. */
 async function buildApp(client) {
   const q = (name) => schema.quote(APP) + '.' + schema.quote(name);
@@ -241,6 +265,13 @@ async function main() {
     const byNode = APP + '_node';
     const bySql = APP + '_sql';
     let copyDifferences = null;
+    const seededDifferences = [];
+    // Set when the seeding actually ran. Without it, a copy that fell over
+    // before seeding left this check with nothing to report and passing -
+    // which is the exact shape of failure this whole file exists to catch,
+    // and it was in the check that catches it.
+    let seedingRan = false;
+    let engineForSeeding = null;
     let nodeStatements = null;
     let sqlStatements = null;
 
@@ -260,6 +291,44 @@ async function main() {
         return JSON.parse(JSON.stringify(shape).split(where).join('<copy>'));
       };
       copyDifferences = differences(await readBack(byNode), await readBack(bySql));
+
+      // And now the rows. Up to here the two engines were asked the same
+      // question and their answers compared; a seeder cannot be checked
+      // that way, because what matters is not what it says but what ends
+      // up in the table the attacks are about to run against.
+      const mineSeeded = await attack.seed(client, byNode, fromNode.tables);
+      let theirsSeeded = null;
+      await sqlengine.withEngine(client, async (target) => {
+        engineForSeeding = target;
+        const { rows } = await client.query(
+          'SELECT ' + schema.quote(target) + '.seed($1, $2::jsonb) AS answer',
+          [bySql, JSON.stringify(fromSql.tables)],
+        );
+        theirsSeeded = rows[0].answer;
+      });
+
+      const told = (r) => JSON.stringify({
+        seeded: (r.seeded || []).map((s) => s.table + '/' + s.owner + '/' + s.attempt).sort(),
+        skipped: (r.skipped || []).map((s) => s.table).sort(),
+      });
+      if (told(mineSeeded) !== told(theirsSeeded)) {
+        seededDifferences.push('the seeders report different things:' +
+          '\n        node ' + told(mineSeeded) + '\n        sql  ' + told(theirsSeeded));
+      }
+      // A table nobody could seed is the one thing that must never differ
+      // quietly: it is the difference between a hole examined and a hole
+      // written off as unknown.
+      const left = await contentsOf(client, byNode);
+      const right = await contentsOf(client, bySql);
+      for (const table of Object.keys(left)) {
+        const a = JSON.stringify(left[table]);
+        const b = JSON.stringify(right[table] === undefined ? null : right[table]);
+        if (a !== b) {
+          seededDifferences.push(table + ' came out different:' +
+            '\n        node ' + a + '\n        sql  ' + b);
+        }
+      }
+      seedingRan = true;
     } catch (err) {
       copyDifferences = ['building a copy fell over: ' + err.message];
     }
@@ -292,7 +361,6 @@ async function main() {
     // answers compared exactly - which says more than comparing seeded rows,
     // where a disagreement only shows up as a row that looks different.
     let seedingDifferences = null;
-    let engineForSeeding = null;
     try {
       await sqlengine.withEngine(client, async (target) => {
         engineForSeeding = target;
@@ -402,6 +470,14 @@ async function main() {
     } catch (err) {
       seedingDifferences = ['asking the two engines fell over: ' + err.message];
     }
+
+    check('8. and seed the copy into the same state', (() => {
+      // The one the attacks stand on. Two copies seeded differently mean
+      // two sets of verdicts about two different databases, and nothing
+      // outside would say which was which.
+      if (!seedingRan) return ['it never ran: ' + (copyDifferences || ['no copy']).join('; ')];
+      return seededDifferences;
+    })());
 
     check('7. both engines decide the same things before seeding a row', (() => {
       return seedingDifferences === null ? ['it never ran'] : seedingDifferences;
