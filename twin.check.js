@@ -86,6 +86,12 @@ async function buildApp(client) {
       ' (org_id integer NOT NULL, user_id uuid NOT NULL, role text NOT NULL, PRIMARY KEY (org_id, user_id))',
   );
   await client.query('CREATE TABLE ' + q('flags') + ' (id serial PRIMARY KEY)');
+  await client.query('CREATE TABLE ' + q('User Groups') + ' (' + schema.quote('Group Id') + ' integer PRIMARY KEY)');
+  await client.query('CREATE TABLE ' + q('memberships') + ' (id serial PRIMARY KEY, ' + schema.quote('Group Id') + ' integer NOT NULL REFERENCES ' + q('User Groups') + ' (' + schema.quote('Group Id') + '))');
+  await client.query('ALTER TABLE ' + q('orders') + ' ADD CONSTRAINT orders_owner_fkey FOREIGN KEY (owner) REFERENCES ' + q('profiles') + '(id)');
+  await client.query('CREATE TABLE ' + q('carts') + ' (org_id integer, cart_id integer, PRIMARY KEY (org_id, cart_id))');
+  await client.query('CREATE TABLE ' + q('cart_items') + ' (id serial PRIMARY KEY, org_id integer NOT NULL, cart_id integer NOT NULL,' + ' FOREIGN KEY (org_id, cart_id) REFERENCES ' + q('carts') + ' (org_id, cart_id))');
+  await client.query('CREATE TABLE ' + q('folders') + ' (id integer PRIMARY KEY, parent_id integer REFERENCES ' + q('folders') + '(id))');
   // A varchar CHECK, whose rule Postgres writes through a cast; a value
   // with a comma in it; and a declared width a generated value has to be
   // cut down to. The first two were each written off as a table that could
@@ -113,7 +119,10 @@ async function buildApp(client) {
   );
   await client.query('CREATE VIEW ' + q('paid_orders') + ' AS SELECT id, owner, total FROM ' + q('orders') + " WHERE status = 'paid'");
 
-  for (const t of ['profiles', 'orders', 'members', 'flags', 'sessions', 'tickets', 'everything']) {
+  for (const t of [
+    'profiles', 'orders', 'members', 'flags', 'sessions', 'tickets', 'everything',
+    'carts', 'cart_items', 'folders', 'User Groups', 'memberships',
+  ]) {
     await client.query('GRANT SELECT ON ' + q(t) + ' TO anon, authenticated');
   }
   await client.query('GRANT SELECT ON ' + q('paid_orders') + ' TO anon');
@@ -332,6 +341,35 @@ async function main() {
               ': node ' + JSON.stringify(m) + ', sql ' + JSON.stringify(t));
           }
         }
+        // What each table points at, and what has to exist before it can.
+        // An order that merely works is not enough: two engines seeding in
+        // different orders would build two different copies, and nothing
+        // downstream would say which verdict belonged to which.
+        for (const table of fromNode.tables) {
+          const m = attack.foreignKeys(table);
+          const t = (await ask('foreign_keys', [JSON.stringify(table)])) || [];
+          if (JSON.stringify(m) !== JSON.stringify(t)) {
+            found.push('the keys on ' + table.name + ': node ' + JSON.stringify(m) +
+              ', sql ' + JSON.stringify(t));
+          }
+        }
+        {
+          const m = attack.dependencyOrder(fromNode.tables).map((one) => one.name);
+          const t = ((await ask('dependency_order', [JSON.stringify(fromNode.tables)])) || [])
+            .map((one) => one.name);
+          if (m.join(' -> ') !== t.join(' -> ')) {
+            found.push('the order tables are seeded in: node ' + m.join(' -> ') +
+              '   sql ' + t.join(' -> '));
+          }
+          // And it has to be an order that works, not merely a shared one.
+          if (m.indexOf('profiles') > m.indexOf('orders')) {
+            found.push('a child is seeded before its parent: ' + m.join(' -> '));
+          }
+          if (m.indexOf('carts') > m.indexOf('cart_items')) {
+            found.push('the composite key comes before what it points at: ' + m.join(' -> '));
+          }
+        }
+
         // And the value each engine would put in a column. The Node side
         // hands a value to the driver as a parameter and the SQL side
         // returns the text the insert casts, so they are compared as text:

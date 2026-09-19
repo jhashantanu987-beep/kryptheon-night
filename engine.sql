@@ -923,3 +923,115 @@ BEGIN
   nth := least(greatest(coalesce(attempt, 0), 0), array_length(shapes, 1) - 1);
   RETURN __KN__.fit_to(shapes[nth + 1], kind);
 END $$;
+
+/*
+ * The foreign keys on a table, read out of Postgres's own wording.
+ *
+ * Every column of the key, not just the first. A key over (org_id, cart_id)
+ * used to be read as though it were only org_id: the second column got an
+ * invented value, the pair pointed at no row that existed, and the table was
+ * reported as one that could not be checked.
+ */
+CREATE OR REPLACE FUNCTION __KN__.foreign_keys(tab jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  keys jsonb := '[]'::jsonb;
+  con jsonb;
+  parts text[];
+BEGIN
+  FOR con IN SELECT * FROM jsonb_array_elements(coalesce(tab->'constraints', '[]'::jsonb)) LOOP
+    CONTINUE WHEN con->>'kind' <> 'f';
+    parts := regexp_match(
+      con->>'definition',
+      'FOREIGN KEY \(([^)]+)\) REFERENCES ([^(]+)\(([^)]+)\)',
+      'i');
+    CONTINUE WHEN parts IS NULL;
+    keys := keys || jsonb_build_array(jsonb_build_object(
+      'columns', __KN__.unquoted_list(parts[1]),
+      -- The schema is dropped: inside the copy every table it can point at is
+      -- in the copy, and keeping the original's name would send it home.
+      'refTable', __KN__.unquoted(split_part(parts[2], '.', greatest(
+        array_length(string_to_array(parts[2], '.'), 1), 1))),
+      'refColumns', __KN__.unquoted_list(parts[3])
+    ));
+  END LOOP;
+  RETURN keys;
+END $$;
+
+/* A name as Postgres wrote it, with the quoting taken back off. */
+CREATE OR REPLACE FUNCTION __KN__.unquoted(name text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT replace(btrim(name), '"', '');
+$$;
+
+/* And a comma-separated list of them. */
+CREATE OR REPLACE FUNCTION __KN__.unquoted_list(list text)
+RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT coalesce(jsonb_agg(__KN__.unquoted(piece) ORDER BY at), '[]'::jsonb)
+    FROM regexp_split_to_table(list, ',') WITH ORDINALITY AS p(piece, at);
+$$;
+
+/*
+ * One step of the walk: everything this table points at, before the table.
+ *
+ * The three sets are carried in and out rather than held in a closure, which
+ * plpgsql does not have. Post-order, exactly as the Node side walks it, so the
+ * two engines hand back the same order and not merely a workable one.
+ */
+CREATE OR REPLACE FUNCTION __KN__.dependency_visit(name text, tables jsonb, state jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  tab jsonb;
+  key jsonb;
+  parent text;
+BEGIN
+  IF state->'done' ? name OR state->'visiting' ? name THEN RETURN state; END IF;
+
+  SELECT t INTO tab FROM jsonb_array_elements(tables) t WHERE t->>'name' = name;
+  IF tab IS NULL THEN RETURN state; END IF;
+
+  state := jsonb_set(state, '{visiting}', (state->'visiting') || to_jsonb(name));
+
+  FOR key IN SELECT * FROM jsonb_array_elements(__KN__.foreign_keys(tab)) LOOP
+    parent := key->>'refTable';
+    CONTINUE WHEN parent = name;
+    CONTINUE WHEN NOT EXISTS (
+      SELECT 1 FROM jsonb_array_elements(tables) t WHERE t->>'name' = parent);
+    state := __KN__.dependency_visit(parent, tables, state);
+  END LOOP;
+
+  state := jsonb_set(state, '{visiting}',
+    coalesce((SELECT jsonb_agg(v) FROM jsonb_array_elements(state->'visiting') v
+               WHERE v <> to_jsonb(name)), '[]'::jsonb));
+  state := jsonb_set(state, '{done}', (state->'done') || to_jsonb(name));
+  state := jsonb_set(state, '{ordered}', (state->'ordered') || to_jsonb(name));
+  RETURN state;
+END $$;
+
+/*
+ * Parents before children.
+ *
+ * Tables come back in alphabetical order, which put `orders` before `profiles`
+ * and made every insert fail on the foreign key - on the first real app it was
+ * pointed at, because every app has one of these. A cycle is left in whatever
+ * order it arrived: it cannot be satisfied anyway, and the table that fails is
+ * reported rather than dropped.
+ */
+CREATE OR REPLACE FUNCTION __KN__.dependency_order(tables jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  state jsonb := jsonb_build_object('done', '[]'::jsonb, 'visiting', '[]'::jsonb, 'ordered', '[]'::jsonb);
+  tab jsonb;
+  out jsonb := '[]'::jsonb;
+  name text;
+BEGIN
+  FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
+    state := __KN__.dependency_visit(tab->>'name', tables, state);
+  END LOOP;
+
+  FOR name IN SELECT jsonb_array_elements_text(state->'ordered') LOOP
+    out := out || jsonb_build_array(
+      (SELECT t FROM jsonb_array_elements(tables) t WHERE t->>'name' = name));
+  END LOOP;
+  RETURN out;
+END $$;

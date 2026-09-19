@@ -73,11 +73,30 @@ async function main() {
     // skipped quietly: a check nobody ran must not read like a check that
     // passed.
     if (await present(client)) {
-      check('0. there is room here to test this at all', [
-        'this database already has an auth.users, and it is not this run\'s to create or remove.',
-        'Nothing was touched. Point the checks at a database without one, or remove that table' +
-          ' yourself if it is a leftover.',
-      ]);
+      // Three different situations, and saying the wrong one is its own
+      // bug. A table with our mark on it IS this run's kind of table; the
+      // reason to leave it alone is that a suite in another window may be
+      // using it right now, which is not the same as "it is not ours".
+      const { rows: note } = await client.query(
+        "SELECT obj_description('auth.users'::regclass, 'pg_class') AS mark",
+      );
+      const mark = String(note.length ? note[0].mark || '' : '');
+      const ours = mark.startsWith(MARK);
+      const made = ours ? parseInt(mark.slice(MARK.length), 36) : NaN;
+      const minutes = Number.isFinite(made) ? Math.round((Date.now() - made) / 60000) : null;
+
+      check('0. there is room here to test this at all', ours
+        ? [
+            'there is an auth.users here that these checks made, ' + minutes + ' minutes ago.',
+            'It is left alone because a suite running in another window could be using it.' +
+              ' It is swept once it is ' + Math.round(fixture.ABANDONED_AFTER / 60000) +
+              ' minutes old; if nothing else is running, remove it now and run this again.',
+          ]
+        : [
+            'this database already has an auth.users, and it is not this run\'s to create or remove.',
+            'Nothing was touched. Point the checks at a database without one, or remove that table' +
+              ' yourself if it is a leftover.',
+          ]);
     } else {
       plantedOurOwn = true;
       const old = Date.now() - fixture.ABANDONED_AFTER - 60 * 60 * 1000;
