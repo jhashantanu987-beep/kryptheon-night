@@ -26,6 +26,9 @@ const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 const APP = 'kn_twin_' + Date.now().toString(36);
 // The table that holds one column of every type the seeder has a rule for.
 const EVERYTHING = 'everything';
+// A schema the visitor is never given USAGE on. Named the way every
+// fixture is, so a run that dies still leaves something the sweep can see.
+const PRIVATE = 'kn_locked_' + Date.now().toString(36);
 // Any one of the seeded people; which of them is not what is under test.
 const SOMEBODY = '11111111-1111-4111-8111-111111111111';
 
@@ -110,6 +113,51 @@ async function buildApp(client) {
       ' (org_id integer NOT NULL, user_id uuid NOT NULL, role text NOT NULL, PRIMARY KEY (org_id, user_id))',
   );
   await client.query('CREATE TABLE ' + q('flags') + ' (id serial PRIMARY KEY)');
+  await client.query('CREATE SCHEMA ' + schema.quote(PRIVATE));
+  await client.query('CREATE FUNCTION ' + schema.quote(PRIVATE) +
+    '.is_allowed(who uuid) RETURNS boolean LANGUAGE sql STABLE AS ' + "$fn$ SELECT true $fn$");
+  // Hiding the schema is not enough, which was worth finding out: a policy
+  // expression is stored already parsed, with the OID of the function in
+  // it, so nothing resolves a name at read time and USAGE on the schema is
+  // never checked. Only EXECUTE on the function is, and that is granted to
+  // PUBLIC the moment the function is created.
+  //
+  // Revoked on this run's own function, in this run's own schema, and
+  // nowhere else. blocked.check.js learned that the expensive way, by
+  // revoking on the customer's auth.uid() and poisoning every later check.
+  await client.query('REVOKE ALL ON FUNCTION ' + schema.quote(PRIVATE) +
+    '.is_allowed(uuid) FROM PUBLIC');
+  await client.query('CREATE TABLE ' + q('locked') +
+    ' (id serial PRIMARY KEY, owner uuid NOT NULL)');
+  await client.query('ALTER TABLE ' + q('locked') + ' ENABLE ROW LEVEL SECURITY');
+  await client.query('CREATE POLICY through_a_closed_door ON ' + q('locked') +
+    ' FOR SELECT TO anon, authenticated USING (' + schema.quote(PRIVATE) +
+    '.is_allowed(owner))');
+  // A policy granted to a logged-out visitor that calls auth.uid().
+  //
+  // Without one, the worst bug this product has had cannot be caught here:
+  // sending a logged-out visitor with no claims at all makes auth.uid()
+  // throw, the read returns nothing, and nothing is exactly what a properly
+  // secured table returns. The fixture's other policies are either granted
+  // only to authenticated or say USING (true), so neither of them ever
+  // reaches auth.uid() as anon.
+  await client.query('CREATE TABLE ' + q('receipts') +
+    ' (id serial PRIMARY KEY, owner uuid NOT NULL, amount numeric(10,2) NOT NULL)');
+  await client.query('ALTER TABLE ' + q('receipts') + ' ENABLE ROW LEVEL SECURITY');
+  await client.query('CREATE POLICY mine_only ON ' + q('receipts') +
+    ' FOR SELECT TO anon, authenticated USING (owner = auth.uid())');
+
+  // Granted to nobody at all, so the attack is refused outright. Without
+  // one of these, refusal_means is never called and the difference between
+  // "the attack lost" and "the attack never ran" is never tested.
+  await client.query('CREATE TABLE ' + q('internal') +
+    ' (id serial PRIMARY KEY, note text NOT NULL)');
+
+  // And an ungranted materialized view, because Postgres words that refusal
+  // differently: "permission denied for materialized view". An alternation
+  // that tried `view` first would never reach it.
+  await client.query('CREATE MATERIALIZED VIEW ' + q('receipt_totals') +
+    ' AS SELECT owner, count(*) AS n FROM ' + q('receipts') + ' GROUP BY owner');
   await client.query('CREATE TABLE ' + q('User Groups') + ' (' + schema.quote('Group Id') + ' integer PRIMARY KEY)');
   await client.query('CREATE TABLE ' + q('memberships') + ' (id serial PRIMARY KEY, ' + schema.quote('Group Id') + ' integer NOT NULL REFERENCES ' + q('User Groups') + ' (' + schema.quote('Group Id') + '))');
   await client.query('ALTER TABLE ' + q('orders') + ' ADD CONSTRAINT orders_owner_fkey FOREIGN KEY (owner) REFERENCES ' + q('profiles') + '(id)');
@@ -145,7 +193,9 @@ async function buildApp(client) {
 
   for (const t of [
     'profiles', 'orders', 'members', 'flags', 'sessions', 'tickets', 'everything',
-    'carts', 'cart_items', 'folders', 'User Groups', 'memberships',
+    'carts', 'cart_items', 'folders', 'User Groups', 'memberships', 'receipts',
+    'locked',
+    // internal and receipt_totals are granted to nobody on purpose.
   ]) {
     await client.query('GRANT SELECT ON ' + q(t) + ' TO anon, authenticated');
   }
@@ -271,7 +321,10 @@ async function main() {
     // which is the exact shape of failure this whole file exists to catch,
     // and it was in the check that catches it.
     let seedingRan = false;
+    let attackRan = false;
+    const verdictDifferences = [];
     let engineForSeeding = null;
+    let engineForAttack = null;
     let nodeStatements = null;
     let sqlStatements = null;
 
@@ -329,6 +382,44 @@ async function main() {
         }
       }
       seedingRan = true;
+
+      // And the verdict. This is the one a person reads, so it is the one
+      // that has to match: everything above it exists to make this
+      // comparison mean something.
+      // Tables and views, the same list scan.js attacks.
+      const asTargets = (plan) => plan.tables.concat((plan.views || []).map((view) => ({
+        name: view.name,
+        columns: view.columns || [],
+        constraints: [],
+        rlsEnabled: false,
+        isView: true,
+      })));
+      const mineSaid = await attack.impersonate(client, byNode, asTargets(fromNode));
+      let theirsSaid = null;
+      await sqlengine.withEngine(client, async (target) => {
+        engineForAttack = target;
+        const { rows } = await client.query(
+          'SELECT ' + schema.quote(target) + '.impersonate($1, $2::jsonb) AS answer',
+          [bySql, JSON.stringify(asTargets(fromSql))],
+        );
+        theirsSaid = rows[0].answer;
+      });
+
+      const verdict = (r) => JSON.stringify({
+        findings: (r.findings || [])
+          .map((f) => f.kind + ':' + f.table + '/' + f.readable + '/' + (f.owner || '-'))
+          .sort(),
+        completed: [...(r.completed || [])].sort(),
+        // Which attacks could not be run at all, and on which table. A
+        // table one engine tested and the other could not is the difference
+        // between a hole examined and a hole written off as unknown.
+        blocked: (r.blocked || []).map((b) => b.key).sort(),
+      });
+      if (verdict(mineSaid) !== verdict(theirsSaid)) {
+        verdictDifferences.push('the two engines said different things:' +
+          '\n        node ' + verdict(mineSaid) + '\n        sql  ' + verdict(theirsSaid));
+      }
+      attackRan = true;
     } catch (err) {
       copyDifferences = ['building a copy fell over: ' + err.message];
     }
@@ -471,6 +562,14 @@ async function main() {
       seedingDifferences = ['asking the two engines fell over: ' + err.message];
     }
 
+    check('9. and reach the same verdict about it', (() => {
+      // Agreeing is not the same as being right, and this only asks the
+      // first. What the answer OUGHT to be is verdicts.check.js, on an app
+      // that declares it up front.
+      if (!attackRan) return ['it never ran'];
+      return verdictDifferences;
+    })());
+
     check('8. and seed the copy into the same state', (() => {
       // The one the attacks stand on. Two copies seeded differently mean
       // two sets of verdicts about two different databases, and nothing
@@ -485,7 +584,7 @@ async function main() {
 
     const { rows: left } = await client.query(
       'SELECT nspname FROM pg_namespace WHERE nspname = ANY($1)',
-      [[installed, engineForSeeding].filter(Boolean)],
+      [[installed, engineForSeeding, engineForAttack].filter(Boolean)],
     );
     check('4. the engine takes itself away again', (() => {
       // It gets installed into the customer's database to answer one question.
@@ -499,6 +598,7 @@ async function main() {
     })());
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE').catch(() => {});
+    await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(PRIVATE) + ' CASCADE').catch(() => {});
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP + '_node') + ' CASCADE').catch(() => {});
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP + '_sql') + ' CASCADE').catch(() => {});
     await undoAuth();

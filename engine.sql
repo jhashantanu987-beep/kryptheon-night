@@ -1296,3 +1296,192 @@ BEGIN
 
   RETURN jsonb_build_object('seeded', seeded, 'skipped', skipped);
 END $$;
+
+-- --------------------------------------------------------------------------
+-- The impersonation attack, inside the database.
+--
+-- Nothing here is SECURITY DEFINER, and it cannot be: Postgres refuses to let
+-- a security-definer function change role, and changing role is the whole
+-- attack. Measured, not assumed - probe-plpgsql.js asks exactly this.
+-- --------------------------------------------------------------------------
+
+/*
+ * A refusal is only an answer when it is the right refusal.
+ *
+ * "permission denied for table orders" means this caller cannot reach the
+ * table at all. That is the attack being defeated, and it is good news worth
+ * recording as a pass.
+ *
+ * Everything else - a schema the policy needs and the role cannot use, a
+ * function the policy calls that is not there, a timeout - means the rule was
+ * never evaluated. No verdict exists. Both come back as an error and return
+ * zero rows, and zero rows is exactly what a perfectly secured table returns,
+ * so telling them apart is the difference between "you are safe" and "I could
+ * not tell", which is the difference the whole product rests on.
+ */
+CREATE OR REPLACE FUNCTION __KN__.refusal_means(message text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  -- The multi-word kinds come first. Postgres says "permission denied for
+  -- materialized view hits", and an alternation that tried `view` first would
+  -- never reach it - so a matview nobody had granted was filed as untested
+  -- rather than as the attack being beaten, and a correct app collected a
+  -- warning it had not earned.
+  SELECT CASE WHEN coalesce(message, '') ~*
+    'permission denied for (materialized view|foreign table|partitioned table|table|relation|view|sequence)'
+    THEN 'unreachable' ELSE 'untested' END;
+$$;
+
+/*
+ * Reads a table the way a request would, as whoever is asking.
+ *
+ * Counted rather than fetched. The Node side pulls the rows back and counts
+ * them there; here the count is the only thing wanted, and row level security
+ * applies to a count exactly as it applies to a select.
+ *
+ * `owner` being given also asks the second question: of the rows this caller
+ * can see, how many belong to somebody else.
+ */
+CREATE OR REPLACE FUNCTION __KN__.read_as(
+  source text, table_name text, role_ text, user_id text, owner text)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  claims text;
+  total bigint;
+  theirs bigint := NULL;
+  target text := __KN__.always_quote(source) || '.' || __KN__.always_quote(table_name);
+  -- Both statements are written out before the role changes, and this is
+  -- not tidiness. Once this function becomes anon it cannot call anything
+  -- in the engine schema any more - anon has no USAGE on it - so a call to
+  -- always_quote or user_b made after the switch fails with "permission
+  -- denied for schema kn_engine_...". That is not the app defending
+  -- itself, but it arrives looking exactly like it: every crossed attack
+  -- came back as a table that could not be tested.
+  --
+  -- The rule for everything on this side of the engine: whatever the
+  -- attack needs, it must already hold before it stops being itself.
+  counting text := 'SELECT count(*) FROM ' || target;
+  counting_theirs text := CASE WHEN owner IS NULL THEN NULL ELSE
+    'SELECT count(*) FROM ' || target || ' WHERE '
+      || __KN__.always_quote(owner) || '::text = ' || quote_literal(__KN__.user_b()) END;
+BEGIN
+  -- A logged-out visitor is not "no claims". Supabase hands PostgREST the
+  -- anon key, which is itself a JWT, so request.jwt.claims arrives as a real
+  -- JSON object that simply has no `sub` in it.
+  --
+  -- Sending an empty string instead made auth.uid() throw on the cast, and a
+  -- read that throws returns no rows - which is exactly what a properly
+  -- secured table returns. Every table whose policy calls auth.uid(), which
+  -- is nearly every table anyone writes, came back looking safe without the
+  -- rule ever being evaluated.
+  claims := CASE WHEN user_id IS NULL
+    THEN json_build_object('role', role_)::text
+    ELSE json_build_object('sub', user_id, 'role', role_)::text END;
+
+  BEGIN
+    EXECUTE 'SET LOCAL ROLE ' || quote_ident(role_);
+    PERFORM set_config('request.jwt.claims', claims, true);
+
+    EXECUTE counting INTO total;
+    IF counting_theirs IS NOT NULL THEN
+      EXECUTE counting_theirs INTO theirs;
+    END IF;
+
+    RESET ROLE;
+    PERFORM set_config('request.jwt.claims', '', true);
+    RETURN jsonb_build_object('ok', true, 'count', total, 'theirs', theirs);
+  EXCEPTION WHEN OTHERS THEN
+    -- A refusal is an answer: the table is not reachable by this caller at
+    -- all. Which kind of refusal it was is decided by the caller.
+    RESET ROLE;
+    PERFORM set_config('request.jwt.claims', '', true);
+    RETURN jsonb_build_object('ok', false, 'why', SQLERRM);
+  END;
+END $$;
+
+/*
+ * What each table gives away, and to whom.
+ *
+ * Two separate findings, because they are two different conversations with the
+ * person who has to fix it:
+ *
+ *   exposed  - a logged-out stranger can read the table. This is the one that
+ *              ends up on a news site.
+ *   crossed  - a signed-in customer can read another customer's rows. Quieter,
+ *              and the one that breaks trust with the people already paying.
+ */
+CREATE OR REPLACE FUNCTION __KN__.impersonate(source text, tables jsonb)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  findings jsonb := '[]'::jsonb;
+  completed jsonb := '[]'::jsonb;
+  blocked jsonb := '[]'::jsonb;
+  tab jsonb;
+  owner text;
+  anon jsonb;
+  as_a jsonb;
+  key text;
+  named jsonb;
+  reached boolean;
+BEGIN
+  FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
+    owner := __KN__.owner_column(tab);
+    named := coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c),
+                      '[]'::jsonb);
+
+    anon := __KN__.read_as(source, tab->>'name', 'anon', NULL, NULL);
+    as_a := __KN__.read_as(source, tab->>'name', 'authenticated', __KN__.user_a(), owner);
+
+    -- Did this read produce a verdict, and if not, why not?
+    key := 'exposed:' || (tab->>'name');
+    IF (anon->>'ok')::boolean THEN
+      completed := completed || to_jsonb(key);
+      reached := true;
+    ELSIF __KN__.refusal_means(anon->>'why') = 'unreachable' THEN
+      -- Refused outright. The attack ran and lost, which is the result we
+      -- want for a table that is properly closed.
+      completed := completed || to_jsonb(key);
+      reached := false;
+    ELSE
+      blocked := blocked || jsonb_build_array(jsonb_build_object(
+        'table', tab->>'name', 'key', key,
+        'why', 'as a logged-out visitor: ' || (anon->>'why')));
+      reached := false;
+    END IF;
+
+    IF reached AND (anon->>'count')::bigint > 0 THEN
+      findings := findings || jsonb_build_array(jsonb_build_object(
+        'kind', 'exposed',
+        'table', tab->>'name',
+        'readable', (anon->>'count')::bigint,
+        'columns', named,
+        'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false),
+        'isView', coalesce((tab->>'isView')::boolean, false)));
+    END IF;
+
+    -- Crossed is only ever looked for where a row says who it belongs to, so
+    -- on a table with no owner there is no attack to record either way.
+    IF owner IS NOT NULL THEN
+      key := 'crossed:' || (tab->>'name');
+      IF (as_a->>'ok')::boolean THEN
+        completed := completed || to_jsonb(key);
+        IF coalesce((as_a->>'theirs')::bigint, 0) > 0 THEN
+          findings := findings || jsonb_build_array(jsonb_build_object(
+            'kind', 'crossed',
+            'table', tab->>'name',
+            'owner', owner,
+            'readable', (as_a->>'theirs')::bigint,
+            'columns', named,
+            'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+        END IF;
+      ELSIF __KN__.refusal_means(as_a->>'why') = 'unreachable' THEN
+        completed := completed || to_jsonb(key);
+      ELSE
+        blocked := blocked || jsonb_build_array(jsonb_build_object(
+          'table', tab->>'name', 'key', key,
+          'why', 'as a signed-in customer: ' || (as_a->>'why')));
+      END IF;
+    END IF;
+  END LOOP;
+
+  RETURN jsonb_build_object('findings', findings, 'completed', completed, 'blocked', blocked);
+END $$;
