@@ -305,6 +305,76 @@ async function main() {
       }
       return problems;
     });
+
+    // ---- the shape every real app has, and no fixture here had ----
+    //
+    // Every source schema in this suite is `kn_src_<moment>`, which is not on
+    // anybody's search_path - so `pg_get_constraintdef` always wrote the schema
+    // name out, and the rewrite always had something to rewrite. A real app
+    // lives in `public`, which IS on the search_path, so the same foreign key
+    // comes back as a bare "REFERENCES profiles(id)" with nothing to rewrite -
+    // and binds, inside the copy, to the customer's own table.
+    //
+    // That is what happened on the first real Supabase project this was ever
+    // run against: two tables out of four were tied to the customer's rows,
+    // could not be seeded, and went unattacked. Reproduced here by putting the
+    // source schema on the search_path, which is the only thing `public` was
+    // ever doing differently.
+    const SEARCHED = 'kn_path_' + Date.now().toString(36);
+    let pathProblems = [];
+    try {
+      await client.query('CREATE SCHEMA ' + schema.quote(SEARCHED));
+      const q = (name) => schema.quote(SEARCHED) + '.' + schema.quote(name);
+      await client.query('CREATE TABLE ' + q('parents') + ' (id uuid PRIMARY KEY, email text NOT NULL)');
+      await client.query('CREATE TABLE ' + q('children') +
+        ' (id bigserial PRIMARY KEY, owner uuid NOT NULL REFERENCES ' + q('parents') + '(id), body text NOT NULL)');
+
+      // The one line that reproduces it. Without this the reference comes back
+      // qualified and there is nothing to get wrong.
+      await client.query('SET search_path TO ' + schema.quote(SEARCHED) + ', public');
+      const read = await schema.readSchema(client, SEARCHED);
+
+      const bare = (read.tables.find((t) => t.name === 'children') || { constraints: [] })
+        .constraints.filter((c) => c.kind === 'f')
+        .map((c) => String(c.definition));
+      if (!bare.length) {
+        pathProblems.push('the foreign key was not read at all, so nothing was tested');
+      } else if (/\./.test(bare[0].replace(/\(.*/, ''))) {
+        pathProblems.push('the reference came back qualified, so this check is no longer reproducing the bug: ' + bare[0]);
+      }
+
+      const built = 'kn_pathcopy_' + Date.now().toString(36);
+      try {
+        await schema.writeSchema(client, read, built);
+        const { rows } = await client.query(
+          `SELECT con.conname, rn.nspname AS points_at
+             FROM pg_constraint con
+             JOIN pg_class cl ON cl.oid = con.conrelid
+             JOIN pg_namespace cn ON cn.oid = cl.relnamespace
+             JOIN pg_class rc ON rc.oid = con.confrelid
+             JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+            WHERE con.contype = 'f' AND cn.nspname = $1`,
+          [built],
+        );
+        for (const row of rows) {
+          if (row.points_at !== built) {
+            pathProblems.push(row.conname + ' in the copy points at ' + row.points_at + ', not at the copy');
+          }
+        }
+        if (!rows.length) pathProblems.push('the copy has no foreign key at all, so nothing was measured');
+      } finally {
+        await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(built) + ' CASCADE').catch(() => {});
+      }
+    } catch (err) {
+      // writeSchema now refuses to finish a copy that points outside itself,
+      // which is the guard doing its job - and is still a failure of the
+      // rewrite that was supposed to make it unnecessary.
+      pathProblems.push('building the copy threw: ' + err.message);
+    } finally {
+      await client.query('SET search_path TO "$user", public').catch(() => {});
+      await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(SEARCHED) + ' CASCADE').catch(() => {});
+    }
+    record('10. an app in a schema on the search_path is copied, not borrowed', () => pathProblems);
   } finally {
     for (const name of [COPY, SOURCE]) {
       try {

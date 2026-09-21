@@ -500,6 +500,44 @@ function rewriteSchemaRefs(expr, fromSchema, toSchema) {
 }
 
 /**
+ * Points a reference with no schema on it at the copy.
+ *
+ * The one the other two rewrites could not see. `pg_get_constraintdef` writes
+ * the schema only when the referenced table is *not* reachable through
+ * `search_path` - so an app living in `app_something` comes back as
+ * "REFERENCES app_something.profiles(id)" and is rewritten, while the same app
+ * living in `public` comes back as "REFERENCES profiles(id)" and there is
+ * nothing to rewrite. Replayed into the copy, that bare name resolves through
+ * `search_path` all over again, and binds to the customer's real table.
+ *
+ * Found on the first real Supabase project this was ever pointed at, which is
+ * the first app that was not in a schema of its own:
+ *
+ *   notes_owner_fkey     -> public.profiles      (the customer's own table)
+ *   orders_user_id_fkey  -> public.profiles      (the customer's own table)
+ *
+ * Nothing was written to those tables - the copy only pointed at them - but
+ * the copy was not the app, which is the same failure three other bugs in this
+ * file were. Here it meant every insert into the copy was checked against a
+ * table the seeder had put nothing in, so two tables out of four were never
+ * attacked and were reported, honestly but uselessly, as not checked.
+ *
+ * Only names the plan itself owns are touched. A reference to something
+ * outside the schema is the stand-in's business, not this one's.
+ */
+function qualifyOwnRefs(definition, plan, target) {
+  const own = new Set((plan.tables || []).map((table) => table.name));
+  // A replacer function, never a replacement string: `$&` and friends are read
+  // as instructions inside one, and that has already cost this project an
+  // engine that would not install.
+  return String(definition).replace(
+    /(\bREFERENCES\s+)("?)([^".\s(]+)\2(\s*\()/gi,
+    (whole, before, quoteMark, name, after) =>
+      (own.has(name) ? before + quote(target) + '.' + quote(name) + after : whole),
+  );
+}
+
+/**
  * Points a foreign key at the stand-in instead of at the real outside table.
  *
  * Both spellings again, for the same reason the schema rewrite handles both:
@@ -669,9 +707,13 @@ async function writeSchema(client, plan, target) {
       for (const constraint of table.constraints) {
         const isForeign = constraint.kind === 'f';
         if (isForeign !== wantForeign) continue;
-        const definition = rewriteExternalRefs(
-          rewriteSchemaRefs(constraint.definition, plan.schema, target),
-          plan.external,
+        const definition = qualifyOwnRefs(
+          rewriteExternalRefs(
+            rewriteSchemaRefs(constraint.definition, plan.schema, target),
+            plan.external,
+            target,
+          ),
+          plan,
           target,
         );
         statements.push(
@@ -770,6 +812,36 @@ async function writeSchema(client, plan, target) {
   for (const statement of statements) {
     await client.query(statement);
   }
+
+  // And then look at what was actually built, rather than at what was meant.
+  //
+  // Everything above this line reasons about strings. The guard at the top of
+  // this file reads the statements before they run; this one asks Postgres
+  // where the copy ended up pointing, which is the only account of it that
+  // cannot be fooled by a spelling nobody anticipated - and one was not. A
+  // bare "REFERENCES profiles(id)" replayed into the copy bound to the
+  // customer's own table, silently, on every app that lives in `public`.
+  //
+  // Nothing is written to a table outside the copy either way. The damage is
+  // subtler than that: a copy tied to the customer's rows is not the app being
+  // attacked, and every verdict taken from it is about something else.
+  const { rows: strays } = await client.query(
+    `SELECT con.conname, rn.nspname AS points_at
+       FROM pg_constraint con
+       JOIN pg_class cl ON cl.oid = con.conrelid
+       JOIN pg_namespace cn ON cn.oid = cl.relnamespace
+       JOIN pg_class rc ON rc.oid = con.confrelid
+       JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+      WHERE con.contype = 'f' AND cn.nspname = $1 AND rn.nspname <> $1`,
+    [target],
+  );
+  if (strays.length) {
+    throw new Error(
+      'the copy points outside itself, so it is not the app: ' +
+        strays.map((row) => row.conname + ' -> ' + row.points_at).join(', '),
+    );
+  }
+
   return statements;
 }
 
