@@ -19,6 +19,7 @@
     "recheck.js",
     "intro.js",
     "trouble.js",
+    "connect.js",
     "README.md"
   ],
   "engines": {

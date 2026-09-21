@@ -29,52 +29,10 @@ const scanner = require('../scan.js');
 const recheck = require('../recheck.js');
 const intro = require('../intro.js');
 const trouble = require('../trouble.js');
+const { howToConnect } = require('../connect.js');
 
 const line = (text) => process.stdout.write(text + '\n');
 const fail = (text) => process.stderr.write(text + '\n');
-
-// Long enough for a Supabase project that has gone to sleep to wake up -
-// free projects pause after a week and take the better part of half a minute
-// to come back - and short enough that a blocked port does not look like a
-// hang. Without this the connection simply never returns and the person is
-// left watching a cursor with nothing to read.
-const CONNECT_TIMEOUT = 30000;
-
-/**
- * How to connect, with encryption on by default.
- *
- * Measured, not assumed. `pg` 8.23 leaves SSL off entirely when the string
- * says nothing, so the password would cross the internet in the clear -
- * unacceptable in any tool, and absurd in this one. Putting `sslmode=require`
- * in the string instead is worse than it looks: this version of
- * `pg-connection-string` treats it as `verify-full`, which fails outright
- * against Supabase's own certificate authority, and it prints a paragraph of
- * upgrade warning to the screen while it does so.
- *
- * So the option is set here instead: encrypted always, certificate not
- * verified - which is what `sslmode=require` means everywhere else, and what
- * every other client reaching these databases does.
- *
- * Anything the person put in the string themselves wins. Somebody who typed
- * `sslmode=verify-full` and pointed at their own certificate meant it.
- */
-function howToConnect(connectionString) {
-  const config = { connectionString: connectionString, connectionTimeoutMillis: CONNECT_TIMEOUT };
-  if (/[?&]sslmode=/i.test(connectionString)) return config;
-
-  let host = '';
-  try {
-    host = new URL(connectionString).hostname;
-  } catch (err) {
-    host = '';
-  }
-  // A database on this machine is not crossing a network, and will usually
-  // not have a certificate at all.
-  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '') return config;
-
-  config.ssl = { rejectUnauthorized: false };
-  return config;
-}
 
 function usage() {
   return [

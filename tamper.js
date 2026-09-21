@@ -87,11 +87,28 @@ function whatHappened(result) {
  * `seeded` carries the shape of row that worked when the table was seeded, so
  * the insert here is not rejected by some CHECK the seeder already solved.
  */
-async function tamper(client, schema, tables, seeded) {
+async function tamper(client, schema, tables, seeded, policies) {
   const findings = [];
   const completed = [];
   const blocked = [];
   const shapeFor = new Map((seeded || []).map((entry) => [entry.table, entry.attempt || 0]));
+
+  // Which rules each table actually has, so the report can say why a write got
+  // through instead of assuming. Without this the report told somebody their
+  // rule "covers every command rather than only reading" about a policy
+  // written FOR INSERT - the finding was true and the reason was invented,
+  // which is the one thing a report cannot do twice.
+  //
+  // Permissive only. A restrictive policy can narrow what is allowed and
+  // never open it, so it is never the reason a write succeeded.
+  const rulesFor = new Map();
+  for (const policy of policies || []) {
+    if (String(policy.permissive || 'PERMISSIVE').toUpperCase() !== 'PERMISSIVE') continue;
+    const list = rulesFor.get(policy.table_name) || [];
+    const cmd = String(policy.cmd || 'ALL').toUpperCase();
+    if (!list.includes(cmd)) list.push(cmd);
+    rulesFor.set(policy.table_name, list);
+  }
 
   for (const table of tables) {
     if (!shapeFor.has(table.name)) continue; // never seeded, so nothing to protect
@@ -160,6 +177,7 @@ async function tamper(client, schema, tables, seeded) {
           owner: owner,
           columns: (table.columns || []).map((c) => c.name),
           rlsEnabled: table.rlsEnabled,
+          rules: rulesFor.get(table.name) || [],
         });
       }
     }

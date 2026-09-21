@@ -13,6 +13,7 @@
 
 const { Client } = require('pg');
 const trouble = require('./trouble.js');
+const { howToConnect } = require('./connect.js');
 
 const results = [];
 function check(name, problems) {
@@ -205,6 +206,52 @@ async function main() {
       problems.push('the original message was swallowed: ' + said.join(' | '));
     }
     if (!/could not connect/i.test(said.join(' '))) problems.push('it does not say what failed');
+    return problems;
+  })());
+
+  /* ---- how the connection is actually opened ---- */
+
+  check('13. the password is never sent unencrypted', (() => {
+    // `pg` leaves SSL off entirely when the string says nothing about it, so
+    // a string copied from somewhere that does not add sslmode would put the
+    // credential to somebody's whole database on the wire in the clear.
+    const problems = [];
+    const plain = howToConnect('postgresql://postgres:pw@db.abc.supabase.co:5432/postgres');
+    if (!plain.ssl) problems.push('a string with no sslmode was going to connect unencrypted');
+    if (plain.ssl && plain.ssl.rejectUnauthorized !== false) {
+      problems.push('it would verify the certificate, which Supabase’s own authority fails');
+    }
+    // A database on this machine is not crossing a network and usually has no
+    // certificate at all.
+    if (howToConnect('postgresql://postgres:pw@localhost:5432/postgres').ssl) {
+      problems.push('it demanded a certificate from a database on this machine');
+    }
+    return problems;
+  })());
+
+  check('14. the sslmode the hosts hand out is replaced, and a chosen one is not', (() => {
+    // Measured: this driver reads sslmode=require as full verification AND
+    // prints a nine-line upgrade notice while doing it. Neon's own string
+    // ends in ?sslmode=require, so following the instructions on screen put
+    // that notice in the middle of a person's security report.
+    const problems = [];
+    for (const handed of ['require', 'prefer']) {
+      const config = howToConnect('postgresql://postgres:pw@db.abc.supabase.co:5432/postgres?sslmode=' + handed);
+      if (/sslmode/i.test(config.connectionString)) problems.push('sslmode=' + handed + ' was left in the string');
+      if (!config.ssl) problems.push('sslmode=' + handed + ' was dropped without turning encryption on');
+    }
+    // Somebody who typed one of these meant it, and it is not ours to undo.
+    for (const chosen of ['verify-full', 'no-verify', 'disable']) {
+      const config = howToConnect('postgresql://postgres:pw@db.abc.supabase.co:5432/postgres?sslmode=' + chosen);
+      if (!config.connectionString.includes('sslmode=' + chosen)) {
+        problems.push('sslmode=' + chosen + ' was overridden, and it was deliberate');
+      }
+      if (config.ssl) problems.push('sslmode=' + chosen + ' was overridden with our own setting');
+    }
+    // Everything else in the string has to survive being taken apart.
+    const kept = howToConnect('postgresql://postgres:pw@db.abc.supabase.co:5432/postgres?sslmode=require&application_name=kn');
+    if (!kept.connectionString.includes('application_name=kn')) problems.push('another parameter was lost');
+    if (!kept.connectionString.includes(':pw@')) problems.push('the password was lost rewriting the string');
     return problems;
   })());
 

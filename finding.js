@@ -123,12 +123,61 @@ function causeOf(finding) {
   }
   if (finding.kind === 'writable') {
     if (finding.rlsEnabled) {
+      // Which rule let it through, from what is actually on the table rather
+      // than from an assumption.
+      //
+      // This branch used to say, of every writable table with row level
+      // security on, that its rule "covers every command rather than only
+      // reading". Measured against a table whose only policy was written FOR
+      // INSERT, that sentence was false twice over: the rule covered one
+      // command, and there was no rule letting anybody read at all. The
+      // finding was proved; the reason was invented. A report that overstates
+      // once is believed never again, so the reason is now read, not guessed.
+      const rules = (finding.rules || []).map((rule) => String(rule).toUpperCase());
+      const WRITTEN_FOR = { add: 'INSERT', change: 'UPDATE', 'delete': 'DELETE' };
+      const IN_WORDS = { INSERT: 'adding rows', UPDATE: 'changing rows', DELETE: 'deleting rows' };
+      const named = [];
+      for (const move of finding.can || []) {
+        const command = WRITTEN_FOR[move];
+        if (command && rules.includes(command) && !named.includes(command)) named.push(command);
+      }
+
+      if (rules.includes('ALL')) {
+        return {
+          short: 'the rule on it covers every command, not only reading',
+          long:
+            'The table has row level security switched on, but the rule attached ' +
+            'to it is written FOR ALL - so the same rule that decides who may ' +
+            'see a row also decides who may add, change and delete one, and it ' +
+            'is letting this through.',
+        };
+      }
+
+      if (named.length) {
+        return {
+          short: 'the rule you wrote for ' + listOf(named.map((c) => IN_WORDS[c])) +
+            ' lets everybody through',
+          long:
+            'The table has row level security switched on, and there is a rule on ' +
+            'it written for ' + listOf(named.map((c) => IN_WORDS[c])) + '. That ' +
+            'rule is the one letting this through: it does not check who is ' +
+            'asking, so it accepts the request from a stranger exactly as it ' +
+            'would from the person the row belongs to.',
+        };
+      }
+
+      // Row level security on, and no permissive rule that names this write.
+      // It should not have been possible, and saying which rule did it would
+      // be inventing one. What is certain is what was done, and that is all
+      // this says.
       return {
-        short: 'the rule on it allows writes as well as reads',
+        short: 'row level security is on, and something let this through anyway',
         long:
-          'The table has row level security switched on, but the rule attached ' +
-          'to it covers every command rather than only reading - so the same ' +
-          'rule that lets people see the rows also lets them change them.',
+          'The table has row level security switched on, and none of the rules on ' +
+          'it are written for this kind of write - so this should have been ' +
+          'refused and was not. Check whether the role your app connects as owns ' +
+          'the table or has BYPASSRLS, because either of those goes round every ' +
+          'rule you have written.',
       };
     }
     return {

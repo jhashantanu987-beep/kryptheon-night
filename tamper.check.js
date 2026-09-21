@@ -123,7 +123,7 @@ async function main() {
     const sown = await attack.seed(client, APP, plan.tables);
 
     const before = await contents(client, names);
-    const run = await tamper.tamper(client, APP, plan.tables, sown.seeded);
+    const run = await tamper.tamper(client, APP, plan.tables, sown.seeded, plan.policies);
     const after = await contents(client, names);
 
     const found = new Map(run.findings.map((f) => [f.table + ' / ' + f.who, f]));
@@ -246,6 +246,49 @@ async function main() {
         problems.push('it reported a table it had nothing to attack: ' + JSON.stringify(mentioned));
       }
       if (run.findings.some((f) => f.table === 'impossible')) problems.push('and claimed a finding on it');
+      return problems;
+    })());
+
+    check('11. the rule that let a write through reaches the report', (() => {
+      // `finding.check.js` proves the wording is right given the rules. This
+      // proves the rules arrive at all - which is the half that was missing,
+      // and the half a real database is needed for.
+      //
+      // add_only has one policy, written FOR INSERT. all_true has one written
+      // FOR ALL. Told apart here, they are told apart in the report; passed
+      // through as nothing, both would be described with the same invented
+      // sentence about a rule covering every command.
+      const problems = [];
+
+      const addOnly = found.get('add_only / anyone');
+      if (!addOnly) {
+        problems.push('add_only was not reported writable, so nothing was measured');
+      } else {
+        if (!(addOnly.rules || []).includes('INSERT')) {
+          problems.push('the FOR INSERT policy did not reach the finding: ' + JSON.stringify(addOnly.rules));
+        }
+        if ((addOnly.rules || []).includes('ALL')) {
+          problems.push('a FOR INSERT policy arrived as FOR ALL: ' + JSON.stringify(addOnly.rules));
+        }
+        const said = finding.causeOf(addOnly);
+        if (/every command/i.test(said.short + said.long)) {
+          problems.push('and the report still called it a rule covering every command');
+        }
+      }
+
+      const everything = found.get('all_true / anyone');
+      if (!everything) {
+        problems.push('all_true was not reported writable, so nothing was measured');
+      } else if (!(everything.rules || []).includes('ALL')) {
+        problems.push('the FOR ALL policy did not reach the finding: ' + JSON.stringify(everything.rules));
+      }
+
+      // The two must not arrive looking the same, or nothing above is testing
+      // anything.
+      if (addOnly && everything &&
+          JSON.stringify(addOnly.rules) === JSON.stringify(everything.rules)) {
+        problems.push('a FOR INSERT table and a FOR ALL table arrived identical');
+      }
       return problems;
     })());
 

@@ -243,7 +243,10 @@ async function scan(client, sourceSchema, options) {
     // copy comes out of this exactly as it went in and anything running after
     // reads the same database the earlier attacks did.
     say('  Trying to change data that is not ours ...');
-    const writes = await tamper.tamper(client, copyName, theirs, sown.seeded);
+    // The copy's own policies, not the app's - they are the same rules, and
+    // the copy is what was actually attacked. The report needs them to say
+    // which rule let a write through rather than assuming one.
+    const writes = await tamper.tamper(client, copyName, theirs, sown.seeded, copyPlan.policies);
     for (const key of writes.completed) attempted.push(key);
     for (const stuck of writes.blocked) {
       notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });

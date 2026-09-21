@@ -291,6 +291,76 @@ const cases = [
       return problems;
     },
   },
+  {
+    name: '14. why a write got through is read off the rules, not assumed',
+    run: () => {
+      // Found on a real database. A waitlist whose only policy was written
+      // FOR INSERT was described as having a rule that "covers every command
+      // rather than only reading - so the same rule that lets people see the
+      // rows also lets them change them". It covered one command, and no rule
+      // let anybody read anything. The attack was real; the explanation was
+      // invented, which is the failure this whole file exists to catch.
+      const writable = (rules, can) => ({
+        kind: 'writable',
+        table: 'waitlist',
+        who: 'anyone',
+        can: can || ['add'],
+        changed: { add: 1 },
+        owner: null,
+        columns: ['id', 'email'],
+        rlsEnabled: true,
+        rules: rules,
+      });
+      const problems = [];
+
+      const insertOnly = finding.causeOf(writable(['INSERT']));
+      if (/every command/i.test(insertOnly.short + insertOnly.long)) {
+        problems.push('a FOR INSERT policy was described as covering every command');
+      }
+      if (/see the rows|read/i.test(insertOnly.long)) {
+        problems.push('a write-only policy was described as letting people read: ' + insertOnly.long);
+      }
+      if (!/adding rows/.test(insertOnly.short)) {
+        problems.push('it does not name which rule let the write through: ' + insertOnly.short);
+      }
+
+      // FOR ALL genuinely does cover reads and writes, and must still say so.
+      const forAll = finding.causeOf(writable(['ALL'], ['add', 'change', 'delete']));
+      if (!/every command|FOR ALL/i.test(forAll.short + forAll.long)) {
+        problems.push('a FOR ALL policy was not described as covering every command');
+      }
+
+      // Only the commands that actually got through are named. A rule for
+      // deleting is not the reason an insert landed.
+      const two = finding.causeOf(writable(['INSERT', 'DELETE'], ['add']));
+      if (/deleting rows/.test(two.short)) {
+        problems.push('it blamed a rule for a write that never got through: ' + two.short);
+      }
+
+      // Nothing on the table names this write, so there is no rule to blame
+      // and none may be invented.
+      for (const rules of [[], ['SELECT']]) {
+        const nothing = finding.causeOf(writable(rules));
+        if (/the rule you wrote|every command/i.test(nothing.short + nothing.long)) {
+          problems.push('with rules ' + JSON.stringify(rules) + ' it invented a rule: ' + nothing.short);
+        }
+      }
+
+      // A restrictive policy can only narrow what is allowed, so it is never
+      // the reason a write succeeded - it must never be blamed for one.
+      const restrictive = finding.causeOf(writable([]));
+      if (/lets everybody through/.test(restrictive.short)) {
+        problems.push('a table with no permissive rule was said to have one');
+      }
+
+      // And with row level security off, none of this applies at all.
+      const off = finding.causeOf(Object.assign(writable([]), { rlsEnabled: false }));
+      if (!/never switched on/.test(off.short)) {
+        problems.push('row level security being off was not given as the reason: ' + off.short);
+      }
+      return problems;
+    },
+  },
 ];
 
 let failures = 0;

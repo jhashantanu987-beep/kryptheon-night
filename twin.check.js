@@ -456,7 +456,7 @@ async function main() {
       // that makes it safe to run at all.
       const beforeNode = await contentsOf(client, byNode);
       const beforeSql = await contentsOf(client, bySql);
-      const mineWrote = await tamper.tamper(client, byNode, fromNode.tables, mineSeeded.seeded);
+      const mineWrote = await tamper.tamper(client, byNode, fromNode.tables, mineSeeded.seeded, fromNode.policies);
       let theirsWrote = null;
       await sqlengine.withEngine(client, async (target) => {
         engineForWriting = target;
