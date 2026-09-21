@@ -218,6 +218,63 @@ async function main() {
       return problems;
     })());
 
+    check('11. a table and its mark arrive together, or not at all', await (async () => {
+      // The hole the mark itself had. The mark was written in a second
+      // statement, so a run killed between the two left an auth.users with no
+      // comment on it - and an unmarked table is one every later run reads as
+      // the customer's and will never remove. Permanently: the sweep only
+      // takes marked ones, and this whole suite then refuses to start.
+      //
+      // Found on 2026-09-21, on the database these checks run against, four
+      // hours after the run that made it.
+      //
+      // Proved by making the mark fail rather than by killing anything: the
+      // question is whether the table survives a failure between the two
+      // statements, and a thrown error is the same interruption a dead
+      // process is, from the database's side.
+      const problems = [];
+      if (await present(client)) {
+        return ['an auth.users is already here, so this could not be tested'];
+      }
+
+      const brittle = {
+        query: (text, values) => (
+          /^\s*COMMENT/i.test(String(text))
+            ? Promise.reject(new Error('pretend the run died here'))
+            : client.query(text, values)
+        ),
+      };
+
+      let threw = false;
+      try {
+        await fixture.ensureAuthUsers(brittle, 'id uuid PRIMARY KEY, email text');
+      } catch (err) {
+        threw = true;
+      }
+
+      if (!threw) problems.push('the mark failed and it carried on as if it had not');
+      if (await present(client)) {
+        problems.push('an unmarked auth.users was left behind, which no later run will ever clear');
+        await client.query('DROP TABLE IF EXISTS auth.users CASCADE').catch(() => {});
+      }
+
+      // And the ordinary path still leaves a marked table, or the rollback
+      // above would be passing by never creating anything at all.
+      const made = await fixture.ensureAuthUsers(client, 'id uuid PRIMARY KEY, email text');
+      if (!made.made) {
+        problems.push('it did not create the table on the ordinary path');
+      } else {
+        const { rows } = await client.query(
+          "SELECT obj_description('auth.users'::regclass, 'pg_class') AS mark",
+        );
+        if (!String(rows[0].mark || '').startsWith(MARK)) {
+          problems.push('the table it made carries no mark: ' + JSON.stringify(rows[0].mark));
+        }
+        await made.undo();
+      }
+      return problems;
+    })());
+
   } finally {
     if (plantedOurOwn) {
       await client.query('DROP TABLE IF EXISTS auth.users CASCADE').catch(() => {});

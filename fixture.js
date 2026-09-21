@@ -98,21 +98,36 @@ async function ensureAuth(client) {
 
   const { rows: schemaRows } = await client.query("SELECT 1 FROM pg_namespace WHERE nspname = 'auth'");
   const madeSchema = schemaRows.length === 0;
-  if (madeSchema) await client.query('CREATE SCHEMA auth');
 
-  const { rows: functionRows } = await client.query(
-    `SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE n.nspname = 'auth' AND p.proname = 'uid'`,
-  );
-  const madeFunction = functionRows.length === 0;
-  if (madeFunction) {
-    // Written the way Supabase writes it, and only when there is nothing
-    // there. Replacing somebody's own auth.uid() is the exact mistake this
-    // module exists to stop.
-    await client.query(
-      'CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
-        "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$",
+  const { rows: functionRows } = madeSchema
+    ? { rows: [] }
+    : await client.query(
+      `SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'auth' AND p.proname = 'uid'`,
     );
+  const madeFunction = functionRows.length === 0;
+
+  // Both or neither, for the same reason auth.users is. Dying between them
+  // leaves an auth schema this suite created and will never claim, because
+  // whether it was ours is held in a variable in a process that is gone.
+  if (madeSchema || madeFunction) {
+    await client.query('BEGIN');
+    try {
+      if (madeSchema) await client.query('CREATE SCHEMA auth');
+      if (madeFunction) {
+        // Written the way Supabase writes it, and only when there is nothing
+        // there. Replacing somebody's own auth.uid() is the exact mistake
+        // this module exists to stop.
+        await client.query(
+          'CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ ' +
+            "SELECT nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$",
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    }
   }
 
   await client.query('GRANT USAGE ON SCHEMA auth TO anon, authenticated').catch(() => {});
@@ -143,10 +158,29 @@ async function ensureAuthUsers(client, definition) {
   );
   if (rows.length) return { made: false, undo: async function undo() {} };
 
-  await client.query('CREATE TABLE auth.users (' + definition + ')');
-  await client.query(
-    "COMMENT ON TABLE auth.users IS '" + MADE_HERE + Date.now().toString(36) + "'",
-  );
+  // The table and its mark, or neither.
+  //
+  // These were two statements. A run killed between them - a timeout, a
+  // dropped connection, ctrl-c - left an auth.users with no comment on it,
+  // and an unmarked table is one every later run reads as the customer's and
+  // refuses to touch. For ever: the sweep only removes marked ones, and
+  // `guests.check.js` then stops before it has tested anything, saying so.
+  //
+  // Which is exactly what happened here on 2026-09-21, and it is the same
+  // hole the mark was invented to close - left open because the mark was
+  // written a statement too late. DDL is transactional in Postgres, so making
+  // it one unit costs nothing.
+  await client.query('BEGIN');
+  try {
+    await client.query('CREATE TABLE auth.users (' + definition + ')');
+    await client.query(
+      "COMMENT ON TABLE auth.users IS '" + MADE_HERE + Date.now().toString(36) + "'",
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  }
   return {
     made: true,
     undo: async function undo() {
