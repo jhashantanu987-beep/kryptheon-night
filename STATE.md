@@ -215,6 +215,46 @@ region flag, so this cannot be improved from the CLI. It matters because a
 slow suite looks exactly like a hung one - and acting on that guess killed a
 run that was working perfectly.
 
+**The copy was borrowing the customer's tables, on every app that lives in
+`public`.** `pg_get_constraintdef` writes the schema name only when the
+referenced table is *not* reachable through `search_path`. Every fixture in
+this repo builds its app in `kn_src_<moment>`, which is on nobody's path, so
+every foreign key came back qualified and the rewrite always had something to
+rewrite. A real app lives in `public`, which is on the path, so the same key
+comes back as a bare `REFERENCES profiles(id)` - and replayed into the copy it
+resolves through `search_path` again and binds to the customer's own table.
+
+Measured on the first real Supabase project this was ever pointed at:
+
+    notes_owner_fkey     -> public.profiles
+    orders_user_id_fkey  -> public.profiles
+
+Nothing was written to those tables. The damage is that the copy was not the
+app: inserts into it were checked against a table the seeder had put nothing
+in, so two tables out of four could not be seeded and were never attacked.
+`orders` - no row level security, granted to `anon` - was invisible. The
+report said "not checked" rather than "safe", which is the only reason this
+was not a false green.
+
+The fourth "the copy was not the app" bug, and the first that no string
+rewrite could have caught. So `writeSchema` now asks `pg_constraint` where the
+copy ended up pointing and refuses to hand back one that points outside
+itself. A spelling nobody anticipated can get past a rewrite; it cannot get
+past the database's own account of what was built.
+
+**Supabase's own advisor does not find the worst one.** Run against the same
+project on 2026-09-21, its advisor listed two issues - `waitlist` and
+`orders`, both "RLS Disabled in Public". It did not list `profiles`, because
+`profiles` *has* row level security enabled. Its policy is `USING (true)`, so
+every request passes. The scan read two rows off it as a logged-out stranger.
+
+That is the sentence the product is sold on, with an external control for the
+first time: *the table has row level security switched on, so it looks
+protected, but the rule attached to it allows every request - that is why
+nothing in your dashboard flags it.* Worth keeping honest about: the fixture
+was written to contain that trap, so finding it was not a surprise. What was
+informative is that the dashboard, looking at the same database, did not.
+
 **npm downloads are not users.** 1253 last month, but every spike lands
 exactly on a publish day and 20 of 30 days are zero. That is mirrors reacting
 to publishes. **Nobody is using it.** The problem is distribution, not the
