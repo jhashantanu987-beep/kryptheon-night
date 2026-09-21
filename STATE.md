@@ -16,7 +16,7 @@ looking at the screen, the other by looking at the database.
 | | `C:\Users\jhash\code\kryptheon-v1` | `C:\Users\jhash\code\kryptheon-night` |
 | --- | --- | --- |
 | what it is | the shipping CLI | the night shift |
-| npm | **published**, `kryptheon` 0.1.12 | **published**, `kryptheon-night` 0.1.0 |
+| npm | **published**, `kryptheon` 0.1.12 | **published**, `kryptheon-night` 0.1.2 |
 | github | `jhashantanu987-beep/kryptheon-cli` | `jhashantanu987-beep/kryptheon-night` (private) |
 | commits | 3 | 21 |
 | built on | Playwright | Postgres |
@@ -376,10 +376,17 @@ anything.
   every Supabase-specific decision in `trouble.js` and `connect.js` - the
   session pooler, IPv6 on direct connections, the certificate authority - is
   reasoned from documentation rather than measured. Free tier is enough.
-- **Nothing, to publish.** Done on 2026-09-21. `kryptheon-night@0.1.0`,
-  fourteen files, 60 kB, shasum `e9523618` - the same shasum the dry run
-  showed, so what is on the registry is the artifact the guard checked.
-  Installed from npm into an empty folder it runs end to end in 2m20s.
+- **Nothing, to publish.** `kryptheon-night@0.1.2` on 2026-09-21, shasum
+  `494428ad` - byte for byte the tarball `npm pack` builds here. Installed
+  from the registry into an empty folder and run against a real Supabase
+  project: 2 seconds to install, 2m36s to a report of five problems, and
+  nothing left in their database afterwards.
+
+  Publishing needs a browser one-time password, so that step belongs to
+  whoever owns the account. Read the registry to confirm a publish, and read
+  it with `--prefer-online` or the version endpoint directly: a plain
+  packument fetch is cached and said 0.1.1 for some minutes after 0.1.2 was
+  live.
 - **Where the nightly verdict goes.** The design is that `pg_net` posts only
   *news*, never data - "Kryptheon found 3 things, run `kryptheon night` to see
   them" - no table names, nothing. That still needs somewhere to post to;
