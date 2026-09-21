@@ -315,6 +315,34 @@ const BY_SYSCALL = {
 };
 
 /**
+ * Is this Supabase's direct connection, and if so whose?
+ *
+ * `db.<ref>.supabase.co` is the direct connection. Supabase stopped giving it
+ * an IPv4 address, so today it resolves to an AAAA record and nothing else -
+ * and on a machine with no IPv6 the name does not resolve at all. The failure
+ * that produces is ENOTFOUND: not "unreachable", which would at least hint at
+ * the network, but "no such name", which reads as a typo.
+ *
+ * Measured on a real project: A = ENODATA, AAAA = 2406:da1c:..., and no
+ * global IPv6 on the machine. The scan said "there is a typo in the address,
+ * or this computer is not online... if your project was paused or deleted",
+ * and all three of those were false. That sends somebody to reset a password
+ * or rebuild a project that was never broken.
+ *
+ * The ref is handed back so the pooler string can be spelled out with their
+ * own project in it rather than as a shape to fill in.
+ */
+function supabaseDirectRef(raw) {
+  try {
+    const host = new URL(String(raw).trim().replace(/^["']|["']$/g, '')).hostname;
+    const match = /^db\.([a-z0-9]+)\.supabase\.(co|com)$/i.exec(host);
+    return match ? match[1] : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
  * One failure, in plain English.
  *
  * Always returns something. A branch that has not been written yet is worse
@@ -325,6 +353,33 @@ const BY_SYSCALL = {
  */
 function explain(err, raw) {
   const code = err && err.code ? String(err.code) : '';
+
+  // Checked before the general ENOTFOUND, because for this one address the
+  // general answer is wrong in every one of its three guesses.
+  const ref = code === 'ENOTFOUND' ? supabaseDirectRef(raw) : null;
+  if (ref) {
+    return [
+      'I could not find that server - and I think I know why.',
+      '',
+      'That address is Supabase’s direct connection, and it now answers only',
+      'over IPv6. Plenty of home and office networks have no IPv6 at all, and on',
+      'those the name does not resolve to anything - which is what just',
+      'happened here.',
+      '',
+      'There is nothing wrong with your project or your password. Use the',
+      'session pooler instead, which answers over the ordinary internet:',
+      '',
+      '  Supabase dashboard -> Project Settings -> Database ->',
+      '  Connection string -> URI -> and pick "Session pooler".',
+      '',
+      'It looks like this, with your password in the middle:',
+      '',
+      '  postgresql://postgres.' + ref + ':PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres',
+      '',
+      'Take the port 5432 one. The other pooler, on 6543, hands every statement',
+      'a different connection and these attacks have to stay on one.',
+    ];
+  }
 
   if (BY_CODE[code]) return BY_CODE[code].slice();
   if (BY_SYSCALL[code]) return BY_SYSCALL[code].slice();
@@ -372,6 +427,7 @@ module.exports = {
   readConnectionString: readConnectionString,
   poolerWarning: poolerWarning,
   explain: explain,
+  supabaseDirectRef: supabaseDirectRef,
   withoutSecret: withoutSecret,
   PLACEHOLDERS: PLACEHOLDERS,
 };

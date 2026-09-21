@@ -209,6 +209,49 @@ async function main() {
     return problems;
   })());
 
+  check('15. Supabase’s IPv6-only direct connection is named, not called a typo', (() => {
+    // Measured against a real project on 2026-09-21: the direct connection
+    // has an AAAA record and no A record, this machine has no global IPv6, so
+    // the name does not resolve and pg reports ENOTFOUND. The general answer
+    // for ENOTFOUND offers three causes - a typo, being offline, and a paused
+    // or deleted project - and every one of them was false.
+    const direct = 'postgresql://postgres:pw@db.kcfsflcleldwefkusowf.supabase.co:5432/postgres';
+    const said = trouble.explain({ code: 'ENOTFOUND' }, direct).join('\n');
+    const problems = [];
+
+    if (!/IPv6/.test(said)) problems.push('it does not say why the name did not resolve: ' + said);
+    if (!/session pooler/i.test(said)) problems.push('it does not say what to use instead');
+    if (/typo/i.test(said)) problems.push('it still offers a typo as the cause');
+    if (/paused or deleted/i.test(said)) problems.push('it still suggests the project may be gone');
+    // Their own project, spelled out, rather than a shape to fill in.
+    if (!said.includes('postgres.kcfsflcleldwefkusowf')) {
+      problems.push('it does not build the pooler string from their own project ref');
+    }
+    if (!/6543/.test(said)) problems.push('it does not steer them off the transaction pooler');
+
+    // And this must stay narrow. Any other host that cannot be found is still
+    // a typo or an offline machine, and saying "IPv6" about it would be the
+    // same invention in the other direction.
+    for (const other of [
+      'postgresql://postgres.abc:pw@aws-0-ap-south-1.pooler.supabase.com:5432/postgres',
+      'postgresql://u:pw@ep-thing.us-east-2.aws.neon.tech:5432/neondb',
+      'postgresql://u:pw@db.example.com:5432/app',
+    ]) {
+      if (/IPv6/.test(trouble.explain({ code: 'ENOTFOUND' }, other).join('\n'))) {
+        problems.push('it blamed IPv6 for ' + other.split('@')[1]);
+      }
+    }
+
+    // The ref is read off the host, and only off a host of that exact shape.
+    if (trouble.supabaseDirectRef(direct) !== 'kcfsflcleldwefkusowf') {
+      problems.push('the project ref was not read correctly');
+    }
+    if (trouble.supabaseDirectRef('postgresql://u:pw@db.notsupabase.io:5432/x')) {
+      problems.push('it read a project ref out of a host that is not Supabase');
+    }
+    return problems;
+  })());
+
   /* ---- how the connection is actually opened ---- */
 
   check('13. the password is never sent unencrypted', (() => {
