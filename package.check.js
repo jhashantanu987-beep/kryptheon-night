@@ -41,10 +41,21 @@ function check(name, problems) {
 function npm(args, cwd) {
   const command = process.platform === 'win32' ? 'cmd.exe' : 'npm';
   const argv = process.platform === 'win32' ? ['/c', 'npm'].concat(args) : args;
+
+  // npm passes its own settings to child processes as npm_config_* variables,
+  // and this check runs as `prepublishOnly` - so under `npm publish
+  // --dry-run` the pack below inherits npm_config_dry_run and packs nothing.
+  // It still prints the file name it would have written, which is how a check
+  // ends up installing a tarball that does not exist and reporting the
+  // product as broken. Cleared here so the pack is always a real one.
+  const env = Object.assign({}, process.env);
+  delete env.npm_config_dry_run;
+
   const r = spawnSync(command, argv, {
     cwd: cwd,
     encoding: 'utf8',
     timeout: 300000,
+    env: env,
   });
   return { out: String(r.stdout || ''), err: String(r.stderr || ''), code: r.status };
 }
@@ -133,12 +144,21 @@ function main() {
   const packed = npm(['pack', '--silent'], HERE);
   const tarball = packed.out.trim().split('\n').filter(Boolean).pop();
 
-  if (packed.code !== 0 || !tarball) {
-    check('4. npm pack builds a tarball', ['npm pack failed: ' + (packed.err || packed.out).trim()]);
+  const tarballPath = tarball ? path.join(HERE, tarball) : '';
+
+  // npm printing a name is not npm writing a file, and the two came apart the
+  // first time this check ran inside a publish. Checked on disk, and said in
+  // one line - without this the run carries on and every later check fails
+  // with `Cannot find module`, which reads like a broken product rather than
+  // like a tarball that was never built.
+  if (packed.code !== 0 || !tarball || !fs.existsSync(tarballPath)) {
+    check('4. npm pack builds a tarball', [
+      packed.code !== 0
+        ? 'npm pack failed: ' + (packed.err || packed.out).trim()
+        : 'npm pack said it wrote ' + (tarball || '(nothing)') + ', and there is no such file',
+    ]);
     return report();
   }
-
-  const tarballPath = path.join(HERE, tarball);
   const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'kn-fresh-'));
 
   try {
