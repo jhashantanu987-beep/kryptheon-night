@@ -1,0 +1,202 @@
+// What the person is asked, and what they are told before anything runs.
+//
+// This file is the whole difference between a tool for people who write code
+// and a tool for people who do not. The engine behind it does not change; the
+// first ninety seconds do.
+//
+// Two things happen here and both are deliberate.
+//
+// Asking, rather than requiring. `KN_DATABASE_URL=... node scan.js public` is
+// three unfamiliar ideas at once: an environment variable, a connection
+// string, and a schema. Somebody who has only ever clicked Deploy has met
+// none of them. So the command takes no arguments, and asks.
+//
+// Telling before doing. This tool connects to a person's production database
+// with the owner's credential and creates things in it. Nobody should agree
+// to that from a package name. What it does, what it does not do, and then a
+// yes or no - in that order, before the first statement is sent.
+
+const readline = require('readline');
+const trouble = require('./trouble.js');
+
+/**
+ * Where the connection string is, said as buttons rather than as concepts.
+ *
+ * Named screen by screen because "get your connection string" is not an
+ * instruction to somebody who does not know the phrase. Supabase first
+ * because that is who this is for; Lovable and Bolt build on Supabase, so
+ * their users end up on the same page by a different door.
+ */
+function whereToFindIt() {
+  return [
+    'Where to find it:',
+    '',
+    '  Supabase   supabase.com/dashboard -> your project -> the gear icon',
+    '             (Project Settings) at the bottom left -> Database ->',
+    '             scroll to "Connection string" -> the URI tab -> Copy.',
+    '',
+    '             Replace [YOUR-PASSWORD] in it with your database password.',
+    '             It is on that same page under "Database password".',
+    '',
+    '  Lovable    your app uses Supabase underneath. Open the Supabase',
+    '  and Bolt   project it made for you and follow the lines above.',
+    '',
+    '  Neon       console.neon.tech -> your project -> Connection Details.',
+    '',
+    'It is one long line beginning postgresql:// and it ends in /postgres.',
+  ];
+}
+
+/**
+ * What is about to happen, and what is not.
+ *
+ * The second half matters more than the first. Everybody who runs this is
+ * being asked to hand a stranger's program the key to their live database,
+ * and the fears they have are specific: will you read my customers, will you
+ * send anything anywhere, will you leave a mess. Each of those is answered in
+ * its own line, in the words they would use.
+ *
+ * Nothing here is a promise made only on this screen. Every line is something
+ * the code is built to make true and a check in this repo fails if it stops
+ * being true - `untouched.check.js` photographs the whole database and
+ * compares it afterwards.
+ */
+function consentLines(target) {
+  return [
+    'Before I touch anything, here is exactly what I am going to do.',
+    '',
+    'What I will do:',
+    '',
+    '  - Look at the shape of your "' + target + '" tables: their names, their',
+    '    columns, and the rules about who is allowed to see what.',
+    '',
+    '  - Make one new temporary space inside your database and rebuild that',
+    '    same shape in it. Your real tables are not changed.',
+    '',
+    '  - Put two made-up people in the copy - fake names, fake emails.',
+    '',
+    '  - Attack the copy. I try to read those two fake people as a stranger',
+    '    would, try to change their rows, try to break them.',
+    '',
+    '  - Tell you what got through, and delete the copy.',
+    '',
+    'What I will not do:',
+    '',
+    '  - I do not read your real data. Not one customer, order or message.',
+    '    Every row I read is a row I put there myself a moment earlier.',
+    '',
+    '  - I do not change your real tables. Only the temporary copy.',
+    '',
+    '  - I do not send anything anywhere. No account, no upload, no server of',
+    '    mine. Your connection string stays on this computer and is not',
+    '    written to any file.',
+    '',
+    '  - I do not leave anything behind. The copy is deleted when I finish,',
+    '    and also if I crash.',
+    '',
+    'This takes two or three minutes.',
+  ];
+}
+
+/** Asks a question and hands back what was typed. */
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(String(answer || '').trim());
+    });
+  });
+}
+
+/**
+ * Asks for something that must not be echoed.
+ *
+ * The connection string carries the password to the entire database. Shown on
+ * screen it is read by whoever is behind them, and it stays in the scrollback
+ * of whatever terminal they are in for as long as that window is open.
+ *
+ * Nothing is printed as they type - not even stars, because a pasted string
+ * of stars is no more checkable than nothing and the character count alone
+ * says how long the password is. What they get instead is the address read
+ * back to them afterwards, with the password removed, which is the part they
+ * would actually want to check.
+ */
+function askSecret(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    let silent = false;
+    // readline writes every keystroke back to the screen itself. This replaces
+    // that with nothing, but only once the prompt has been written - otherwise
+    // the question never appears either.
+    rl._writeToOutput = function (text) {
+      if (!silent) rl.output.write(text);
+    };
+    rl.question(question, (answer) => {
+      silent = false;
+      rl.output.write('\n');
+      rl.close();
+      resolve(String(answer || '').trim());
+    });
+    silent = true;
+  });
+}
+
+/**
+ * Was that a yes?
+ *
+ * The question being answered is "may I connect to your production database",
+ * so the rule is that only a yes is a yes. A stray newline, a shrug, an
+ * accidental Enter on an empty line - none of those are permission, and the
+ * cost of getting this backwards is connecting to somebody's live database
+ * without being asked to.
+ *
+ * Separate from the asking so it can be checked directly. Every form of this
+ * that hid inside a prompt went unchecked.
+ */
+function isYes(answer) {
+  const said = String(answer == null ? '' : answer).trim().toLowerCase();
+  return said === 'y' || said === 'yes';
+}
+
+/** Yes or no, where anything that is not a clear yes is a no. */
+async function askYesNo(question) {
+  return isYes(await ask(question));
+}
+
+/**
+ * The connection string, from wherever it can be had.
+ *
+ * The environment variable is checked first so that anybody scripting this
+ * never sees a prompt, and so the string does not have to be retyped on every
+ * run. Nothing is saved: asked again next time is the correct behaviour for a
+ * credential this powerful, and a file holding it would be the one thing this
+ * tool tells people not to do.
+ */
+async function askForConnection(say) {
+  say('');
+  say('  I need the connection string for your database.');
+  say('');
+  say('  It is one line that lets me connect. It contains your database');
+  say('  password, so I will not show it on screen as you paste it, and I do');
+  say('  not save it anywhere.');
+  say('');
+  whereToFindIt().forEach((l) => say('  ' + l));
+  say('');
+
+  const given = await askSecret('  Paste it here and press Enter: ');
+  return given;
+}
+
+module.exports = {
+  whereToFindIt: whereToFindIt,
+  consentLines: consentLines,
+  ask: ask,
+  askSecret: askSecret,
+  askYesNo: askYesNo,
+  isYes: isYes,
+  askForConnection: askForConnection,
+  // Re-exported so the command has one place to reach for the wording of a
+  // failure, rather than two.
+  withoutSecret: trouble.withoutSecret,
+};

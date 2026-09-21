@@ -1,12 +1,20 @@
 # Running the checks
 
-Fourteen suites. Run them after every change, not at the end.
+Nineteen suites. Run them after every change, not at the end.
 
     set KN_DATABASE_URL=postgresql://...
     npm run check
 
+Five of them need nothing but Node, and those are worth running on their own
+every time a word of the product is edited:
+
+    npm run check:dry
+
 | | needs a database | what it is about |
 |---|---|---|
+| `package.check.js` | no | what npm hands a stranger actually runs |
+| `trouble.check.js` | no | every failure is a sentence, not a stack trace |
+| `intro.check.js` | no | the consent screen is honest, and honoured |
 | `finding.check.js` | no | the report never says more than the attack saw |
 | `recheck.check.js` | no | "fixed" is only ever said when it is true |
 | `untouched.check.js` | yes | nothing outside the copy is changed, at all |
@@ -28,6 +36,37 @@ The ones that need a database build small apps in Postgres, use them, and take
 away exactly what they created - see **The checks are guests** below.
 
 ## What each one is guarding
+
+**package.check.js** - the only check that tests the thing a customer receives
+rather than the thing in this folder. It runs `npm pack`, installs the tarball
+into an empty directory that has never seen this repo, and runs the command
+from there. The sibling project shipped a broken `kryptheon@0.1.8` precisely
+this way: green in the repo, `Cannot find module` for everybody who installed
+it, and no suite could have known. It follows the `require` graph from the bin
+rather than trusting the `files` list, because trusting the list is the bug.
+It needs no database, so `prepublishOnly` can run it.
+
+**trouble.check.js** - the wording of every failure that happens before a
+single attack runs. Most of them are one person's first ninety seconds: the
+Supabase line pasted with `[YOUR-PASSWORD]` still in it, the project URL
+pasted instead of the connection string, an API key pasted instead of either.
+Two of the cases are not invented - a connection is really opened to a host
+that does not exist and to a port with nothing behind it, and the error object
+`pg` actually produced is what gets explained. A mapping keyed on `err.code`
+passes for months against hand-written fakes.
+
+It has already caught one real fault: the message for a dropped connection
+told people to add `?sslmode=require`, which this version of the driver reads
+as full certificate verification and which Supabase's own certificate
+authority then fails.
+
+**intro.check.js** - the consent screen, and whether it is a gate or a
+decoration. Checks 7 and 8 are a pair: with nobody to ask and no `--yes` the
+command must not connect, and with `--yes` it must - without the second, the
+first would pass just as happily on a command that never connects to anything.
+Check 3 is a jargon blocklist. "I will introspect your schema and replay your
+RLS policies" is a true sentence that tells this person nothing, and agreement
+to a sentence nobody understood is not consent.
 
 **finding.check.js** - the report never says more than the attack saw. Most of
 it is restraint: no invented columns, no invented severity, no "personal

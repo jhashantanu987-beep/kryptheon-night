@@ -341,6 +341,47 @@ function saveRun(file, result) {
   }
 }
 
+/**
+ * The last thing on the screen: what was not tested, and why.
+ *
+ * A report that ends on "nothing got through" is read as "I am safe", and the
+ * distance between those two sentences is the whole product. So the last
+ * words are always the limits of the answer, not the answer.
+ *
+ * It is printed even when nothing was missed, because "I tested all of it"
+ * and "I did not tell you what I skipped" look identical when the section is
+ * simply absent, and only one of them is good news.
+ */
+function notTestedLines(result) {
+  const notChecked = result.notChecked || [];
+  const lines = ['', '  ' + '-'.repeat(68), '  What I did not test', ''];
+
+  if (!notChecked.length) {
+    lines.push('    Every table I could reach was attacked, and every attack I have');
+    lines.push('    finished, ran.');
+  } else {
+    for (const missed of notChecked) {
+      lines.push('    ' + missed.table + ' - ' + missed.why);
+    }
+    lines.push('');
+    lines.push('    These are unknown, not clear. An attack that never ran comes back');
+    lines.push('    looking exactly like an attack that was refused.');
+  }
+
+  // Said every time, whether or not the collision attack ran. It is the one
+  // limit that is structural rather than circumstantial, and a person
+  // deciding how far to trust this deserves to know it is there.
+  lines.push('');
+  lines.push('    One thing is never reported, on purpose: the lost update - two');
+  lines.push('    withdrawals of 100 from a balance of 100 that both go through.');
+  lines.push('    Every Postgres database behaves that way unless the app asks it');
+  lines.push('    not to, so whether yours is affected depends on code I never see.');
+  lines.push('    Flagging it would mean flagging every app with a number in it.');
+  lines.push('');
+
+  return lines;
+}
+
 /** The report, as the person reads it in the morning. */
 function report(result) {
   if (result.stopped) {
@@ -356,19 +397,20 @@ function report(result) {
   // held" is only true about the tables that were actually tried, and a table
   // no row could be put into looks exactly like a table nothing got out of.
   const notChecked = result.notChecked || [];
+  // Said before the verdict, and again in full at the very end. The warning
+  // has to come first or "everything held" is read before the reason it might
+  // not mean anything; the list has to come last or it is the first thing
+  // scrolled past. The two are not the same sentence twice - this one is
+  // whether to trust the verdict, and the one at the end is what to go and
+  // look at.
   const sayWhatWasMissed = () => {
     if (!notChecked.length) return;
     line('');
-    line('  ' + notChecked.length + (notChecked.length === 1 ? ' table was' : ' tables were') + ' NOT checked:');
-    line('');
-    for (const missed of notChecked) {
-      line('    ' + missed.table + ' - ' + missed.why);
-    }
-    line('');
-    line('  I could not get a test row into ' + (notChecked.length === 1 ? 'it' : 'them') +
-      ', so I cannot say whether');
-    line('  ' + (notChecked.length === 1 ? 'it is' : 'they are') + ' safe. Treat ' +
-      (notChecked.length === 1 ? 'it' : 'them') + ' as unknown, not as clear.');
+    line('  ' + notChecked.length + (notChecked.length === 1 ? ' table was' : ' tables were') +
+      ' NOT checked. Whatever this report says next is not');
+    line('  about ' + (notChecked.length === 1 ? 'it' : 'them') + '. Treat ' +
+      (notChecked.length === 1 ? 'it' : 'them') + ' as unknown, not as clear - the list, and why, is');
+    line('  at the end.');
   };
 
   if (!result.findings.length) {
@@ -380,6 +422,7 @@ function report(result) {
     } else {
       finding.allClearLines(result.attacksRun).forEach(line);
     }
+    notTestedLines(result).forEach(line);
     return;
   }
 
@@ -409,7 +452,8 @@ function report(result) {
   line('  ' + '-'.repeat(68));
   line('  Nothing here touched your live app. I built a copy, attacked the copy,');
   line('  and deleted it. Not one real customer was involved.');
-  line('');
+
+  notTestedLines(result).forEach(line);
 }
 
 /** Wraps at a width a person can read without their eyes sliding off. */
@@ -516,5 +560,7 @@ module.exports = {
   loadLastRun: loadLastRun,
   saveRun: saveRun,
   sweepOldCopies: sweepOldCopies,
+  notTestedLines: notTestedLines,
+  LAST_RUN: LAST_RUN,
   ABANDONED_AFTER: ABANDONED_AFTER,
 };

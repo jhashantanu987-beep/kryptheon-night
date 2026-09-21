@@ -1,11 +1,35 @@
 {
   "name": "kryptheon-night",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Attacks a copy of your Supabase database and tells you in plain English what got in.",
+  "license": "MIT",
   "type": "commonjs",
-  "description": "Attacks a copy of your backend and reports what it found, in plain English.",
+  "bin": {
+    "kryptheon-night": "bin/kryptheon-night.js"
+  },
+  "files": [
+    "bin/",
+    "scan.js",
+    "schema.js",
+    "attack.js",
+    "finding.js",
+    "collision.js",
+    "tamper.js",
+    "orphan.js",
+    "recheck.js",
+    "intro.js",
+    "trouble.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "check": "node finding.check.js && node recheck.check.js && node untouched.check.js && node blocked.check.js && node orphans.check.js && node guests.check.js && node usable.check.js && node twin.check.js && node external.check.js && node schema.check.js && node collision.check.js && node tamper.check.js && node orphan.check.js && node shapes.check.js && node verdicts.check.js && node loop.check.js",
+    "check": "node package.check.js && node trouble.check.js && node intro.check.js && node finding.check.js && node recheck.check.js && node untouched.check.js && node blocked.check.js && node orphans.check.js && node guests.check.js && node usable.check.js && node twin.check.js && node external.check.js && node schema.check.js && node collision.check.js && node tamper.check.js && node orphan.check.js && node shapes.check.js && node verdicts.check.js && node loop.check.js",
+    "check:dry": "node package.check.js && node trouble.check.js && node intro.check.js && node finding.check.js && node recheck.check.js",
+    "check:package": "node package.check.js",
+    "check:trouble": "node trouble.check.js",
+    "check:intro": "node intro.check.js",
     "check:report": "node finding.check.js",
     "check:recheck": "node recheck.check.js",
     "check:copy": "node schema.check.js",
@@ -26,7 +50,21 @@
     "check:guests": "node guests.check.js",
     "check:interruption": "node orphan.check.js",
     "probe:orphan": "node probe-orphan.js",
-    "check:twin": "node twin.check.js"
+    "check:twin": "node twin.check.js",
+    "prepublishOnly": "node package.check.js"
+  },
+  "keywords": [
+    "supabase",
+    "postgres",
+    "rls",
+    "row-level-security",
+    "security",
+    "lovable",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jhashantanu987-beep/kryptheon-night.git"
   },
   "dependencies": {
     "pg": "^8.23.0"

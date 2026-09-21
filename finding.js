@@ -472,12 +472,21 @@ function allClearLines(attacksRun) {
   if (!attacksRun) {
     return ['', '  I did not manage to attack anything, so there is nothing to report.', ''];
   }
+  // "Your data held" used to be the last line here, and it was the wrong
+  // sentence: it says something about the app, and all this program knows is
+  // something about the attacks it happened to run. A person who reads "your
+  // data held" stops looking. A person who reads "these attacks lost" knows
+  // what they have been handed and what they have not.
   return [
     '',
     '  Nothing got through.',
     '',
-    '  I ran ' + attacksRun + ' ' + (attacksRun === 1 ? 'attack' : 'attacks') + ' against a copy of your app',
-    '  and every one of them was refused. Your data held.',
+    '  I ran ' + attacksRun + ' ' + (attacksRun === 1 ? 'attack' : 'attacks') + ' against a copy of your app,',
+    '  and every one of them lost.',
+    '',
+    '  That is not the same as "your app is safe". It means these attacks,',
+    '  against this shape of database, this time, did not get in. Anything I',
+    '  did not try is listed at the end.',
     '',
   ];
 }
