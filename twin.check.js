@@ -20,6 +20,9 @@ const { Client } = require('pg');
 const schema = require('./schema.js');
 const fixture = require('./fixture.js');
 const attack = require('./attack.js');
+const tamper = require('./tamper.js');
+const orphan = require('./orphan.js');
+const collision = require('./collision.js');
 const sqlengine = require('./sqlengine.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
@@ -113,6 +116,21 @@ async function buildApp(client) {
       ' (org_id integer NOT NULL, user_id uuid NOT NULL, role text NOT NULL, PRIMARY KEY (org_id, user_id))',
   );
   await client.query('CREATE TABLE ' + q('flags') + ' (id serial PRIMARY KEY)');
+  await client.query('CREATE TABLE ' + q('counters') +
+    ' (id serial PRIMARY KEY, seq bigint GENERATED ALWAYS AS IDENTITY,' +
+    ' doubled integer GENERATED ALWAYS AS (id * 2) STORED, note text NOT NULL)');
+  await client.query('CREATE TABLE ' + q('drafts') +
+    ' (id serial PRIMARY KEY, profile_id uuid NOT NULL, body text NOT NULL)');
+  await client.query('CREATE TABLE ' + q('invoices') +
+    ' (id serial PRIMARY KEY, profile_id uuid NOT NULL REFERENCES ' + q('profiles') +
+    '(id), total numeric(10,2) NOT NULL)');
+  await client.query('CREATE TABLE ' + q('audit_events') +
+    ' (id serial PRIMARY KEY, profile_id uuid NOT NULL, what text NOT NULL)');
+  await client.query('CREATE TABLE ' + q('mentions') +
+    ' (id serial PRIMARY KEY, folder_id text NOT NULL, note text NOT NULL)');
+  await client.query('CREATE TABLE ' + q('comments') +
+    ' (id serial PRIMARY KEY, profile_id uuid NOT NULL' +
+    " CHECK (profile_id <> '99999999-9999-4999-8999-999999999999'::uuid), body text NOT NULL)");
   await client.query('CREATE SCHEMA ' + schema.quote(PRIVATE));
   await client.query('CREATE FUNCTION ' + schema.quote(PRIVATE) +
     '.is_allowed(who uuid) RETURNS boolean LANGUAGE sql STABLE AS ' + "$fn$ SELECT true $fn$");
@@ -194,11 +212,15 @@ async function buildApp(client) {
   for (const t of [
     'profiles', 'orders', 'members', 'flags', 'sessions', 'tickets', 'everything',
     'carts', 'cart_items', 'folders', 'User Groups', 'memberships', 'receipts',
+    'drafts', 'invoices', 'audit_events', 'mentions', 'comments', 'counters',
     'locked',
     // internal and receipt_totals are granted to nobody on purpose.
   ]) {
-    await client.query('GRANT SELECT ON ' + q(t) + ' TO anon, authenticated');
+    await client.query('GRANT SELECT, INSERT, UPDATE, DELETE ON ' + q(t) +
+      ' TO anon, authenticated');
   }
+  await client.query('GRANT USAGE ON ALL SEQUENCES IN SCHEMA ' + schema.quote(APP) +
+    ' TO anon, authenticated');
   await client.query('GRANT SELECT ON ' + q('paid_orders') + ' TO anon');
 
   await client.query('ALTER TABLE ' + q('profiles') + ' ENABLE ROW LEVEL SECURITY');
@@ -251,7 +273,8 @@ function differences(mine, theirs, where) {
 
 /** Only the parts of the shape the SQL engine has been taught so far. */
 const SO_FAR = [
-  'schema', 'tables', 'types', 'policies', 'grants', 'indexes', 'views', 'viewGrants', 'external', 'unsupported',
+  'schema', 'tables', 'types', 'policies', 'grants', 'sequenceGrants', 'indexes', 'views',
+  'viewGrants', 'external', 'unsupported',
 ];
 
 function onlySoFar(shape) {
@@ -322,6 +345,12 @@ async function main() {
     // and it was in the check that catches it.
     let seedingRan = false;
     let attackRan = false;
+    let writeRan = false;
+    let brokenRan = false;
+    const brokenDifferences = [];
+    let engineForBroken = null;
+    const writeDifferences = [];
+    let engineForWriting = null;
     const verdictDifferences = [];
     let engineForSeeding = null;
     let engineForAttack = null;
@@ -420,6 +449,145 @@ async function main() {
           '\n        node ' + verdict(mineSaid) + '\n        sql  ' + verdict(theirsSaid));
       }
       attackRan = true;
+
+      // And who can WRITE. Every write is rolled back, so what is compared
+      // afterwards is not only the verdict but the tables themselves: a
+      // write attack that leaves anything behind has broken the one promise
+      // that makes it safe to run at all.
+      const beforeNode = await contentsOf(client, byNode);
+      const beforeSql = await contentsOf(client, bySql);
+      const mineWrote = await tamper.tamper(client, byNode, fromNode.tables, mineSeeded.seeded);
+      let theirsWrote = null;
+      await sqlengine.withEngine(client, async (target) => {
+        engineForWriting = target;
+        const { rows } = await client.query(
+          'SELECT ' + schema.quote(target) + '.tamper($1, $2::jsonb, $3::jsonb) AS answer',
+          [bySql, JSON.stringify(fromSql.tables), JSON.stringify(theirsSeeded.seeded)],
+        );
+        theirsWrote = rows[0].answer;
+      });
+
+      const wrote = (r) => JSON.stringify({
+        findings: (r.findings || [])
+          .map((f) => f.table + '/' + f.who + '/' + [...(f.can || [])].sort().join('+'))
+          .sort(),
+        completed: [...(r.completed || [])].sort(),
+        blocked: (r.blocked || []).map((b) => b.key).sort(),
+      });
+      if (wrote(mineWrote) !== wrote(theirsWrote)) {
+        writeDifferences.push('the two engines said different things about writing:' +
+          '\n        node ' + wrote(mineWrote) + '\n        sql  ' + wrote(theirsWrote));
+      }
+      const afterNode = await contentsOf(client, byNode);
+      const afterSql = await contentsOf(client, bySql);
+      if (JSON.stringify(beforeNode) !== JSON.stringify(afterNode)) {
+        writeDifferences.push('node did not put the tables back: ' +
+          JSON.stringify(beforeNode) + ' -> ' + JSON.stringify(afterNode));
+      }
+      if (JSON.stringify(beforeSql) !== JSON.stringify(afterSql)) {
+        writeDifferences.push('sql did not put the tables back: ' +
+          JSON.stringify(beforeSql) + ' -> ' + JSON.stringify(afterSql));
+      }
+      writeRan = true;
+
+      // And whether a half-finished row can survive: one pointing at
+      // something that is not there. Run as the owner on purpose - the
+      // question is not who is allowed to make an orphan, it is whether
+      // the database permits one to exist at all.
+      const beforeBrokenNode = await contentsOf(client, byNode);
+      const beforeBrokenSql = await contentsOf(client, bySql);
+      const mineBroke = await orphan.orphan(client, byNode, fromNode.tables, mineSeeded.seeded);
+      let theirsBroke = null;
+      // And what each says about "can the same thing exist twice". The SQL
+      // engine cannot race - a second connection needs a credential it is
+      // never given - so what is compared there is what it CONSIDERED, and
+      // that it called every one of them untested rather than saying
+      // nothing. Saying nothing is the one answer that reads as safety.
+      let theirsRaced = null;
+      await sqlengine.withEngine(client, async (target) => {
+        engineForBroken = target;
+        const { rows } = await client.query(
+          'SELECT ' + schema.quote(target) + '.orphan($1, $2::jsonb, $3::jsonb) AS answer',
+          [bySql, JSON.stringify(fromSql.tables), JSON.stringify(theirsSeeded.seeded)],
+        );
+        theirsBroke = rows[0].answer;
+        const { rows: raced } = await client.query(
+          'SELECT ' + schema.quote(target) + '.collide($1, $2::jsonb, $3::jsonb) AS answer',
+          [bySql, JSON.stringify(fromSql.tables), JSON.stringify(fromSql.indexes)],
+        );
+        theirsRaced = rows.length ? raced[0].answer : null;
+      });
+
+      const broke = (r) => JSON.stringify({
+        findings: (r.findings || []).map((f) => f.table + '.' + f.column + ' -> ' + f.parent).sort(),
+        completed: [...(r.completed || [])].sort(),
+        notTried: (r.notTried || []).map((n) => n.table + '.' + n.column).sort(),
+      });
+      // Both engines agreeing that there was nothing to do is not the same
+      // as both engines working. The fixture has three columns that look
+      // like they point somewhere, and one of them can really be orphaned.
+      if (!(mineBroke.notTried || []).some((n) => n.table === 'comments')) {
+        brokenDifferences.push('nothing was refused for a reason other than a foreign key,' +
+          ' so the difference between losing and not being tested is untested');
+      }
+      if ((mineBroke.completed || []).some((k) => k.startsWith('orphaned:mentions'))) {
+        brokenDifferences.push('a column was pointed at a table whose key is a different type');
+      }
+      if (!(mineBroke.completed || []).some((k) => k.startsWith('orphaned:drafts'))) {
+        brokenDifferences.push('the orphan attack considered nothing on drafts, so' +
+          ' nothing below it means anything: ' + JSON.stringify(mineBroke.completed || []));
+      }
+      if (broke(mineBroke) !== broke(theirsBroke)) {
+        brokenDifferences.push('the two engines said different things about orphans:' +
+          '\n        node ' + broke(mineBroke) + '\n        sql  ' + broke(theirsBroke));
+      }
+
+      // Every column the Node side would race, the SQL side has to name as
+      // one it could not.
+      const wouldRace = collision.candidates(fromNode.tables, fromNode.indexes)
+        .map((one) => one.table + '.' + one.column).sort();
+      const named = (theirsRaced && theirsRaced.notTried ? theirsRaced.notTried : [])
+        .map((one) => one.table + '.' + one.column).sort();
+      if (wouldRace.join(', ') !== named.join(', ')) {
+        brokenDifferences.push('the engines disagree about what a race would even consider:' +
+          '\n        node would race ' + JSON.stringify(wouldRace) +
+          '\n        sql  could not  ' + JSON.stringify(named));
+      }
+      const mineCandidates = collision.candidates(fromNode.tables, fromNode.indexes)
+        .map((one) => one.table + '.' + one.column + '/' + one.expectation +
+          (one.covered ? '/covered' : '/open')).sort();
+      let theirsCandidates = null;
+      await sqlengine.withEngine(client, async (target) => {
+        const { rows } = await client.query(
+          'SELECT ' + schema.quote(target) + '.collision_candidates($1::jsonb, $2::jsonb) AS answer',
+          [JSON.stringify(fromSql.tables), JSON.stringify(fromSql.indexes)],
+        );
+        theirsCandidates = (rows[0].answer || [])
+          .map((one) => one.table + '.' + one.column + '/' + one.expectation +
+            (one.covered ? '/covered' : '/open')).sort();
+      });
+      if (!mineCandidates.length) {
+        brokenDifferences.push('nothing in the fixture is worth racing, so none of this means anything');
+      }
+      if (mineCandidates.join(', ') !== (theirsCandidates || []).join(', ')) {
+        brokenDifferences.push('the engines pick different columns to race:' +
+          '\n        node ' + JSON.stringify(mineCandidates) +
+          '\n        sql  ' + JSON.stringify(theirsCandidates));
+      }
+      if ((theirsRaced && theirsRaced.findings ? theirsRaced.findings : []).length) {
+        brokenDifferences.push('the sql engine claimed to have raced something, which it cannot');
+      }
+      const afterBrokenNode = await contentsOf(client, byNode);
+      const afterBrokenSql = await contentsOf(client, bySql);
+      if (JSON.stringify(beforeBrokenNode) !== JSON.stringify(afterBrokenNode)) {
+        brokenDifferences.push('node left an orphan behind: ' +
+          JSON.stringify(beforeBrokenNode) + ' -> ' + JSON.stringify(afterBrokenNode));
+      }
+      if (JSON.stringify(beforeBrokenSql) !== JSON.stringify(afterBrokenSql)) {
+        brokenDifferences.push('sql left an orphan behind: ' +
+          JSON.stringify(beforeBrokenSql) + ' -> ' + JSON.stringify(afterBrokenSql));
+      }
+      brokenRan = true;
     } catch (err) {
       copyDifferences = ['building a copy fell over: ' + err.message];
     }
@@ -562,6 +730,16 @@ async function main() {
       seedingDifferences = ['asking the two engines fell over: ' + err.message];
     }
 
+    check('11. and about half-finished rows, and about what it cannot race', (() => {
+      if (!brokenRan) return ['it never ran'];
+      return brokenDifferences;
+    })());
+
+    check('10. and about who can write to it, having put it all back', (() => {
+      if (!writeRan) return ['it never ran'];
+      return writeDifferences;
+    })());
+
     check('9. and reach the same verdict about it', (() => {
       // Agreeing is not the same as being right, and this only asks the
       // first. What the answer OUGHT to be is verdicts.check.js, on an app
@@ -584,7 +762,8 @@ async function main() {
 
     const { rows: left } = await client.query(
       'SELECT nspname FROM pg_namespace WHERE nspname = ANY($1)',
-      [[installed, engineForSeeding, engineForAttack].filter(Boolean)],
+      [[installed, engineForSeeding, engineForAttack, engineForWriting, engineForBroken]
+        .filter(Boolean)],
     );
     check('4. the engine takes itself away again', (() => {
       // It gets installed into the customer's database to answer one question.

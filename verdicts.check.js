@@ -12,6 +12,9 @@
 //
 //   expect: 'found'  a real hole - it must appear in the findings
 //   expect: 'clean'  a correct app - no findings, and nothing skipped
+//   must:            words that have to appear in the finding itself, for
+//                    the cases where a finding on the right table is still
+//                    the wrong finding
 //
 // The ones that were wrong when this was written: an owner column that is
 // text rather than uuid, which is what Clerk and Firebase ids look like; a
@@ -29,6 +32,24 @@ const CONN = process.argv[2] || process.env.KN_DATABASE_URL;
 let undoAuth = async () => {};
 
 const SHAPES = [
+  {
+    // The shape Supabase actually gives you: table grants AND sequence
+    // grants. The copy replayed the first and not the second, so every
+    // insert the write attack tried came back 'permission denied for
+    // sequence' - which reads as the app defending itself. The table was
+    // still reported, for change and delete, so nothing looked wrong; the
+    // one thing missing was that a stranger can ADD rows, on every table
+    // with a serial key, which is most tables.
+    name: 'a wide open table with a serial key, granted the way Supabase does',
+    expect: 'found',
+    where: 'waitlist',
+    must: ['"add"'],
+    sql: (q, s) => [
+      'CREATE TABLE ' + q('waitlist') + ' (id serial PRIMARY KEY, email text NOT NULL)',
+      'GRANT SELECT, INSERT, UPDATE, DELETE ON ' + q('waitlist') + ' TO anon, authenticated',
+      'GRANT USAGE ON ALL SEQUENCES IN SCHEMA ' + schema.quote(s) + ' TO anon, authenticated',
+    ],
+  },
   {
     name: 'owner column is text, not uuid (Clerk / Firebase ids)',
     expect: 'found',
@@ -260,6 +281,16 @@ async function groundwork(client, name) {
           bad: 'MISSED',
           detail: 'expected a finding on ' + shape.where + '; got [' + found.join(', ') + ']' +
             (skipped.length ? '  skipped: ' + skipped.join(' | ') : ''),
+        };
+      } else if (shape.must && !(result.findings || []).some((f) =>
+        f.table === shape.where && shape.must.every((word) =>
+          JSON.stringify(f).includes(word)))) {
+        verdict = {
+          bad: 'THE WRONG FINDING',
+          detail: 'on ' + shape.where + ' expected ' + shape.must.join(' + ') + ', got ' +
+            JSON.stringify((result.findings || [])
+              .filter((f) => f.table === shape.where)
+              .map((f) => f.kind + (f.can ? ':' + f.can.join('+') : ''))),
         };
       } else if (shape.expect === 'clean' && found.length) {
         verdict = { bad: 'FALSE ALARM', detail: 'reported ' + found.join(', ') + ' on a correct app' };

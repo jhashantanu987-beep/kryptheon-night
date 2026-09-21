@@ -105,6 +105,43 @@ async function readConstraints(client, schema, table) {
 }
 
 /**
+ * Who was granted what on the sequences a table depends on.
+ *
+ * Without these the copy is not the app, in the one way that matters most.
+ * Supabase grants anon USAGE on every sequence in public, so a stranger can
+ * insert into a table whose key is a serial. The copy replayed the table
+ * grants and not the sequence ones, so every insert the tampering attack
+ * tried came back 'permission denied for sequence' - which reads as the
+ * attack being beaten. "A stranger can add rows to your table" was never
+ * reported on any table with a serial key, which is most tables, and it was
+ * silent: it looked exactly like an app that had got it right.
+ *
+ * Only sequences a column owns. Those are the ones the copy has - measured,
+ * not assumed: serial, bigserial and both kinds of identity all come out
+ * with the same name in the copy. A sequence standing on its own does not,
+ * and nothing inserts into one, so a grant on it changes no verdict.
+ */
+async function readSequenceGrants(client, schema) {
+  const { rows } = await client.query(
+    `SELECT DISTINCT s.relname AS sequence_name,
+            CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END AS grantee,
+            a.privilege_type
+       FROM pg_class s
+       JOIN pg_namespace n ON n.oid = s.relnamespace
+       JOIN pg_depend d ON d.objid = s.oid
+                       AND d.classid = 'pg_class'::regclass
+                       AND d.deptype IN ('a', 'i')
+       CROSS JOIN LATERAL aclexplode(s.relacl) a
+      WHERE n.nspname = $1 AND s.relkind = 'S'
+        AND (CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END)
+            IN ('anon', 'authenticated', 'service_role', 'PUBLIC')
+      ORDER BY 1, 2, 3`,
+    [schema],
+  );
+  return rows;
+}
+
+/**
  * Unique indexes, which are the other half of "can this happen twice".
  *
  * Read separately from constraints because `CREATE UNIQUE INDEX` and
@@ -409,6 +446,7 @@ async function readSchema(client, schema) {
     tables: built,
     policies: await readPolicies(client, schema),
     grants: await readGrants(client, schema),
+    sequenceGrants: await readSequenceGrants(client, schema),
     types: await readTypes(client, schema),
     indexes: await readIndexes(client, schema),
     views: await readViewsWithColumns(client, schema),
@@ -586,6 +624,24 @@ async function writeSchema(client, plan, target) {
     statements.push(
       'CREATE TABLE ' + quote(target) + '.' + quote(table.name) + ' (' + columns.join(', ') + ')',
     );
+
+    // And the sequence belongs to its column, the way serial makes it.
+    //
+    // Not tidiness. A sequence a column owns is linked to it in pg_depend,
+    // and that link is how the grants on it are found again - so a copy
+    // whose sequences stand loose reads back as having no sequence grants
+    // at all, however many were replayed onto it. It also means the
+    // sequence goes when the copy's table goes, which is what the original
+    // does.
+    for (const column of table.columns) {
+      const match = /nextval\('([^']+)'/.exec(column.default_expr || '');
+      if (!match) continue;
+      const bare = match[1].split('.').pop().split('"').join('');
+      statements.push(
+        'ALTER SEQUENCE ' + quote(target) + '.' + quote(bare) + ' OWNED BY ' +
+          quote(target) + '.' + quote(table.name) + '.' + quote(column.name),
+      );
+    }
   }
 
   // Stand-ins for the tables outside this schema that its foreign keys point
@@ -674,6 +730,16 @@ async function writeSchema(client, plan, target) {
     const who = grant.grantee === 'PUBLIC' ? 'PUBLIC' : quote(grant.grantee);
     statements.push(
       'GRANT ' + grant.privilege_type + ' ON ' + quote(target) + '.' + quote(grant.table_name) + ' TO ' + who,
+    );
+  }
+
+  // The sequences, on the same terms as the tables. A table grant without
+  // the sequence grant that goes with it is a copy nobody can insert into.
+  for (const grant of plan.sequenceGrants || []) {
+    const who = grant.grantee === 'PUBLIC' ? 'PUBLIC' : quote(grant.grantee);
+    statements.push(
+      'GRANT ' + grant.privilege_type + ' ON SEQUENCE ' + quote(target) + '.' +
+        quote(grant.sequence_name) + ' TO ' + who,
     );
   }
 
@@ -777,6 +843,21 @@ function diffSchemas(source, copy) {
     if (!copyTypes.includes(made)) differences.push('a type did not come across whole: ' + made);
   }
 
+  // The sequence grants, for the same reason they are copied at all: without
+  // them nothing can insert, and every write attack reads as the app
+  // defending itself.
+  const sequenceText = (plan) =>
+    (plan.sequenceGrants || [])
+      .map((g) => g.sequence_name + ' ' + g.grantee + ' ' + g.privilege_type)
+      .sort();
+  const sourceSequences = sequenceText(source);
+  const copySequences = sequenceText(copy);
+  for (const one of sourceSequences) {
+    if (!copySequences.includes(one)) {
+      differences.push('a sequence grant did not come across: ' + one);
+    }
+  }
+
   // Uniqueness decides whether the Collision attack has anything to report, so
   // a unique index that failed to come across has to be caught here rather
   // than turn into a confident finding about a table that was actually fine.
@@ -828,6 +909,7 @@ module.exports = {
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,
   readTypes: readTypes,
+  readSequenceGrants: readSequenceGrants,
   readIndexes: readIndexes,
   readViews: readViews,
   readExternalTargets: readExternalTargets,

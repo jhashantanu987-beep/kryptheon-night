@@ -107,7 +107,12 @@ It earned itself on its first run, on a list of role names that arrived as
 a string in one engine and a list in the other. It later caught a copy whose
 columns still pointed at the original's enum type.
 
-It now also compares the decisions seeding makes before it writes a row:
+It now compares all four attacks, on one app, end to end: what each engine
+reads, what each builds, what each seeds, and what each concludes. Eleven
+checks, and the last three are the ones a person would recognise - who can
+read this, who can write to it, and can a half-finished row survive.
+
+It also compares the decisions seeding makes before it writes a row:
 who a row belongs to, what a CHECK will actually accept, and how wide a
 generated value may be. Those are decisions taken from the shape and
 nothing else, so both engines can be asked the same question and their
@@ -199,6 +204,55 @@ which is indistinguishable from a clean database.
 Each is guarded by a pair of opposite mistakes rather than a single case,
 because a sweep has two ways to be wrong: leaving the rubbish, and taking
 away something a run in another window is using right now.
+
+## The copy was not the app, three times
+
+Every attack runs against the copy, so anything the copy fails to carry
+is a hole nobody looks in - and it fails quietly, because a refused attack
+and a defended one look identical from outside.
+
+- **the types.** Enums and domains were borrowed from the original rather
+  than built in the copy. A view that mentions an enum then took the whole
+  scan down, because pg_get_viewdef writes the literal as
+  `'paid'::app.order_status` and the copy had no such type.
+
+- **the grants on the sequences.** Supabase grants anon USAGE on every
+  sequence in public. The copy replayed the table grants and not those, so
+  every insert came back `permission denied for sequence` - which reads as
+  the attack being beaten. "A stranger can add rows to your table" was
+  never reported on any table with a serial key, which is most tables. The
+  table was still reported for change and delete, so nothing looked wrong.
+
+- **the ownership of those sequences.** `serial` makes the sequence belong
+  to its column, and that link in pg_depend is how the grants on it are
+  found again. The copy created its sequences loose, so the grants were
+  replayed onto them and then read back as absent. The copy now does
+  `ALTER SEQUENCE ... OWNED BY`, which also means the sequence goes when
+  the copy's table goes.
+
+## What the SQL engine cannot do, and says so
+
+The collision attack needs two requests at the same instant: the second
+insert has to be in flight while the first transaction is still open. A
+plpgsql function is one session, so it needs a second one from inside the
+database. Measured rather than assumed - `dblink` is available and this
+role may even create it, but it cannot connect back to its own database
+without a password:
+
+    dbname only    -> password or GSSAPI delegated credentials required
+    empty conninfo -> the same
+    a local socket -> the same
+
+The only way to open that second session is to hold a credential, and the
+whole reason the SQL engine exists is that no credential ever moves. So it
+does not run that attack - and every column it would have raced comes back
+named, in `notTried`, with the reason. Reporting nothing is the one answer
+that reads as safety.
+
+The candidates are still worked out in full, identically to the other
+engine, so the two can be compared: what was considered has to match even
+where what was concluded cannot. The npx door still races them for real,
+because Node has two connections and can.
 
 ## Two shapes of the same rule
 
@@ -303,6 +357,19 @@ every guard is removed one at a time to confirm a check fails. The scratchpad
 runners assert each anchor matches exactly once first, because a mutation that
 quietly changed nothing looks exactly like a check that passed.
 
+The runner itself had the disease it exists to find. It counted "the check
+did not exit 0" as caught, and a dropped connection does not exit 0 either:
+one mutation was reported caught twice while it was in fact alive and
+untested. A catch now has to be shown - a FAIL line naming the check that
+noticed - a dropped connection is retried, and anything else is NOT KNOWN
+rather than a pass or a catch.
+
+Stopping a mutation run is not free either. Killing the process skips the
+`finally` that puts the file back, so a mutation can be left in the working
+tree; it happened, and a loose `grep -c` for a string that appears in more
+than one place said the tree was clean when it was not. Every anchor is
+checked by name now.
+
 The interruption attack is the clearest case of why. Its first run caught 3 of
 10, and every survivor was a real gap. The checks were asking what got
 reported and never what got considered, so a column pointing at Stripe was
@@ -311,6 +378,23 @@ only because the fixture had no table that could catch them: no candidate that
 gets refused, none refused for a reason other than a foreign key, and no
 parent already holding the value the attack uses to mean nobody. That last one
 would have invented a hole out of a coincidence.
+
+The twin fixture is the clearest record of that. Nobody designed it: every
+shape in it was asked for by a mutation that lived through the whole check,
+and every one of them is a shape some real app has.
+
+| shape | the mutation that asked for it |
+| --- | --- |
+| a domain over integer, and one over varchar(4) | breaking the lookup of the type underneath a domain changed nothing, because a domain over text lands on the same value text does |
+| a foreign key between quoted names | every name was lowercase, so Postgres wrote every key without a quote and the code that unquotes them never ran |
+| a policy granted to anon that calls auth.uid() | sending a logged-out visitor with no claims makes auth.uid() throw, and a read that throws returns nothing - which is what a secured table returns |
+| a table granted to nobody, and an ungranted materialized view | without a refusal, `refusal_means` was never called at all |
+| a read that fails for a reason other than permission | "the attack lost" and "the attack could not run" were indistinguishable |
+| write privileges, and USAGE on the sequences | the fixture granted only SELECT, so every write was refused before it began and six mutations to the write attack changed nothing |
+| a column that can really be orphaned | the attack considered nothing, so both engines agreed about nothing |
+| a `_id` column whose type does not match its table | pointing at a table by name alone would tell somebody to break their app |
+| a row refused for a reason other than a key | a refusal that teaches nothing was being counted as the database holding |
+| a table whose first writable-looking column is an identity column | every other table had an ordinary column first, so skipping generated ones could be removed unnoticed |
 
 Survivors have been worth more than the passes. Two in `recheck.js` turned up
 the overlapping `allClear` guards. One in `collision.js` showed the fixture had

@@ -208,6 +208,43 @@ RETURNS jsonb LANGUAGE sql STABLE AS $$
     ) rows;
 $$;
 
+/*
+ * Who was granted what on the sequences a table depends on.
+ *
+ * Without these the copy is not the app, in the one way that matters most.
+ * Supabase grants anon USAGE on every sequence in public, so a stranger can
+ * insert into a table whose key is a serial. The copy replayed the table
+ * grants and not the sequence ones, so every insert the tampering attack
+ * tried came back 'permission denied for sequence' - which reads as the
+ * attack being beaten. "A stranger can add rows to your table" was never
+ * reported on any table with a serial key, which is most tables.
+ *
+ * Only sequences a column owns. Those are the ones the copy has - measured,
+ * not assumed. A sequence standing on its own does not come across, and
+ * nothing inserts into one, so a grant on it changes no verdict.
+ */
+CREATE OR REPLACE FUNCTION __KN__.read_sequence_grants(source text)
+RETURNS jsonb LANGUAGE sql STABLE AS $$
+  SELECT coalesce(jsonb_agg(g ORDER BY g->>'sequence_name', g->>'grantee', g->>'privilege_type'),
+                  '[]'::jsonb)
+    FROM (
+      SELECT DISTINCT jsonb_build_object(
+               'sequence_name', s.relname,
+               'grantee', CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END,
+               'privilege_type', a.privilege_type
+             ) AS g
+        FROM pg_class s
+        JOIN pg_namespace n ON n.oid = s.relnamespace
+        JOIN pg_depend d ON d.objid = s.oid
+                        AND d.classid = 'pg_class'::regclass
+                        AND d.deptype IN ('a', 'i')
+        CROSS JOIN LATERAL aclexplode(s.relacl) a
+       WHERE n.nspname = source AND s.relkind = 'S'
+         AND (CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END)
+             IN ('anon', 'authenticated', 'service_role', 'PUBLIC')
+    ) rows;
+$$;
+
 /* The grants on views. Separate, because views are created after the tables. */
 CREATE OR REPLACE FUNCTION __KN__.read_view_grants(source text)
 RETURNS jsonb LANGUAGE sql STABLE AS $$
@@ -289,6 +326,7 @@ BEGIN
     'external', __KN__.read_external(source, tables),
     'policies', __KN__.read_policies(source),
     'grants', __KN__.read_grants(source),
+    'sequenceGrants', __KN__.read_sequence_grants(source),
     'types', __KN__.read_types(source),
     'indexes', __KN__.read_indexes(source),
     'views', __KN__.read_views(source),
@@ -632,6 +670,22 @@ BEGIN
     END LOOP;
     out := out || ('CREATE TABLE ' || here || '.' || __KN__.always_quote(tab->>'name')
                    || ' (' || array_to_string(cols, ', ') || ')');
+
+    -- And the sequence belongs to its column, the way serial makes it.
+    --
+    -- Not tidiness. A sequence a column owns is linked to it in pg_depend,
+    -- and that link is how the grants on it are found again - so a copy
+    -- whose sequences stand loose reads back as having no sequence grants
+    -- at all, however many were replayed onto it.
+    FOR col IN SELECT * FROM jsonb_array_elements(tab->'columns') LOOP
+      CONTINUE WHEN col->>'default_expr' IS NULL;
+      bare := (regexp_match(col->>'default_expr', 'nextval\(''([^'']+)'''))[1];
+      CONTINUE WHEN bare IS NULL;
+      bare := replace(split_part(bare, '.', greatest(array_length(string_to_array(bare, '.'), 1), 1)), '"', '');
+      out := out || ('ALTER SEQUENCE ' || here || '.' || __KN__.always_quote(bare)
+                     || ' OWNED BY ' || here || '.' || __KN__.always_quote(tab->>'name')
+                     || '.' || __KN__.always_quote(col->>'name'));
+    END LOOP;
   END LOOP;
 
   -- Stand-ins for the tables outside this schema that its foreign keys point
@@ -704,6 +758,15 @@ BEGIN
   FOR grant_ IN SELECT * FROM jsonb_array_elements(coalesce(plan->'grants', '[]'::jsonb)) LOOP
     out := out || ('GRANT ' || (grant_->>'privilege_type') || ' ON ' || here || '.'
                    || __KN__.always_quote(grant_->>'table_name') || ' TO '
+                   || CASE WHEN grant_->>'grantee' = 'PUBLIC' THEN 'PUBLIC'
+                           ELSE __KN__.always_quote(grant_->>'grantee') END);
+  END LOOP;
+
+  -- The sequences, on the same terms as the tables. A table grant without
+  -- the sequence grant that goes with it is a copy nobody can insert into.
+  FOR grant_ IN SELECT * FROM jsonb_array_elements(coalesce(plan->'sequenceGrants', '[]'::jsonb)) LOOP
+    out := out || ('GRANT ' || (grant_->>'privilege_type') || ' ON SEQUENCE ' || here || '.'
+                   || __KN__.always_quote(grant_->>'sequence_name') || ' TO '
                    || CASE WHEN grant_->>'grantee' = 'PUBLIC' THEN 'PUBLIC'
                            ELSE __KN__.always_quote(grant_->>'grantee') END);
   END LOOP;
@@ -1052,6 +1115,17 @@ CREATE OR REPLACE FUNCTION __KN__.user_b() RETURNS text LANGUAGE sql IMMUTABLE A
   SELECT '22222222-2222-4222-8222-222222222222';
 $$;
 
+-- Two more who own nothing at all. The seeded pair already hold a row each,
+-- so an attack that inserts under their name collides with the row the
+-- seeder put there - on a table keyed by the person that is a primary key
+-- clash, and it was being read as the app refusing the attack.
+CREATE OR REPLACE FUNCTION __KN__.user_c() RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT '55555555-5555-4555-8555-555555555555';
+$$;
+CREATE OR REPLACE FUNCTION __KN__.user_d() RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT '66666666-6666-4666-8666-666666666666';
+$$;
+
 /*
  * One row that is really in the parent table, so a foreign key is satisfied.
  *
@@ -1189,9 +1263,15 @@ BEGIN
   RETURN jsonb_build_object('columns', columns, 'values', values_);
 END $$;
 
-/* Puts a built row in. Separate so the same row can be raced against itself. */
-CREATE OR REPLACE FUNCTION __KN__.insert_row(source text, table_name text, row_ jsonb)
-RETURNS void LANGUAGE plpgsql AS $$
+/*
+ * The statement that puts a built row in.
+ *
+ * Written out rather than run, because the tampering attack needs the same
+ * insert the seeder would use and needs it as text: it has to be built
+ * before the attack stops being itself, and run afterwards as somebody else.
+ */
+CREATE OR REPLACE FUNCTION __KN__.insert_statement(source text, table_name text, row_ jsonb)
+RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
   where_ text := 'INSERT INTO ' || __KN__.always_quote(source) || '.' || __KN__.always_quote(table_name);
   names text;
@@ -1202,8 +1282,7 @@ BEGIN
   -- spelling for exactly this, and without it every settings and flags table
   -- in the world came back as one that could not be checked.
   IF jsonb_array_length(row_->'columns') = 0 THEN
-    EXECUTE where_ || ' DEFAULT VALUES';
-    RETURN;
+    RETURN where_ || ' DEFAULT VALUES';
   END IF;
 
   SELECT string_agg(__KN__.always_quote(name), ', ' ORDER BY at) INTO names
@@ -1215,7 +1294,14 @@ BEGIN
   SELECT string_agg(quote_nullable(v), ', ' ORDER BY at) INTO places
     FROM jsonb_array_elements_text(row_->'values') WITH ORDINALITY AS c(v, at);
 
-  EXECUTE where_ || ' (' || names || ') VALUES (' || places || ')';
+  RETURN where_ || ' (' || names || ') VALUES (' || places || ')';
+END $$;
+
+/* And running it. Separate so the same row can be raced against itself. */
+CREATE OR REPLACE FUNCTION __KN__.insert_row(source text, table_name text, row_ jsonb)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE __KN__.insert_statement(source, table_name, row_);
 END $$;
 
 /*
@@ -1484,4 +1570,617 @@ BEGIN
   END LOOP;
 
   RETURN jsonb_build_object('findings', findings, 'completed', completed, 'blocked', blocked);
+END $$;
+
+-- --------------------------------------------------------------------------
+-- Can a stranger change your data?
+--
+-- Everything above asks whether the wrong person can READ. This asks whether
+-- they can WRITE, and the answer matters more: a leak is bad, but a stranger
+-- who can delete your customers table has taken something you cannot get back.
+--
+-- EVERYTHING HERE IS ROLLED BACK. Each write runs inside an exception block,
+-- which in plpgsql is a subtransaction, and the block is always left by
+-- raising on purpose - so the write happens, the count is kept, and the row
+-- is gone. Measured before it was written: probe-plpgsql.js asks exactly this.
+-- --------------------------------------------------------------------------
+
+/*
+ * A column an UPDATE can harmlessly set to itself.
+ *
+ * Setting a column to its own value changes nothing about the row while still
+ * proving the write was allowed - so the finding is real and the data is not
+ * even momentarily wrong inside the transaction that gets rolled back.
+ */
+CREATE OR REPLACE FUNCTION __KN__.first_writable(tab jsonb)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  found text;
+BEGIN
+  SELECT c->>'name' INTO found
+    FROM jsonb_array_elements(tab->'columns') WITH ORDINALITY AS e(c, at)
+   WHERE c->>'generated' IS NULL AND NOT (c->>'identity')::boolean
+     AND (c->>'name') !~* '^id$'
+   ORDER BY at LIMIT 1;
+  IF found IS NOT NULL THEN RETURN found; END IF;
+
+  SELECT c->>'name' INTO found
+    FROM jsonb_array_elements(tab->'columns') WITH ORDINALITY AS e(c, at)
+   WHERE c->>'generated' IS NULL AND NOT (c->>'identity')::boolean
+   ORDER BY at LIMIT 1;
+  RETURN coalesce(found, 'id');
+END $$;
+
+/*
+ * What a write actually achieved.
+ *
+ * Three outcomes, and the middle one is the one that matters: a statement can
+ * succeed and change nothing, which is row level security doing its job. Row
+ * level security filters rows away rather than complaining, so every verdict
+ * is taken from the number of rows that actually moved.
+ */
+CREATE OR REPLACE FUNCTION __KN__.what_happened(result jsonb)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE
+    WHEN (result->>'ok')::boolean THEN
+      CASE WHEN (result->>'count')::bigint > 0 THEN 'got through' ELSE 'refused' END
+    -- A WITH CHECK turning a write away IS the app defending itself, and it is
+    -- the single most common way a correct app says no. Reading it as "I could
+    -- not tell" put a warning on every table that had got it right, and a
+    -- warning nobody earned is how a report stops being read.
+    WHEN coalesce(result->>'why', '') ~* 'violates row-level security policy' THEN 'refused'
+    WHEN __KN__.refusal_means(result->>'why') = 'unreachable' THEN 'refused'
+    ELSE 'untested'
+  END;
+$$;
+
+/*
+ * Runs one write the way a request runs it, and never keeps the result.
+ *
+ * The rollback is not a tidy-up, it is the safety property. Nothing this
+ * attack does survives the statement that did it.
+ *
+ * The statement arrives already written, for the same reason read_as builds
+ * its queries up front: once this function becomes anon it can no longer call
+ * anything in the engine schema, and a refusal from its own housekeeping is
+ * indistinguishable from the app defending itself.
+ */
+CREATE OR REPLACE FUNCTION __KN__.try_write(role_ text, identity text, statement text)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  claims text := CASE WHEN identity IS NULL
+    THEN json_build_object('role', role_)::text
+    ELSE json_build_object('sub', identity, 'role', role_)::text END;
+  moved bigint := 0;
+  worked boolean := false;
+  why text := NULL;
+BEGIN
+  BEGIN
+    EXECUTE 'SET LOCAL statement_timeout = ' || quote_literal('15s');
+    EXECUTE 'SET LOCAL ROLE ' || quote_ident(role_);
+    PERFORM set_config('request.jwt.claims', claims, true);
+
+    EXECUTE statement;
+    GET DIAGNOSTICS moved = ROW_COUNT;
+    worked := true;
+
+    -- Raised on purpose. The block is a subtransaction, so leaving it this way
+    -- undoes the write while the count, which is a plpgsql variable and not a
+    -- database change, survives.
+    RAISE EXCEPTION 'kryptheon: undoing the write' USING ERRCODE = 'KN001';
+  EXCEPTION
+    WHEN SQLSTATE 'KN001' THEN
+      NULL;
+    WHEN OTHERS THEN
+      worked := false;
+      moved := 0;
+      why := SQLERRM;
+  END;
+
+  RESET ROLE;
+  PERFORM set_config('request.jwt.claims', '', true);
+  PERFORM set_config('statement_timeout', '0', true);
+  RETURN jsonb_build_object('ok', worked, 'count', moved, 'why', why);
+END $$;
+
+/*
+ * Every way in, per table, per kind of caller.
+ *
+ * `seeded` carries the shape of row that worked when the table was seeded, so
+ * the insert here is not rejected by some CHECK the seeder already solved.
+ */
+CREATE OR REPLACE FUNCTION __KN__.tamper(source text, tables jsonb, seeded jsonb)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  findings jsonb := '[]'::jsonb;
+  completed jsonb := '[]'::jsonb;
+  blocked jsonb := '[]'::jsonb;
+  tab jsonb;
+  owner text;
+  shape integer;
+  actor record;
+  key text;
+  can jsonb;
+  changed jsonb;
+  stuck text;
+  their_rows text;
+  at text;
+  row_ jsonb;
+  column_ text;
+  moves jsonb;
+  move jsonb;
+  result jsonb;
+  outcome text;
+  named jsonb;
+BEGIN
+  FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
+    -- Never seeded, so there is nothing in it to protect.
+    SELECT (s->>'attempt')::integer INTO shape
+      FROM jsonb_array_elements(coalesce(seeded, '[]'::jsonb)) s
+     WHERE s->>'table' = tab->>'name';
+    CONTINUE WHEN NOT FOUND;
+    shape := coalesce(shape, 0);
+
+    owner := __KN__.owner_column(tab);
+    at := __KN__.always_quote(source) || '.' || __KN__.always_quote(tab->>'name');
+    column_ := __KN__.always_quote(__KN__.first_writable(tab));
+    named := coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c),
+                      '[]'::jsonb);
+
+    -- Rows belonging to the other fake person. Scoped on purpose: a signed-in
+    -- customer deleting their OWN rows is not a finding, it is the feature,
+    -- and an unscoped DELETE would report every correctly built app.
+    their_rows := CASE WHEN owner IS NULL THEN ''
+      ELSE ' WHERE ' || __KN__.always_quote(owner) || ' = ' || quote_literal(__KN__.user_a()) END;
+
+    -- Written under a name nobody has used, which is both what makes the row
+    -- land at all and what makes it the right test: adding a row of your own
+    -- is the feature, adding one under somebody else's name is not.
+    row_ := __KN__.row_for(source, tab, __KN__.user_c(), '7', NULL, shape);
+
+    -- Every statement written out before anybody changes role.
+    moves := jsonb_build_array(
+      jsonb_build_object('what', 'add',
+        'statement', __KN__.insert_statement(source, tab->>'name', row_)),
+      jsonb_build_object('what', 'change',
+        'statement', 'UPDATE ' || at || ' SET ' || column_ || ' = ' || column_ || their_rows),
+      jsonb_build_object('what', 'delete',
+        'statement', 'DELETE FROM ' || at || their_rows));
+
+    FOR actor IN
+      SELECT * FROM (VALUES
+        ('anyone', 'anon', NULL::text),
+        ('any customer', 'authenticated', __KN__.user_b())
+      ) AS a(who, role_, identity)
+    LOOP
+      key := 'writable:' || (tab->>'name') || ':' || actor.who;
+      can := '[]'::jsonb;
+      changed := '{}'::jsonb;
+      stuck := NULL;
+
+      FOR move IN SELECT * FROM jsonb_array_elements(moves) LOOP
+        result := __KN__.try_write(actor.role_, actor.identity, move->>'statement');
+        outcome := __KN__.what_happened(result);
+        IF outcome = 'got through' THEN
+          can := can || to_jsonb(move->>'what');
+          changed := jsonb_set(changed, ARRAY[move->>'what'], to_jsonb((result->>'count')::bigint));
+        ELSIF outcome = 'untested' THEN
+          stuck := result->>'why';
+        END IF;
+      END LOOP;
+
+      IF stuck IS NOT NULL THEN
+        -- Something went wrong that was not the app defending itself, so no
+        -- verdict exists for this table and saying nothing would read as safe.
+        blocked := blocked || jsonb_build_array(jsonb_build_object(
+          'table', tab->>'name', 'key', key,
+          'why', 'as ' || actor.who || ': ' || stuck));
+        CONTINUE;
+      END IF;
+
+      completed := completed || to_jsonb(key);
+      IF jsonb_array_length(can) > 0 THEN
+        findings := findings || jsonb_build_array(jsonb_build_object(
+          'kind', 'writable',
+          'table', tab->>'name',
+          'who', actor.who,
+          'can', can,
+          'changed', changed,
+          'owner', owner,
+          'columns', named,
+          'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+      END IF;
+    END LOOP;
+  END LOOP;
+
+  RETURN jsonb_build_object('findings', findings, 'completed', completed, 'blocked', blocked);
+END $$;
+
+-- --------------------------------------------------------------------------
+-- The interruption attack: can a half-finished write survive?
+--
+-- A request cut off partway is mostly a question about the app's code - were
+-- the two inserts wrapped in a transaction? - and this tool never sees the
+-- app's code. But there is a half of it the database answers on its own. A
+-- foreign key is what makes a half-finished state impossible to keep, no
+-- matter how badly the app behaves or where the connection drops.
+--
+-- So the attack is: put in a row pointing at something that is not there, and
+-- see whether the database takes it. Rolled back, always.
+-- --------------------------------------------------------------------------
+
+/*
+ * Tables whose job is to remember things after they are gone.
+ *
+ * A dangling id in an audit row is the feature, and a foreign key there would
+ * be the bug.
+ */
+CREATE OR REPLACE FUNCTION __KN__.keeps_history(name text)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+  SELECT name ~* '(^|_)(log|logs|audit|audits|event|events|history|archive|archives|snapshot|snapshots|activity|activities)(_|$)';
+$$;
+
+/* The single-column primary key of a table, or NULL if it has none. */
+CREATE OR REPLACE FUNCTION __KN__.primary_key_of(tab jsonb)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  con jsonb;
+  inside text;
+  names jsonb;
+BEGIN
+  FOR con IN SELECT * FROM jsonb_array_elements(coalesce(tab->'constraints', '[]'::jsonb)) LOOP
+    CONTINUE WHEN con->>'kind' <> 'p';
+    inside := (regexp_match(con->>'definition', 'PRIMARY KEY \(([^)]+)\)', 'i'))[1];
+    CONTINUE WHEN inside IS NULL;
+    names := __KN__.unquoted_list(inside);
+    -- A composite key is not something a single `<thing>_id` column points at.
+    IF jsonb_array_length(names) = 1 THEN RETURN names->>0; END IF;
+    RETURN NULL;
+  END LOOP;
+  RETURN NULL;
+END $$;
+
+/*
+ * The table a column named `<thing>_id` is pointing at, if there is one.
+ *
+ * The name has to match a table that is really here, and the types have to
+ * agree. Both, because `stripe_id` matches nothing and `org_id integer` does
+ * not point at an `orgs.id` that is a uuid. Telling somebody to add a foreign
+ * key to a column that names something outside this database would be telling
+ * them to break their app.
+ */
+CREATE OR REPLACE FUNCTION __KN__.parent_for(col jsonb, tables jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  stem text := (regexp_match(col->>'name', '^(.+)_id$', 'i'))[1];
+  wanted text;
+  parent jsonb;
+  key text;
+  key_column jsonb;
+BEGIN
+  IF stem IS NULL THEN RETURN NULL; END IF;
+  wanted := lower(stem);
+
+  SELECT t INTO parent FROM jsonb_array_elements(tables) t
+   WHERE lower(t->>'name') IN (wanted, wanted || 's', wanted || 'es')
+   LIMIT 1;
+  IF parent IS NULL THEN RETURN NULL; END IF;
+
+  key := __KN__.primary_key_of(parent);
+  IF key IS NULL THEN RETURN NULL; END IF;
+
+  SELECT c INTO key_column FROM jsonb_array_elements(parent->'columns') c
+   WHERE c->>'name' = key LIMIT 1;
+  IF key_column IS NULL OR (key_column->>'type') IS DISTINCT FROM (col->>'type') THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN jsonb_build_object('table', parent->>'name', 'keyColumn', key, 'type', key_column->>'type');
+END $$;
+
+/* Is this column already held down by a foreign key? */
+CREATE OR REPLACE FUNCTION __KN__.already_tied(tab jsonb, column_name text)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(__KN__.foreign_keys(tab)) k
+     WHERE k->'columns' ? column_name);
+$$;
+
+/*
+ * Every column that looks like it points somewhere, with whether it is already
+ * tied down.
+ *
+ * Tied columns are attacked too. Skipping them would mean that the moment
+ * somebody adds the foreign key this asked for, the attack stops running - and
+ * the re-check could no longer watch it be refused, so it would report the fix
+ * it requested as "could not confirm".
+ *
+ * `tied` decides what is reported, never what is attempted.
+ */
+CREATE OR REPLACE FUNCTION __KN__.candidates(tables jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  found jsonb := '[]'::jsonb;
+  tab jsonb;
+  col jsonb;
+  parent jsonb;
+BEGIN
+  FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
+    CONTINUE WHEN __KN__.keeps_history(tab->>'name');
+    FOR col IN SELECT * FROM jsonb_array_elements(coalesce(tab->'columns', '[]'::jsonb)) LOOP
+      parent := __KN__.parent_for(col, tables);
+      CONTINUE WHEN parent IS NULL;
+      found := found || jsonb_build_array(jsonb_build_object(
+        'table', tab->>'name',
+        'column', col->>'name',
+        'parent', parent->>'table',
+        'parentKey', parent->>'keyColumn',
+        'type', parent->>'type',
+        'tied', __KN__.already_tied(tab, col->>'name')));
+    END LOOP;
+  END LOOP;
+  RETURN found;
+END $$;
+
+/* A value of the right type that is certainly not in the parent table. */
+CREATE OR REPLACE FUNCTION __KN__.nobody(kind text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE
+    WHEN lower(kind) = 'uuid' THEN '99999999-9999-4999-8999-999999999999'
+    WHEN lower(kind) ~ '^(integer|bigint|smallint)' THEN '2147480000'
+    WHEN lower(kind) ~ '^(numeric|decimal|real|double)' THEN '2147480000'
+    ELSE 'kryptheon-nobody'
+  END;
+$$;
+
+/*
+ * Point a row at something that is not there, and see if it is taken.
+ *
+ * Run as the owner of the schema on purpose. The question is not who is
+ * allowed to create an orphan - it is whether the database permits one to
+ * exist at all, which is what decides whether a dropped connection can leave
+ * one behind.
+ */
+CREATE OR REPLACE FUNCTION __KN__.orphan(source text, tables jsonb, seeded jsonb)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  findings jsonb := '[]'::jsonb;
+  completed jsonb := '[]'::jsonb;
+  not_tried jsonb := '[]'::jsonb;
+  target jsonb;
+  tab jsonb;
+  key text;
+  missing text;
+  already integer;
+  shape integer;
+  row_ jsonb;
+  statement text;
+  landed boolean;
+  refused text;
+  named jsonb;
+BEGIN
+  FOR target IN SELECT * FROM jsonb_array_elements(__KN__.candidates(tables)) LOOP
+    key := 'orphaned:' || (target->>'table') || ':' || (target->>'column');
+    SELECT t INTO tab FROM jsonb_array_elements(tables) t WHERE t->>'name' = target->>'table';
+    missing := __KN__.nobody(target->>'type');
+
+    -- It only proves anything if the value really is absent from the parent.
+    BEGIN
+      EXECUTE 'SELECT 1 FROM ' || __KN__.always_quote(source) || '.'
+        || __KN__.always_quote(target->>'parent') || ' WHERE '
+        || __KN__.always_quote(target->>'parentKey') || '::text = '
+        || quote_literal(missing) || ' LIMIT 1'
+        INTO already;
+    EXCEPTION WHEN OTHERS THEN
+      not_tried := not_tried || jsonb_build_array(jsonb_build_object(
+        'table', target->>'table', 'column', target->>'column',
+        'why', 'could not look in ' || (target->>'parent') || ': ' || SQLERRM));
+      CONTINUE;
+    END;
+    IF already IS NOT NULL THEN
+      not_tried := not_tried || jsonb_build_array(jsonb_build_object(
+        'table', target->>'table', 'column', target->>'column',
+        'why', 'the test value was already in ' || (target->>'parent')));
+      CONTINUE;
+    END IF;
+
+    SELECT (s->>'attempt')::integer INTO shape
+      FROM jsonb_array_elements(coalesce(seeded, '[]'::jsonb)) s
+     WHERE s->>'table' = target->>'table';
+    shape := coalesce(shape, 0);
+
+    BEGIN
+      row_ := __KN__.row_for(source, tab, __KN__.user_c(), '9',
+        jsonb_build_object(target->>'column', to_jsonb(missing)), shape);
+      statement := __KN__.insert_statement(source, target->>'table', row_);
+    EXCEPTION WHEN OTHERS THEN
+      not_tried := not_tried || jsonb_build_array(jsonb_build_object(
+        'table', target->>'table', 'column', target->>'column', 'why', SQLERRM));
+      CONTINUE;
+    END;
+
+    landed := false;
+    refused := NULL;
+    BEGIN
+      EXECUTE 'SET LOCAL statement_timeout = ' || quote_literal('15s');
+      EXECUTE statement;
+      landed := true;
+      -- Raised on purpose, to undo the row that just landed. The block is a
+      -- subtransaction; the fact that it landed is a variable and survives.
+      RAISE EXCEPTION 'kryptheon: undoing the orphan' USING ERRCODE = 'KN001';
+    EXCEPTION
+      WHEN SQLSTATE 'KN001' THEN
+        NULL;
+      WHEN OTHERS THEN
+        landed := false;
+        refused := SQLERRM;
+    END;
+    PERFORM set_config('statement_timeout', '0', true);
+
+    IF NOT landed AND coalesce(refused, '') !~* 'violates foreign key constraint' THEN
+      -- Turned away by something other than referential integrity, so nothing
+      -- was learned about whether an orphan can exist.
+      not_tried := not_tried || jsonb_build_array(jsonb_build_object(
+        'table', target->>'table', 'column', target->>'column', 'why', refused));
+      CONTINUE;
+    END IF;
+
+    completed := completed || to_jsonb(key);
+    -- Whether a key is supposedly there does not come into it. What is
+    -- reported is what landed.
+    IF landed THEN
+      named := coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c),
+                        '[]'::jsonb);
+      findings := findings || jsonb_build_array(jsonb_build_object(
+        'kind', 'orphaned',
+        'table', target->>'table',
+        'column', target->>'column',
+        'parent', target->>'parent',
+        'parentKey', target->>'parentKey',
+        'columns', named));
+    END IF;
+  END LOOP;
+
+  RETURN jsonb_build_object('findings', findings, 'completed', completed, 'notTried', not_tried);
+END $$;
+
+-- --------------------------------------------------------------------------
+-- The collision attack, and why this engine cannot run it.
+--
+-- "Can the same thing exist twice" is answered by two requests arriving at the
+-- same instant: the second insert has to be in flight while the first
+-- transaction is still open. A plpgsql function is one session, so it needs a
+-- second one from inside the database.
+--
+-- MEASURED, ON A REAL HOST (scratchpad/dblinkrace.js)
+--
+--   dblink is available and this role may even create it. It cannot connect
+--   back to its own database without a password - dbname alone, an empty
+--   conninfo and a local socket all answer "password or GSSAPI delegated
+--   credentials required". So the only way to open that second session is to
+--   hold a credential, and the whole reason this engine exists is that no
+--   credential ever moves.
+--
+-- So it is not run here. What matters is what that is called. An attack that
+-- did not run is not a table that held, and reporting nothing would read as
+-- safety - so every column that WOULD have been raced comes back as notTried,
+-- by name, with the reason. The npx door still races them for real, because
+-- Node has two connections and can.
+--
+-- The candidates are worked out here in full, identically to the other engine,
+-- precisely so that the two can be compared: what was considered has to match
+-- even when what was concluded cannot.
+-- --------------------------------------------------------------------------
+
+/*
+ * Columns where two rows holding one value is a security problem rather than
+ * an untidy spreadsheet.
+ *
+ * Anchored on the whole name on purpose. `token` is a credential; `token_id`,
+ * `token_expires_at` and `has_token` are not, and matching loosely would put
+ * three false alarms on screen for every real one.
+ */
+CREATE OR REPLACE FUNCTION __KN__.must_be_unique(column_name text, table_name text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE
+    -- One secret matching two rows opens two different doors.
+    WHEN column_name ~* '^(token|auth_token|access_token|refresh_token|reset_token|session_token|session_id|api_key|apikey|access_key|secret_key)$'
+      THEN 'credential'
+    -- A one-time code that can exist twice can be redeemed twice.
+    WHEN column_name ~* '^(invite_code|invitation_code|coupon_code|promo_code|promotion_code|referral_code|voucher_code|redemption_code|activation_code|license_key|serial_key)$'
+      THEN 'code'
+    -- Two accounts answering to one login make "who is this" ambiguous, and
+    -- password reset has to pick one of them. Only on a table that really is
+    -- the account table: `customers` is left alone on purpose, because in half
+    -- the apps it is a contact list where a shared office email is correct.
+    WHEN column_name ~* '^(email|e_mail|username|user_name|handle|login)$'
+     AND table_name ~* '^(users?|profiles?|accounts?|members?|auth_users|app_users|logins?)$'
+      THEN 'identity'
+    ELSE NULL
+  END;
+$$;
+
+/*
+ * Is this column already protected?
+ *
+ * Deliberately generous. A composite UNIQUE (org_id, email) counts, because
+ * the same email in two different organisations is how multi-tenant apps are
+ * supposed to work. A partial index counts, and so does an expression index on
+ * lower(email). The cost is that a column merely mentioned in some other
+ * index's WHERE clause also counts and gets skipped - an attack not run rather
+ * than a false alarm raised, which is the right way round.
+ */
+CREATE OR REPLACE FUNCTION __KN__.covered_by_unique(tab jsonb, column_name text, indexes jsonb)
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  word text := '(^|[^A-Za-z0-9_])'
+    || regexp_replace(column_name, '([.*+?^${}()|\[\]\\])', '\\\1', 'g')
+    || '([^A-Za-z0-9_]|$)';
+  text_ text;
+BEGIN
+  FOR text_ IN
+    SELECT c->>'definition' FROM jsonb_array_elements(coalesce(tab->'constraints', '[]'::jsonb)) c
+     WHERE c->>'kind' IN ('u', 'p')
+    UNION ALL
+    SELECT i->>'definition' FROM jsonb_array_elements(coalesce(indexes, '[]'::jsonb)) i
+     WHERE i->>'table_name' = tab->>'name'
+  LOOP
+    IF text_ ~ word THEN RETURN true; END IF;
+  END LOOP;
+  RETURN false;
+END $$;
+
+/* Every column where the same value twice would be somebody's problem. */
+CREATE OR REPLACE FUNCTION __KN__.collision_candidates(tables jsonb, indexes jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  found jsonb := '[]'::jsonb;
+  tab jsonb;
+  col jsonb;
+  expectation text;
+BEGIN
+  FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
+    FOR col IN SELECT * FROM jsonb_array_elements(coalesce(tab->'columns', '[]'::jsonb)) LOOP
+      expectation := __KN__.must_be_unique(col->>'name', tab->>'name');
+      CONTINUE WHEN expectation IS NULL;
+      found := found || jsonb_build_array(jsonb_build_object(
+        'table', tab->>'name',
+        'column', col->>'name',
+        'expectation', expectation,
+        'type', col->>'type',
+        'covered', __KN__.covered_by_unique(tab, col->>'name', indexes)));
+    END LOOP;
+  END LOOP;
+  RETURN found;
+END $$;
+
+/*
+ * What this engine can say about "can the same thing exist twice".
+ *
+ * Nothing, and it says so by name. Reporting an empty result would be the one
+ * mistake this product cannot afford: a column nobody tested reading as a
+ * column that held.
+ */
+CREATE OR REPLACE FUNCTION __KN__.collide(source text, tables jsonb, indexes jsonb)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  not_tried jsonb := '[]'::jsonb;
+  one jsonb;
+  why constant text :=
+    'this attack needs two requests at the same instant, and a second connection '
+    'cannot be opened from inside the database without a credential - which this '
+    'engine is never given. Run the command line scan to have it raced for real.';
+BEGIN
+  FOR one IN SELECT * FROM jsonb_array_elements(
+    __KN__.collision_candidates(tables, indexes)) LOOP
+    not_tried := not_tried || jsonb_build_array(jsonb_build_object(
+      'table', one->>'table',
+      'column', one->>'column',
+      'why', why));
+  END LOOP;
+
+  RETURN jsonb_build_object(
+    'findings', '[]'::jsonb,
+    'completed', '[]'::jsonb,
+    'notTried', not_tried);
 END $$;
