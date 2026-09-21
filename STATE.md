@@ -16,7 +16,7 @@ looking at the screen, the other by looking at the database.
 | | `C:\Users\jhash\code\kryptheon-v1` | `C:\Users\jhash\code\kryptheon-night` |
 | --- | --- | --- |
 | what it is | the shipping CLI | the night shift |
-| npm | **published**, `kryptheon` 0.1.12 | packaged as `kryptheon-night` 0.1.0, not yet published |
+| npm | **published**, `kryptheon` 0.1.12 | **published**, `kryptheon-night` 0.1.0 |
 | github | `jhashantanu987-beep/kryptheon-cli` | `jhashantanu987-beep/kryptheon-night` (private) |
 | commits | 3 | 21 |
 | built on | Playwright | Postgres |
@@ -336,10 +336,10 @@ anything.
   every Supabase-specific decision in `trouble.js` and `connect.js` - the
   session pooler, IPv6 on direct connections, the certificate authority - is
   reasoned from documentation rather than measured. Free tier is enough.
-- **The one-time password, to publish.** `npm publish` reaches `EOTP` and
-  stops, and the browser step belongs to whoever owns the account. Everything
-  before it is done: the guard passes, the dry run is clean, fourteen files
-  and 60 kB.
+- **Nothing, to publish.** Done on 2026-09-21. `kryptheon-night@0.1.0`,
+  fourteen files, 60 kB, shasum `e9523618` - the same shasum the dry run
+  showed, so what is on the registry is the artifact the guard checked.
+  Installed from npm into an empty folder it runs end to end in 2m20s.
 - **Where the nightly verdict goes.** The design is that `pg_net` posts only
   *news*, never data - "Kryptheon found 3 things, run `kryptheon night` to see
   them" - no table names, nothing. That still needs somewhere to post to;
