@@ -7,6 +7,38 @@ database, not read off the code.
 
 ---
 
+## Stopped here, 2026-09-22 ~01:00
+
+Work is committed and the database is clean. Nothing is half-done in the repo;
+what is half-done is the verification.
+
+**Resume with the four suites that did not get to run:**
+
+    KN_DATABASE_URL=postgresql://...  bash scratchpad/suite-retry.sh shapes verdicts loop twin
+
+These ten passed, after the search_path fix, and do not need running again
+unless the code changes:
+
+| | | | |
+| --- | --- | --- | --- |
+| untouched ✓5 | blocked ✓4 | orphans ✓6 | guests ✓11 |
+| usable ✓6 | external ✓5 | schema ✓11 | collision ✓16 |
+| tamper ✓11 | orphan ✓13 | | |
+
+`npm run check:dry` was green too, at 64 checks. Budget about fifty minutes for
+the four that are left: `shapes` alone is twenty, and it is latency rather than
+work - see the 340 ms measurement below.
+
+**Then**, and only if all four are green: publish 0.1.3. The published 0.1.2
+advances a customer's sequences on any app that lives in `public`, which is
+every real one.
+
+Two throwaway Neon databases were claimed for this and **expire 2026-09-24**:
+one for the suites, one for the demo schemas `app_rls` and `app_no_rls`. Claim
+new ones with `neon claim create --env-pull` when they go.
+
+---
+
 ## Two folders, one product
 
 Kryptheon is **one product being upgraded**, not two products. Both halves
