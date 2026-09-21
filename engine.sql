@@ -497,6 +497,56 @@ RETURNS text LANGUAGE sql IMMUTABLE AS $$
   END;
 $$;
 
+/*
+ * Points a reference with no schema on it at the copy.
+ *
+ * The one the rewrite above cannot see. pg_get_constraintdef writes the schema
+ * only when the referenced table is NOT reachable through search_path, so an
+ * app in a schema of its own comes back as "REFERENCES app.profiles(id)" and
+ * is rewritten, while the same app in `public` comes back as "REFERENCES
+ * profiles(id)" and there is nothing to rewrite. Replayed into the copy, that
+ * bare name resolves through search_path again and binds to the customer's
+ * real table.
+ *
+ * Every fixture in this repo builds its app in a schema of its own, which is
+ * on nobody's path - so both engines were wrong in exactly the way no check
+ * here could see, and the twin check agreed with itself. Found in the node
+ * engine on a real Supabase project, then measured here.
+ *
+ * Only names the plan itself owns are touched: anything outside the schema is
+ * the stand-in's business. The matched text is replaced literally rather than
+ * through regexp_replace, so a table name that happens to contain a regex
+ * character cannot change what gets rewritten.
+ */
+CREATE OR REPLACE FUNCTION __KN__.qualify_own_refs(definition text, plan jsonb, target text)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  hit text[];
+  name text;
+BEGIN
+  IF definition IS NULL THEN RETURN NULL; END IF;
+  -- Group 1 is the whole reference, group 2 the name as written. A quoted
+  -- identifier is matched whole, because it can hold spaces and quotes of its
+  -- own doubled up - the first attempt read a run of safe characters instead
+  -- and silently did not match REFERENCES "Group Table"(...). The unquoted
+  -- alternative excludes a dot, so an already-qualified name is left to the
+  -- rewrite above.
+  hit := regexp_match(definition, '(REFERENCES\s+("(?:[^"]|"")*"|[^\s(".]+)\s*\()');
+  IF hit IS NULL THEN RETURN definition; END IF;
+  name := CASE WHEN left(hit[2], 1) = '"'
+               THEN replace(substring(hit[2] from 2 for length(hit[2]) - 2), '""', '"')
+               ELSE hit[2] END;
+  IF NOT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(plan->'tables') t WHERE t->>'name' = name
+  ) THEN
+    RETURN definition;
+  END IF;
+  RETURN replace(
+    definition,
+    hit[1],
+    'REFERENCES ' || __KN__.always_quote(target) || '.' || __KN__.always_quote(name) || '(');
+END $$;
+
 /* Points a foreign key at the stand-in instead of at the real outside table. */
 CREATE OR REPLACE FUNCTION __KN__.rewrite_external_refs(expr text, external jsonb, to_schema text)
 RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
@@ -718,9 +768,11 @@ BEGIN
         CONTINUE WHEN (con->>'kind' = 'f') <> want_foreign;
         out := out || ('ALTER TABLE ' || here || '.' || __KN__.always_quote(tab->>'name')
                        || ' ADD CONSTRAINT ' || __KN__.always_quote(con->>'name') || ' '
-                       || __KN__.rewrite_external_refs(
-                            __KN__.rewrite_schema_refs(con->>'definition', source, target),
-                            external, target));
+                       || __KN__.qualify_own_refs(
+                            __KN__.rewrite_external_refs(
+                              __KN__.rewrite_schema_refs(con->>'definition', source, target),
+                              external, target),
+                            plan, target));
       END LOOP;
     END LOOP;
   END LOOP;
@@ -804,10 +856,75 @@ RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
   statements jsonb := __KN__.must_stay_inside(__KN__.copy_statements(plan, target), target);
   s text;
+  strays text;
+  saved text := current_setting('search_path');
 BEGIN
+  -- Built with the copy first on the search_path, so a bare name binds to the
+  -- copy and not to whatever the customer happens to have.
+  --
+  -- Postgres writes a name without its schema whenever that name is already
+  -- reachable, so a real app in `public` hands back "REFERENCES profiles(id)"
+  -- and "nextval('orders_id_seq'::regclass)" - and a rewrite looking for a
+  -- schema name finds nothing to change in either. Replayed into the copy,
+  -- the foreign keys pointed at the customer's tables and the copy drew its
+  -- keys from the customer's sequences, which advanced them.
+  --
+  -- Rewriting each kind of expression in turn has no end to it. Naming the
+  -- copy first changes what a bare name means, which ends all of them.
+  -- `public` stays on, after the copy, because the copy legitimately needs
+  -- what lives there. Local to the transaction, so it undoes itself.
+  PERFORM set_config('search_path',
+                     __KN__.always_quote(target) || ', public, extensions', true);
+
   FOR s IN SELECT jsonb_array_elements_text(statements) LOOP
     EXECUTE s;
   END LOOP;
+
+  PERFORM set_config('search_path', saved, true);
+
+  -- And then look at what was built, rather than at what was meant.
+  --
+  -- must_stay_inside reads the statements before they run. This asks Postgres
+  -- where the copy ended up pointing, which is the only account of it that a
+  -- spelling nobody anticipated cannot fool - and one was not: a bare
+  -- "REFERENCES profiles(id)" bound to the customer's own table on every app
+  -- that lives in a schema on the search_path.
+  --
+  -- Nothing is written to a table outside the copy either way. The damage is
+  -- that a copy tied to the customer's rows is not the app being attacked,
+  -- and every verdict taken from it is about something else.
+  -- Foreign keys AND column defaults. The second is where this hid after the
+  -- first was closed: a serial column's default is nextval('<sequence>'), and
+  -- the copy was calling the customer's. Nothing was written to their tables,
+  -- but nextval advances a sequence, so their database changed.
+  --
+  -- Asked of pg_depend rather than of the text, so it holds for any
+  -- expression that ends up pointing at a relation.
+  SELECT string_agg(what || ' -> ' || points_at, ', ') INTO strays FROM (
+    SELECT con.conname AS what, rn.nspname AS points_at
+      FROM pg_constraint con
+      JOIN pg_class cl ON cl.oid = con.conrelid
+      JOIN pg_namespace cn ON cn.oid = cl.relnamespace
+      JOIN pg_class rc ON rc.oid = con.confrelid
+      JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+     WHERE con.contype = 'f' AND cn.nspname = target AND rn.nspname <> target
+    UNION ALL
+    SELECT cl.relname || '.' || a.attname || ' default',
+           rn.nspname || '.' || rc.relname
+      FROM pg_depend d
+      JOIN pg_attrdef ad ON ad.oid = d.objid AND d.classid = 'pg_attrdef'::regclass
+      JOIN pg_class cl ON cl.oid = ad.adrelid
+      JOIN pg_namespace cn ON cn.oid = cl.relnamespace
+      JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+      JOIN pg_class rc ON rc.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+      JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+     WHERE cn.nspname = target AND rn.nspname <> target AND rn.nspname <> 'pg_catalog'
+  ) outside;
+
+  IF strays IS NOT NULL THEN
+    RAISE EXCEPTION 'the copy points outside itself, so it is not the app: %', strays;
+  END IF;
+
   RETURN statements;
 END $$;
 

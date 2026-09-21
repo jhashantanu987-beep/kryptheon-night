@@ -530,10 +530,23 @@ function qualifyOwnRefs(definition, plan, target) {
   // A replacer function, never a replacement string: `$&` and friends are read
   // as instructions inside one, and that has already cost this project an
   // engine that would not install.
+  // A quoted identifier can hold anything, including spaces and quotes of its
+  // own doubled up, so it is matched as a whole rather than as a run of safe
+  // characters. The first attempt used [^".\s(]+ inside the quotes and
+  // silently did not match `REFERENCES "Group Table"(...)` - which the twin
+  // fixture has, because it was built out of every shape that has ever been
+  // read wrong, and it caught this the first time it ran.
+  //
+  // The unquoted alternative excludes a dot, so a name that is already
+  // schema-qualified is left alone: that is the other rewrite's work.
   return String(definition).replace(
-    /(\bREFERENCES\s+)("?)([^".\s(]+)\2(\s*\()/gi,
-    (whole, before, quoteMark, name, after) =>
-      (own.has(name) ? before + quote(target) + '.' + quote(name) + after : whole),
+    /(\bREFERENCES\s+)("(?:[^"]|"")*"|[^\s(".]+)(\s*\()/gi,
+    (whole, before, written, after) => {
+      const name = written.charAt(0) === '"'
+        ? written.slice(1, -1).split('""').join('"')
+        : written;
+      return own.has(name) ? before + quote(target) + '.' + quote(name) + after : whole;
+    },
   );
 }
 
@@ -809,8 +822,37 @@ async function writeSchema(client, plan, target) {
   }
 
   mustStayInside(statements, target);
-  for (const statement of statements) {
-    await client.query(statement);
+  // Built with the copy first on the search_path, so a bare name binds to the
+  // copy and not to whatever the customer happens to have.
+  //
+  // This is the structural half, and it went in after chasing the same bug
+  // through three different kinds of expression. Postgres writes a name
+  // without its schema whenever that name is already reachable - so a real app
+  // in `public` hands back "REFERENCES profiles(id)" and
+  // "nextval('orders_id_seq'::regclass)", and a rewrite that goes looking for
+  // a schema name finds nothing to change in either. Replayed into the copy,
+  // both bound to the customer's own objects: the foreign keys pointed at
+  // their tables, and the copy drew its keys from their sequences, which
+  // advanced them.
+  //
+  // Rewriting each kind of expression in turn is a game with no end - index
+  // predicates, checks that call a function, view bodies. Naming the copy
+  // first on the path ends all of them at once, because it changes what a
+  // bare name means rather than trying to find every place one can appear.
+  //
+  // `public` stays on the path, after the copy, because the copy legitimately
+  // needs what lives there - gen_random_uuid() and the like. `extensions` is
+  // where Supabase keeps them; a schema on the path that does not exist is
+  // ignored rather than an error.
+  const { rows: pathRows } = await client.query('SHOW search_path');
+  const restoreTo = pathRows[0].search_path;
+  await client.query('SET search_path TO ' + quote(target) + ', public, extensions');
+  try {
+    for (const statement of statements) {
+      await client.query(statement);
+    }
+  } finally {
+    await client.query('SET search_path TO ' + restoreTo).catch(() => {});
   }
 
   // And then look at what was actually built, rather than at what was meant.
@@ -825,20 +867,41 @@ async function writeSchema(client, plan, target) {
   // Nothing is written to a table outside the copy either way. The damage is
   // subtler than that: a copy tied to the customer's rows is not the app being
   // attacked, and every verdict taken from it is about something else.
+  // Foreign keys AND column defaults, because the second one is where this
+  // hid after the first was closed: a serial column's default is
+  // nextval('<sequence>'), and the copy was calling the customer's. Nothing
+  // was written to their tables, but nextval advances a sequence, so their
+  // database changed - and "we never touch your live app" says at all.
+  //
+  // Asked of pg_depend rather than of the text, so it holds for any
+  // expression that ends up pointing at a relation, not only the ones anybody
+  // thought to look at. pg_catalog is excluded because everything depends on
+  // it; anything else outside the copy is the bug.
   const { rows: strays } = await client.query(
-    `SELECT con.conname, rn.nspname AS points_at
+    `SELECT con.conname AS what, rn.nspname AS points_at
        FROM pg_constraint con
        JOIN pg_class cl ON cl.oid = con.conrelid
        JOIN pg_namespace cn ON cn.oid = cl.relnamespace
        JOIN pg_class rc ON rc.oid = con.confrelid
        JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-      WHERE con.contype = 'f' AND cn.nspname = $1 AND rn.nspname <> $1`,
+      WHERE con.contype = 'f' AND cn.nspname = $1 AND rn.nspname <> $1
+      UNION ALL
+     SELECT cl.relname || '.' || a.attname || ' default' AS what,
+            rn.nspname || '.' || rc.relname AS points_at
+       FROM pg_depend d
+       JOIN pg_attrdef ad ON ad.oid = d.objid AND d.classid = 'pg_attrdef'::regclass
+       JOIN pg_class cl ON cl.oid = ad.adrelid
+       JOIN pg_namespace cn ON cn.oid = cl.relnamespace
+       JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+       JOIN pg_class rc ON rc.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+       JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+      WHERE cn.nspname = $1 AND rn.nspname <> $1 AND rn.nspname <> 'pg_catalog'`,
     [target],
   );
   if (strays.length) {
     throw new Error(
       'the copy points outside itself, so it is not the app: ' +
-        strays.map((row) => row.conname + ' -> ' + row.points_at).join(', '),
+        strays.map((row) => row.what + ' -> ' + row.points_at).join(', '),
     );
   }
 
@@ -987,6 +1050,7 @@ module.exports = {
   readExternalTargets: readExternalTargets,
   referenceIn: referenceIn,
   rewriteSchemaRefs: rewriteSchemaRefs,
+  qualifyOwnRefs: qualifyOwnRefs,
   stubNameFor: stubNameFor,
   IDENTITIES: IDENTITIES,
   quote: quote,

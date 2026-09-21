@@ -79,6 +79,21 @@ async function contentsOf(client, where) {
 async function buildApp(client) {
   const q = (name) => schema.quote(APP) + '.' + schema.quote(name);
   await client.query('CREATE SCHEMA ' + schema.quote(APP));
+
+  // The app goes on the search_path, because every real one is.
+  //
+  // This fixture named its own schema on every statement, so it was never
+  // reachable by a bare name - and `pg_get_constraintdef` therefore always
+  // wrote the schema out, and both engines' rewrites always had something to
+  // rewrite. A real app lives in `public`, which IS on the path, so the same
+  // foreign key comes back as a bare "REFERENCES profiles(id)" and binds,
+  // inside the copy, to the customer's own table.
+  //
+  // Both engines did that. This check compared them and agreed, because the
+  // one condition that makes it happen is the one no fixture here had. So the
+  // path is set for the whole comparison rather than for a second pass: the
+  // realistic reading is the only one worth comparing.
+  await client.query('SET search_path TO ' + schema.quote(APP) + ', public');
   await fixture.ensureRoles(client, APP, schema.quote);
   undoAuth = await fixture.ensureAuth(client);
 
@@ -776,6 +791,9 @@ async function main() {
       return left.length ? ['still there: ' + left.map((r) => r.nspname).join(', ')] : [];
     })());
   } finally {
+    // Off the path before anything is dropped, so the cleanup below is not
+    // reaching for a schema through a name that is about to stop resolving.
+    await client.query('SET search_path TO "$user", public').catch(() => {});
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE').catch(() => {});
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(PRIVATE) + ' CASCADE').catch(() => {});
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP + '_node') + ' CASCADE').catch(() => {});

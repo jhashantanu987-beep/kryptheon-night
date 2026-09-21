@@ -375,6 +375,38 @@ async function main() {
       await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(SEARCHED) + ' CASCADE').catch(() => {});
     }
     record('10. an app in a schema on the search_path is copied, not borrowed', () => pathProblems);
+
+    record('11. every way Postgres can spell a reference', () => {
+      // Needs no database, and is here because schema.js is what this suite
+      // is about. Check 10 proves the rewrite fires; this proves it fires on
+      // the right things and only on those.
+      //
+      // The quoted-with-a-space case is not hypothetical: the first version
+      // read a run of safe characters inside the quotes, stopped at the
+      // space, and silently did not match. twin.check.js has a foreign key
+      // between quoted names in its fixture and caught it on the first run.
+      const plan = { tables: [{ name: 'parents' }, { name: 'Group Table' }, { name: 'has"quote' }] };
+      const problems = [];
+      const cases = [
+        // written by Postgres                              what it should become
+        ['REFERENCES parents(id)', 'REFERENCES "kn_copy"."parents"(id)'],
+        ['REFERENCES "Group Table"(id)', 'REFERENCES "kn_copy"."Group Table"(id)'],
+        ['REFERENCES "has""quote"(id)', 'REFERENCES "kn_copy"."has""quote"(id)'],
+        // already qualified: the other rewrite's work, not this one's
+        ['REFERENCES other_app.parents(id)', 'REFERENCES other_app.parents(id)'],
+        ['REFERENCES "kn_copy"."parents"(id)', 'REFERENCES "kn_copy"."parents"(id)'],
+        // not a table this plan owns: a stand-in points at it, and qualifying
+        // it to the copy would invent a table that is not there
+        ['REFERENCES notmine(id)', 'REFERENCES notmine(id)'],
+      ];
+      for (const [written, wanted] of cases) {
+        const got = schema.qualifyOwnRefs('FOREIGN KEY (x) ' + written, plan, 'kn_copy');
+        if (got !== 'FOREIGN KEY (x) ' + wanted) {
+          problems.push(written + '\n        became ' + got + '\n        wanted FOREIGN KEY (x) ' + wanted);
+        }
+      }
+      return problems;
+    });
   } finally {
     for (const name of [COPY, SOURCE]) {
       try {

@@ -74,8 +74,18 @@ const PHOTOGRAPHS = {
                  WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema')
                  ORDER BY 1, 2`,
   roles: "SELECT rolname AS name, rolsuper AS super, rolcanlogin AS login FROM pg_roles ORDER BY 1",
-  sequences: `SELECT sequence_schema AS schema, sequence_name AS name
-                FROM information_schema.sequences ORDER BY 1, 2`,
+  // Where each sequence stands, not only that it exists.
+  //
+  // This photographed `sequence_schema, sequence_name` and nothing else, so a
+  // scan could call nextval() on the customer's own sequence all night and
+  // this check would compare two identical lists of names and pass. It did:
+  // a real Supabase project came out of four scans with zero rows in its
+  // tables and its sequences at 25, 25 and 14.
+  //
+  // A photograph of the wrong thing is worse than none, because it is the
+  // reason nobody looks again.
+  sequences: `SELECT schemaname AS schema, sequencename AS name, last_value
+                FROM pg_sequences ORDER BY 1, 2`,
 };
 
 /** One photograph of the whole database, with our own schemas left out. */
@@ -106,6 +116,19 @@ function differences(before, after) {
 async function buildApp(client) {
   const q = (name) => schema.quote(APP) + '.' + schema.quote(name);
   await client.query('CREATE SCHEMA ' + schema.quote(APP));
+
+  // The app goes on the search_path, because every real one is.
+  //
+  // This is the other half of why the promise went unchecked. With the app
+  // unreachable by a bare name, Postgres wrote every schema name out, every
+  // copied expression pointed where it was meant to, and this check had
+  // nothing to find. A real app lives in `public`: its foreign keys came back
+  // bare and bound to the customer's tables, and its serial defaults came back
+  // as nextval('orders_id_seq') and drew from the customer's sequences.
+  //
+  // The promise is about real databases, so it is checked against the shape a
+  // real database has.
+  await client.query('SET search_path TO ' + schema.quote(APP) + ', public');
 
   for (const role of ['anon', 'authenticated']) {
     await client.query(
@@ -172,6 +195,24 @@ async function contents(client) {
     );
     out.push(table + ' = ' + JSON.stringify(rows));
   }
+
+  // And where the app's own sequences stand.
+  //
+  // The photograph cannot see these: the app is named kn_... on purpose, so
+  // that it is excluded alongside the copy, and everything of the app's that
+  // must be watched has to be watched here instead. Its rows were. Its
+  // sequences were not - and that is precisely where the scan was touching a
+  // real database, by calling nextval() on the customer's own sequence
+  // through a serial default the copy had borrowed.
+  //
+  // Measured on a real Supabase project: zero rows in every table, sequences
+  // at 25, 25 and 14. Nothing this check looked at had moved.
+  const { rows: seqs } = await client.query(
+    `SELECT sequencename AS name, last_value
+       FROM pg_sequences WHERE schemaname = $1 ORDER BY 1`,
+    [APP],
+  );
+  out.push('sequences = ' + JSON.stringify(seqs));
   return out;
 }
 
@@ -200,14 +241,29 @@ async function main() {
     // that the scan leaves nothing NEW behind, whatever was already there.
     const copiesBefore = await copySchemas(client);
 
-    const result = await scan(client, APP, {
-      quiet: true,
-      openSession: async () => {
-        const extra = new Client({ connectionString: CONNECTION });
-        await extra.connect();
-        return extra;
-      },
-    });
+    // A scan that throws is this check failing, not this check being unable to
+    // run. Left to reach the top-level catch it printed "The check could not
+    // run: ..." with no FAIL line anywhere - which reads as a broken harness
+    // rather than as a broken product, and which the suite runner treats as a
+    // dropped connection and retries three times.
+    //
+    // It matters most here: the guard that refuses a copy pointing outside
+    // itself raises, so the one failure this file exists to catch was the one
+    // it reported least clearly.
+    let result = { stopped: null, findings: [] };
+    let threw = null;
+    try {
+      result = await scan(client, APP, {
+        quiet: true,
+        openSession: async () => {
+          const extra = new Client({ connectionString: CONNECTION });
+          await extra.connect();
+          return extra;
+        },
+      });
+    } catch (err) {
+      threw = err.message;
+    }
 
     const after = await photograph(client);
     const rowsAfter = await contents(client);
@@ -216,8 +272,11 @@ async function main() {
       // A scan that fell over changes nothing either, and would pass every
       // check below for the wrong reason.
       const problems = [];
+      if (threw) problems.push('it threw: ' + String(threw).split('\n')[0]);
       if (result.stopped) problems.push('it stopped: ' + String(result.stopped).split('\n')[0]);
-      if (!result.stopped && !result.findings.length) problems.push('it found nothing in an app with a hole in it');
+      if (!threw && !result.stopped && !result.findings.length) {
+        problems.push('it found nothing in an app with a hole in it');
+      }
       return problems;
     })());
 
@@ -258,6 +317,7 @@ check("3. the auth.uid() that was there before is still there afterwards", (() =
     })());
   } finally {
     try {
+      await client.query('SET search_path TO "$user", public').catch(() => {});
       await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE');
     } catch (err) {
       console.error('  WARNING: cleanup failed: ' + err.message);
