@@ -16,11 +16,11 @@ looking at the screen, the other by looking at the database.
 | | `C:\Users\jhash\code\kryptheon-v1` | `C:\Users\jhash\code\kryptheon-night` |
 | --- | --- | --- |
 | what it is | the shipping CLI | the night shift |
-| npm | **published**, `kryptheon` 0.1.12 | not published |
+| npm | **published**, `kryptheon` 0.1.12 | packaged as `kryptheon-night` 0.1.0, not yet published |
 | github | `jhashantanu987-beep/kryptheon-cli` | `jhashantanu987-beep/kryptheon-night` (private) |
-| commits | 3 | 17 |
+| commits | 3 | 21 |
 | built on | Playwright | Postgres |
-| commands | `record` `check` `accept` `remove` `setup-ai` | `node scan.js`, not yet a `kryptheon` command |
+| commands | `record` `check` `accept` `remove` `setup-ai` | `npx kryptheon-night`, and `node scan.js` underneath it |
 
 They share **no code**. Checked: `kryptheon-v1` contains nothing about row
 level security or policies; `kryptheon-night` contains nothing about browsers.
@@ -88,10 +88,48 @@ role, and changing role is the attack.
 | 4 | tampering + interruption + collision, in SQL | done |
 | 5 | the installer (`pg_cron` + `pg_net`) | **not started** |
 
-**Important and easy to misread: nothing in the shipped product has changed.**
-`scan.js` still runs the Node engine. The only thing that uses `sqlengine.js`
-is `twin.check.js`. Four slices of work are foundation; no user has seen a
-difference yet.
+**Important and easy to misread: nothing in the engine has changed.** `scan.js`
+still runs the Node engine. The only thing that uses `sqlengine.js` is
+`twin.check.js`. Four slices of work are foundation; no user has seen a
+difference from any of them.
+
+### The front door, which is new
+
+There is now a command. `npx kryptheon-night`, no arguments, no environment
+variable: it asks for the connection string, says what it is about to do and
+what it will not do, waits to be told yes, and runs. `scan.js` is untouched as
+a door and is still what the checks drive.
+
+This was built because of the measurement at the bottom of this file - nobody
+is using the other half either, and the problem was never the engine. A
+vibecoder with a Lovable app has no command line habit, has never heard the
+phrase "connection string", and will not read a stack trace. Everything
+between them and an answer now lives in four files:
+
+| | |
+| --- | --- |
+| `bin/kryptheon-night.js` | the command: arguments, the gate, the exit codes |
+| `intro.js` | what is asked, and the consent screen |
+| `trouble.js` | every failure before the first attack, in sentences |
+| `connect.js` | how a connection is actually opened, and its SSL |
+
+Three things about it are load-bearing rather than decorative:
+
+- **It will not connect without a yes.** With no keyboard attached and no
+  `--yes`, it stops. `intro.check.js` checks 7 and 8 are a pair - without the
+  second, the first would pass on a command that never connects to anything.
+- **Nothing found is never reported as safety.** The all-clear used to end
+  "Your data held". It now says these attacks lost, which is the only thing
+  the program knows.
+- **Every report ends with what was not tested**, including the collision
+  columns and the lost update. A section that is simply absent reads exactly
+  like nothing having been skipped.
+
+It is a separate npm package, not a subcommand of `kryptheon`. Three reasons,
+in order: v1's users would otherwise carry a Postgres driver they have no use
+for; v1's `prepublishOnly` guard is the thing that caught the corrupted 0.1.8
+publish and adding eleven files to its list means editing it; and `npx
+kryptheon-night` is already one command with no install step.
 
 ### The next decision
 
@@ -151,6 +189,32 @@ it. No name is resolved at read time, so schema USAGE is never checked - only
 EXECUTE, which goes to PUBLIC when a function is created. Hiding a schema does
 not stop a policy; revoking EXECUTE does.
 
+**`pg` sends the password in the clear unless told not to, and being told
+badly is worse.** Given a string with no `sslmode`, `pg` 8.23 leaves SSL off
+entirely. Putting `sslmode=require` in the string instead is not the fix: this
+version of `pg-connection-string` reads `require` and `prefer` as
+`verify-full`, which fails against Supabase's own certificate authority, and
+prints nine lines of upgrade notice to the screen while it does it. Neon hands
+out a string ending `?sslmode=require`, so following the instructions on
+screen put that notice in the middle of a security report. `connect.js`
+replaces those two modes with encryption on and no certificate check - which
+is what `sslmode=require` means everywhere else - and leaves `verify-full`,
+`no-verify` and `disable` exactly as somebody typed them.
+
+**Outbound 5432 was open on this network today.** The note at the bottom of
+this file saying it is blocked was true when it was written and was not true
+on 2026-09-21: a throwaway Neon database answered a plain `pg` connection on
+5432 in 2.7 seconds, no preload involved. Test it before assuming either way;
+`KN_PRELOAD` is still there for when it is blocked again.
+
+**The database is 340 ms away, and that is the whole reason a suite takes
+twenty minutes.** Measured over ten round trips to Neon in `us-east-2` from
+here. `shapes.check.js` makes thousands of queries, so it spends nineteen of
+its twenty minutes waiting rather than working. `neon claim create` has no
+region flag, so this cannot be improved from the CLI. It matters because a
+slow suite looks exactly like a hung one - and acting on that guess killed a
+run that was working perfectly.
+
 **npm downloads are not users.** 1253 last month, but every spike lands
 exactly on a publish day and 20 of 30 days are zero. That is mirrors reacting
 to publishes. **Nobody is using it.** The problem is distribution, not the
@@ -193,15 +257,53 @@ of them was bought with a bug.
   `scratchpad/suite-retry.sh` runs each check separately and retries. The
   mutation runner had the same disease and reported a live mutation as caught,
   twice - a catch has to show a FAIL line now.
-- Outbound 5432 is blocked on this network; everything goes through a `--require`
-  preload that swaps `pg` for Neon's WebSocket driver over 443.
+- **npm printing a file name is not npm writing a file.** `npm publish
+  --dry-run` runs `prepublishOnly`, which runs `package.check.js`, which runs
+  `npm pack` - and npm gives its settings to child processes as `npm_config_*`
+  variables, so that pack inherited `npm_config_dry_run` and packed nothing.
+  It printed the file name anyway. The check then installed a tarball that was
+  not there and reported six failures full of `Cannot find module`, which
+  reads like a broken product. The variable is cleared before the child runs,
+  and the tarball is now checked on disk.
+- **`npx <path-to-tarball>` silently does nothing** and exits 0. Use `npx -y
+  --package="<tarball>" -- kryptheon-night`, or install it first.
+- **Killing a run leaves its connections and its schemas behind.** Stopping
+  the wrapper does not stop the `node` it spawned: two backends sat idle on
+  the database and four `kn_*` schemas stayed in it. It is the same disease as
+  the mutation runner - a `finally` that never runs - and it is what
+  `orphans.check.js` and `guests.check.js` exist for. Sweep before blaming
+  anything else.
+- **`guests.check.js` fails on purpose if an `auth.users` from an earlier run
+  is still there.** It has to create and drop that table to test anything, it
+  will not touch one that might belong to a suite in another window, and it
+  says so rather than skipping quietly. Running the suite twice inside six
+  hours is enough to trigger it. Drop the marked table once nothing is
+  running, then run it again.
+- Outbound 5432 was blocked on this network when this file was first written
+  and was open on 2026-09-21. `KN_PRELOAD` still takes a `--require` preload
+  that swaps `pg` for Neon's WebSocket driver over 443, for when it is blocked
+  again. Test rather than assume.
 
 ---
 
 ## The checks
 
-Sixteen suites, all live against a real database. `npm run check`, or
-`scratchpad/suite-retry.sh branch` which retries dropped connections.
+Nineteen suites, five of which need no database at all. `npm run check` for
+all of them, `npm run check:dry` for the five.
+
+Those five - `package`, `trouble`, `intro`, `finding`, `recheck` - are what
+npm hands a stranger, the wording of every failure, the consent screen, the
+report and the re-check. Sixty-three checks, about two minutes, no connection
+string, which makes them the only ones somebody who has just cloned this can
+run. Run them after every change to a word of the product, because the wording
+is the product.
+
+`package.check.js` is the only check that tests what a customer receives
+rather than what is in this folder: it packs the real tarball, installs it
+into an empty directory that has never seen this repo, and runs the command
+from there. It follows the `require` graph out of the bin rather than trusting
+the `files` list, because trusting that list is the bug that shipped
+`kryptheon@0.1.8`.
 
 `twin.check.js` is the important one. Two implementations of the same idea is
 how a bug gets fixed once and survives in the other copy, so it builds one
@@ -229,7 +331,15 @@ anything.
 
 ## Open, and needing the user
 
-- **A Supabase project** for Slice 5. Free tier is enough. Neon cannot host it.
+- **A Supabase project.** Needed twice over now. Slice 5 cannot be built or
+  tested anywhere else, and the front door has never been run against one:
+  every Supabase-specific decision in `trouble.js` and `connect.js` - the
+  session pooler, IPv6 on direct connections, the certificate authority - is
+  reasoned from documentation rather than measured. Free tier is enough.
+- **The one-time password, to publish.** `npm publish` reaches `EOTP` and
+  stops, and the browser step belongs to whoever owns the account. Everything
+  before it is done: the guard passes, the dry run is clean, fourteen files
+  and 60 kB.
 - **Where the nightly verdict goes.** The design is that `pg_net` posts only
   *news*, never data - "Kryptheon found 3 things, run `kryptheon night` to see
   them" - no table names, nothing. That still needs somewhere to post to;
