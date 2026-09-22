@@ -33,10 +33,39 @@ every time a word of the product is edited:
 | `verdicts.check.js` | yes | the answer is right, not merely produced |
 | `loop.check.js` | yes | the whole thing, through the real command |
 
+And one that is deliberately **not** in `npm run check`:
+
+| | needs | what it is about |
+|---|---|---|
+| `installer.check.js` | a **Supabase** project | removing the nightly door gives the database back |
+
+    KN_DATABASE_URL=postgresql://...  npm run check:installer
+
+The nightly door needs `pg_cron` and `pg_net`. Neon offers the first and not
+the second, and every other suite here runs against Neon - so a check that
+cannot run where the suite runs would either fail every night for the wrong
+reason or learn to skip quietly. It lives on its own and says plainly when it
+cannot run.
+
 The ones that need a database build small apps in Postgres, use them, and take
 away exactly what they created - see **The checks are guests** below.
 
 ## What each one is guarding
+
+**installer.check.js** - a customer who removes Kryptheon gets their database
+back exactly as it was. Harder than it sounds, and it fails silently when it
+fails. Three things were measured on a real Supabase project before a line of
+the installer was written: `pg_net` installs into the customer's own `public`
+unless it is told where to go; `cron.unschedule` is overloaded on `(bigint)`
+and `(name)`, so an uncast parameter binds to the name one and fails with
+"could not find valid entry for job", which reads exactly like the job having
+already gone; and dropping `pg_cron` on a database that already had it would
+take every other job in it away.
+
+Its own cleanup follows the same rule as the installer, and for a reason found
+by breaking uninstall on purpose: the run failed correctly and left `pg_cron`
+and `pg_net` installed in a real project. A check that cannot tidy up after
+the thing it is testing is broken is not finished.
 
 **engines.check.js** - the same scan, twice, down two engines, compared as a
 report rather than function by function. `twin.check.js` compares what each

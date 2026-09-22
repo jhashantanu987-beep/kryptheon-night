@@ -53,7 +53,8 @@
     "probe:orphan": "node probe-orphan.js",
     "check:twin": "node twin.check.js",
     "prepublishOnly": "node package.check.js",
-    "check:engines": "node engines.check.js"
+    "check:engines": "node engines.check.js",
+    "check:installer": "node installer.check.js"
   },
   "keywords": [
     "supabase",

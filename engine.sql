@@ -2318,3 +2318,167 @@ BEGIN
     'completed', '[]'::jsonb,
     'notTried', not_tried);
 END $$;
+-- --------------------------------------------------------------------------
+-- Slice 5: the night's work, run from inside the database.
+--
+-- The other door. Down `npx` the engine is installed, used and dropped inside
+-- one command; here the same functions stay put and pg_cron calls the one
+-- below at three in the morning. Nothing in it is new work: it is read_schema,
+-- write_schema, seed, impersonate, tamper, orphan and collide in the order
+-- scan.js runs them, with the answer written to a table instead of to a
+-- screen. If the two doors ever stop agreeing, it is this ordering that has
+-- drifted.
+--
+-- The one thing this door cannot do is race two requests at once, so collide
+-- names every column it would have tried and says why. That is written up in
+-- STATE.md and said out loud in the report: the nightly run is strictly weaker
+-- than the command line for exactly one attack.
+-- --------------------------------------------------------------------------
+
+/*
+ * The copy's name, in the form every sweep in this product recognises.
+ *
+ * `kn_<milliseconds in base 36>`, because `sweepOldCopies` in scan.js reads
+ * the age of an abandoned copy out of its name - there is nothing in Postgres
+ * that records when a schema was made. A nightly run that named its copies
+ * any other way would leave them in the customer's database for ever, and the
+ * sweep would walk straight past them. Postgres has no base 36, so here it is.
+ */
+CREATE OR REPLACE FUNCTION __KN__.base36(n bigint)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  digits constant text := '0123456789abcdefghijklmnopqrstuvwxyz';
+  out text := '';
+  left_ bigint := n;
+BEGIN
+  IF left_ IS NULL OR left_ <= 0 THEN RETURN '0'; END IF;
+  WHILE left_ > 0 LOOP
+    out := substr(digits, (left_ % 36)::integer + 1, 1) || out;
+    left_ := left_ / 36;
+  END LOOP;
+  RETURN out;
+END $$;
+
+/* Where the nightly answers are kept, for `kryptheon night` to read back. */
+CREATE TABLE IF NOT EXISTS __KN__.runs (
+  id           bigserial PRIMARY KEY,
+  ran_at       timestamptz NOT NULL DEFAULT now(),
+  source       text NOT NULL,
+  stopped      text,
+  attacks_run  integer NOT NULL DEFAULT 0,
+  findings     jsonb NOT NULL DEFAULT '[]'::jsonb,
+  not_checked  jsonb NOT NULL DEFAULT '[]'::jsonb
+);
+
+/*
+ * One night's work, and the id of the row it wrote.
+ *
+ * Every failure is recorded rather than raised. A nightly job that throws
+ * leaves pg_cron with a message nobody reads and the customer with no answer
+ * at all - and "no answer" and "nothing got through" look identical from the
+ * outside, which is the one confusion this product exists to prevent.
+ */
+CREATE OR REPLACE FUNCTION __KN__.nightly(source text)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+  copy_name  text := 'kn_' || __KN__.base36((extract(epoch from clock_timestamp()) * 1000)::bigint);
+  plan       jsonb;
+  copy_plan  jsonb;
+  stand_ins  jsonb;
+  theirs     jsonb;
+  views      jsonb;
+  sown       jsonb;
+  seen       jsonb;
+  wrote      jsonb;
+  stranded   jsonb;
+  raced      jsonb;
+  findings   jsonb := '[]'::jsonb;
+  not_checked jsonb := '[]'::jsonb;
+  attempted  jsonb := '[]'::jsonb;
+  run_id     bigint;
+  why        text;
+BEGIN
+  BEGIN
+    plan := __KN__.read_schema(source);
+
+    IF jsonb_array_length(plan->'tables') = 0 THEN
+      INSERT INTO __KN__.runs (source, stopped)
+        VALUES (source, 'The schema "' || source || '" has no tables in it, so there was nothing to attack.')
+        RETURNING id INTO run_id;
+      RETURN run_id;
+    END IF;
+
+    IF jsonb_array_length(coalesce(plan->'unsupported', '[]'::jsonb)) > 0 THEN
+      INSERT INTO __KN__.runs (source, stopped)
+        VALUES (source, 'Parts of this app could not be copied faithfully: ' ||
+                        (plan->'unsupported')::text)
+        RETURNING id INTO run_id;
+      RETURN run_id;
+    END IF;
+
+    PERFORM __KN__.write_schema(plan, copy_name);
+    copy_plan := __KN__.read_schema(copy_name);
+
+    -- The stand-ins belong to this tool, not to the customer. Attacking them
+    -- would produce findings about a table that is not in their app.
+    SELECT coalesce(jsonb_agg(e->>'stub'), '[]'::jsonb) INTO stand_ins
+      FROM jsonb_array_elements(coalesce(plan->'external', '[]'::jsonb)) e;
+    SELECT coalesce(jsonb_agg(t), '[]'::jsonb) INTO theirs
+      FROM jsonb_array_elements(copy_plan->'tables') t
+     WHERE NOT (stand_ins ? (t->>'name'));
+
+    sown := __KN__.seed(copy_name, theirs);
+
+    -- Views have no rows of their own and are never seeded, which is exactly
+    -- why they matter: one over a protected table hands out every row in it
+    -- while the policy sits there intact.
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+             'name', v->>'name',
+             'columns', coalesce(v->'columns', '[]'::jsonb),
+             'constraints', '[]'::jsonb,
+             'rlsEnabled', false,
+             'isView', true)), '[]'::jsonb)
+      INTO views
+      FROM jsonb_array_elements(coalesce(copy_plan->'views', '[]'::jsonb)) v;
+
+    seen     := __KN__.impersonate(copy_name, theirs || views);
+    wrote    := __KN__.tamper(copy_name, theirs, sown->'seeded', copy_plan->'policies');
+    stranded := __KN__.orphan(copy_name, theirs, sown->'seeded');
+    raced    := __KN__.collide(copy_name, theirs, copy_plan->'indexes');
+
+    findings := (seen->'findings') || (wrote->'findings') || (stranded->'findings');
+
+    -- Everything genuinely attacked, so a re-check can tell a finding that was
+    -- fixed from one whose attack simply did not run this time.
+    attempted := coalesce(seen->'completed', '[]'::jsonb)
+              || coalesce(wrote->'completed', '[]'::jsonb)
+              || coalesce(stranded->'completed', '[]'::jsonb);
+
+    -- And everything that was not. Said out loud, never left out: a table
+    -- nothing could be put into reads exactly like a table nothing got out of.
+    not_checked := coalesce(sown->'skipped', '[]'::jsonb)
+                || coalesce(seen->'blocked', '[]'::jsonb)
+                || coalesce(wrote->'blocked', '[]'::jsonb)
+                || coalesce(stranded->'notTried', '[]'::jsonb)
+                || coalesce(raced->'notTried', '[]'::jsonb);
+
+    INSERT INTO __KN__.runs (source, attacks_run, findings, not_checked)
+      VALUES (source, jsonb_array_length(attempted), findings, not_checked)
+      RETURNING id INTO run_id;
+
+  EXCEPTION WHEN OTHERS THEN
+    why := SQLERRM;
+    INSERT INTO __KN__.runs (source, stopped) VALUES (source, why) RETURNING id INTO run_id;
+  END;
+
+  -- Dropped whatever happened above, including when it threw. A copy left in
+  -- the customer's database is the one thing this product promises never to
+  -- do, and a nightly job has nobody watching it.
+  BEGIN
+    EXECUTE 'DROP SCHEMA IF EXISTS ' || quote_ident(copy_name) || ' CASCADE';
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
+
+  RETURN run_id;
+END $$;
