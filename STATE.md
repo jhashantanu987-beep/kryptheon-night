@@ -16,9 +16,9 @@ looking at the screen, the other by looking at the database.
 | | `C:\Users\jhash\code\kryptheon-v1` | `C:\Users\jhash\code\kryptheon-night` |
 | --- | --- | --- |
 | what it is | the shipping CLI | the night shift |
-| npm | **published**, `kryptheon` 0.1.12 | **published**, `kryptheon-night` 0.1.2; 0.1.3 built, not yet pushed |
+| npm | **published**, `kryptheon` 0.1.12 | **published**, `kryptheon-night` 0.1.5 |
 | github | `jhashantanu987-beep/kryptheon-cli` | `jhashantanu987-beep/kryptheon-night` (private) |
-| commits | 3 | 21 |
+| commits | 3 | 40 |
 | built on | Playwright | Postgres |
 | commands | `record` `check` `accept` `remove` `setup-ai` | `npx kryptheon-night`, and `node scan.js` underneath it |
 
@@ -86,7 +86,8 @@ role, and changing role is the attack.
 | 2 | building the copy, in SQL | done |
 | 3 | seeding + impersonation, in SQL | done |
 | 4 | tampering + interruption + collision, in SQL | done |
-| 5 | the installer (`pg_cron` + `pg_net`) | **not started** |
+| 5 | the installer (`pg_cron`) | done |
+| 5b | posting a verdict (`pg_net`) | **not started** - no endpoint chosen |
 
 **Important and easy to misread: nothing in the engine has changed.** `scan.js`
 still runs the Node engine. The only thing that uses `sqlengine.js` is
@@ -394,11 +395,14 @@ anything.
 
 ## Open, and needing the user
 
-- **A Supabase project.** Needed twice over now. Slice 5 cannot be built or
-  tested anywhere else, and the front door has never been run against one:
-  every Supabase-specific decision in `trouble.js` and `connect.js` - the
-  session pooler, IPv6 on direct connections, the certificate authority - is
-  reasoned from documentation rather than measured. Free tier is enough.
+- **A second real app, written by somebody else.** There is a Supabase
+  project now and everything has been measured against it - but its schema
+  was written here, to contain the traps this product looks for. Pointing at
+  it found two serious bugs in an afternoon, which is the point: fixtures
+  miss the shapes real apps have, because the same hands write both. A
+  Lovable or Bolt app nobody here designed, handed over with nothing said
+  about what is in it, is the only thing left that can break this the way a
+  customer will.
 - **Nothing, to publish.** `kryptheon-night@0.1.2` on 2026-09-21, shasum
   `494428ad` - byte for byte the tarball `npm pack` builds here. Installed
   from the registry into an empty folder and run against a real Supabase
