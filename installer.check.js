@@ -19,6 +19,8 @@
 //     other job in it away too.
 
 const { Client } = require('pg');
+const { spawnSync } = require('child_process');
+const path = require('path');
 const installer = require('./installer.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
@@ -207,6 +209,85 @@ async function main() {
     check('9. the database is what it was before any of this', (() => {
       return differences(before, now);
     })());
+
+    /* ---- what the one command says about all this ---- */
+    //
+    // `install` is a verb, and a verb is a thing somebody has to find out
+    // about. Nobody who clicked Deploy in Lovable is going to read a list of
+    // subcommands, so the scan itself says what the nightly run is doing, or
+    // offers it. Three states, three different things to say, and the only
+    // way to know which one comes out is to run the command.
+    //
+    // A tiny app of its own, because these run the whole scan three times and
+    // the scan is as slow as the app is big.
+    const TINY = 'kn_offer_' + Date.now().toString(36);
+    const q = (name) => '"' + TINY + '"."' + name + '"';
+    const scanSays = (extraEnv) => {
+      const r = spawnSync(process.execPath, [
+        path.join(__dirname, 'bin', 'kryptheon-night.js'), '--schema', TINY, '--yes',
+      ], {
+        cwd: __dirname,
+        encoding: 'utf8',
+        timeout: 300000,
+        env: Object.assign({}, process.env, { KN_DATABASE_URL: CONNECTION }, extraEnv || {}),
+      });
+      return String(r.stdout || '') + String(r.stderr || '');
+    };
+
+    try {
+      await client.query('CREATE SCHEMA "' + TINY + '"');
+      await client.query('CREATE TABLE ' + q('notes') + ' (id serial PRIMARY KEY, body text NOT NULL)');
+      await client.query('GRANT SELECT, INSERT ON ' + q('notes') + ' TO anon, authenticated');
+      await client.query('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "' + TINY + '" TO anon, authenticated');
+      await client.query('GRANT USAGE ON SCHEMA "' + TINY + '" TO anon, authenticated');
+
+      const offered = scanSays();
+      check('10. with nothing installed, the scan says it could run nightly', (() => {
+        const problems = [];
+        if (!/every night|kryptheon-night install/.test(offered)) {
+          problems.push('it did not mention the nightly run at all');
+        }
+        return problems;
+      })());
+
+      // The default schema on purpose. The command only ever looks for
+      // `kryptheon` - there is no way to tell it about a test schema - so an
+      // install anywhere else is one it can never see. The first version of
+      // these three used SCHEMA, and both of them failed: the check was what
+      // was wrong, not the product.
+      await installer.install(client, { source: TINY });
+      const running = scanSays();
+      check('11. with it installed and running, the scan says so instead of offering', (() => {
+        const problems = [];
+        if (!/checking this every night/.test(running)) problems.push('it does not say the night is covered');
+        if (/Set that up\?|could run nightly/.test(running)) problems.push('it offered something already installed');
+        return problems;
+      })());
+
+      // The quiet failure: schema there, functions there, nothing scheduled.
+      // Everything looks installed and nothing happens, which is the state a
+      // person would never think to check.
+      const job = await client.query(
+        "SELECT jobid FROM cron.job WHERE jobname = 'kryptheon_nightly'",
+      ).catch(() => ({ rows: [] }));
+      for (const row of job.rows) {
+        await client.query('SELECT cron.unschedule($1::bigint)', [row.jobid]).catch(() => {});
+      }
+      const stalled = scanSays();
+      check('12. installed with nothing scheduled is said out loud, not passed over', (() => {
+        const problems = [];
+        if (!/nothing is scheduled|not running/.test(stalled)) {
+          problems.push('it did not say the nightly run is not running');
+        }
+        if (/checking this every night/.test(stalled)) {
+          problems.push('it claimed the night is covered when nothing is scheduled');
+        }
+        return problems;
+      })());
+    } finally {
+      await installer.uninstall(client, {}).catch(() => {});
+      await client.query('DROP SCHEMA IF EXISTS "' + TINY + '" CASCADE').catch(() => {});
+    }
   } finally {
     // Whatever happened above, leave nothing of ours - including when the
     // thing being tested is the part that is broken.

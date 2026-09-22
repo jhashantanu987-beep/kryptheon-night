@@ -41,15 +41,20 @@ function usage() {
     '',
     '  kryptheon-night - attacks a copy of your database and tells you what got in.',
     '',
-    '  Run it with nothing and it will ask you for what it needs:',
+    '  There is one command. It asks for what it needs:',
     '',
     '      npx kryptheon-night',
     '',
-    '  Or let it do the same thing every night, from inside your database:',
+    '  Run it again after you fix something and it tells you what is actually',
+    '  closed - you do not have to ask it to. It also offers to do the same',
+    '  check every night from inside your database, and says so if it already',
+    '  is. Nothing below is needed to use this.',
     '',
-    '      npx kryptheon-night install     set up the nightly run',
+    '  For scripts, and for people who like knowing:',
+    '',
     '      npx kryptheon-night night       read back the last night it ran',
     '      npx kryptheon-night status      is it installed, and is it running',
+    '      npx kryptheon-night install     set the nightly run up without being asked',
     '      npx kryptheon-night uninstall   take it all out again',
     '',
     '  The nightly run needs pg_cron and pg_net. Supabase has both. It cannot',
@@ -58,11 +63,11 @@ function usage() {
     '',
     '  Options, none of them necessary:',
     '',
-    '      --recheck        run the same attacks again after a fix, and say',
-    '                       which problems are actually closed',
     '      --schema NAME    the part of the database your app lives in.',
     '                       Leave it out; it is "public" for almost everyone',
     '      --yes            skip the "may I?" question. For scripts only',
+    '      --recheck        nothing any more - comparing against the last run',
+    '                       happens by itself. Kept so scripts do not break',
     '      --help           this',
     '',
     '  The connection string can be put in KN_DATABASE_URL instead of being',
@@ -218,6 +223,105 @@ async function runVerb(command, client, target) {
   throw new Error('there is no command called ' + command);
 }
 
+/**
+ * After the report: say what the nightly run is doing, or offer it.
+ *
+ * Three states and each says something different. Installed and running gets
+ * one line, because it is working and nobody needs a paragraph about it.
+ * Installed with no job is the quiet failure - the schema is there, the
+ * functions are there, and nothing runs - so it says so plainly. Not
+ * installed gets the offer.
+ *
+ * Nothing here can make the scan fail. Whatever happens, the person has
+ * already been given their answer, and losing it to an error about a nightly
+ * job they never asked for would be the tool wasting the only thing it did.
+ */
+async function offerTheNight(client, target, canAsk) {
+  let where = null;
+  try {
+    where = await installer.status(client, {});
+  } catch (err) {
+    return;
+  }
+
+  if (where && where.job) {
+    line('  I am also checking this every night, at ' + where.job.schedule + '.');
+    line('  Read the last one with:  npx kryptheon-night night');
+    line('');
+    return;
+  }
+
+  if (where && !where.job) {
+    line('  The nightly check is installed here but nothing is scheduled, so it');
+    line('  is not running. Setting it up again would fix that:');
+    line('');
+    line('      npx kryptheon-night install');
+    line('');
+    return;
+  }
+
+  if (!canAsk) {
+    // Nobody to ask. Said once, quietly, rather than nagging a log file.
+    line('  This can also run every night by itself:  npx kryptheon-night install');
+    line('');
+    return;
+  }
+
+  const can = await installer.extensionState(client, 'pg_net').catch(() => ({ available: false }));
+  const cron = await installer.extensionState(client, 'pg_cron').catch(() => ({ available: false }));
+  if (!can.available || !cron.available) {
+    // Not offered where it cannot happen. An offer that fails when accepted
+    // is worse than no offer.
+    return;
+  }
+
+  line('  One more thing.');
+  line('');
+  line('  What you just read is true about your app right now. It stops being');
+  line('  true the next time anybody changes it - and that is the day nobody');
+  line('  runs this. I can do exactly the same check every night, from inside');
+  line('  your database, and have the answer waiting.');
+  line('');
+  const yes = await intro.askYesNo('  Set that up? (y/n) ');
+  if (!yes) {
+    line('');
+    line('  Fine. It is here if you change your mind:');
+    line('      npx kryptheon-night install');
+    line('');
+    return;
+  }
+
+  block(intro.installConsentLines(installer.SCHEMA, target, installer.AT));
+  const sure = await intro.askYesNo('  Go ahead? (y/n) ');
+  if (!sure) {
+    line('');
+    line('  Left alone. Nothing was installed.');
+    line('');
+    return;
+  }
+
+  try {
+    const done = await installer.install(client, { source: target });
+    line('');
+    line('  Done. It will run at ' + done.at + ', watching "' + done.source + '".');
+    if (done.made.extensions.length) {
+      line('  I added ' + done.made.extensions.join(' and ') + '; uninstall takes them back out.');
+    }
+    line('');
+    line('  Tomorrow:    npx kryptheon-night night');
+    line('  To remove:   npx kryptheon-night uninstall');
+    line('');
+  } catch (err) {
+    // The scan still stands. Say what failed and leave it at that.
+    line('');
+    line('  I could not set up the nightly run: ' + String(err.message).split('\n')[0]);
+    line('');
+    line('  The report above is still good. Nothing was left half-installed.');
+    line('');
+    await installer.uninstall(client, {}).catch(() => {});
+  }
+}
+
 /** Prints a block of plain lines with the indent the rest of the report uses. */
 function block(lines, write) {
   (write || line)('');
@@ -311,17 +415,31 @@ async function main() {
     }
   }
 
+  // Compared against last time whenever there IS a last time, without being
+  // asked.
+  //
+  // `--recheck` was a flag, and a flag is a thing somebody has to know about.
+  // The person this is for fixed what the report told them to fix and typed
+  // the same command again - and got a fresh report that said the same number
+  // of problems, with no word about which of them they had just closed. The
+  // tool knew. It had the file. It waited to be asked.
+  //
+  // The flag still works, because anything scripted may be passing it, and
+  // now it changes nothing: with an earlier run here, this always compares.
   const file = path.resolve(scanner.LAST_RUN);
-  const before = asked.recheck ? scanner.loadLastRun(file) : null;
+  const before = scanner.loadLastRun(file);
   if (asked.recheck && !before) {
+    // Asked for explicitly and impossible, which is worth saying. Arriving
+    // here by accident is not: without the flag, no earlier run simply means
+    // this is the first one.
     fail('');
     fail('  There is no earlier run in this folder to compare against.');
     fail('');
-    fail('  --recheck proves a fix worked by running the same attacks again and');
+    fail('  A re-check proves a fix worked by running the same attacks again and');
     fail('  comparing. With nothing to compare against it would report every');
     fail('  problem as new, which would look like an answer and would not be one.');
     fail('');
-    fail('  Run it without --recheck first.');
+    fail('  Run it once first, and it will compare by itself from then on.');
     fail('');
     process.exit(2);
   }
@@ -372,15 +490,25 @@ async function main() {
       scanner.report(result);
       scanner.saveRun(file, result);
       process.exitCode = result.stopped ? 2 : result.findings.length ? 1 : 0;
-      return;
+    } else {
+      const verdict = recheck.compare(before, result);
+      recheck.describe(verdict).forEach(line);
+      recheck.badgeLines(verdict, result.attacksRun || 0).forEach(line);
+      if (result.findings.length) scanner.report(result);
+      scanner.saveRun(file, result);
+      process.exitCode = result.stopped ? 2 : verdict.allClear ? 0 : 1;
     }
 
-    const verdict = recheck.compare(before, result);
-    recheck.describe(verdict).forEach(line);
-    recheck.badgeLines(verdict, result.attacksRun || 0).forEach(line);
-    if (result.findings.length) scanner.report(result);
-    scanner.saveRun(file, result);
-    process.exitCode = result.stopped ? 2 : verdict.allClear ? 0 : 1;
+    // And then the only other thing worth doing, offered rather than
+    // documented.
+    //
+    // `install` was a verb, and a verb is a thing somebody has to find out
+    // about. Nobody who clicked Deploy in Lovable is going to read a list of
+    // subcommands - they will run this once, get their answer, and never
+    // think about it again, which is exactly the app that is unprotected
+    // three months later. The tool already knows whether the nightly run is
+    // there. So it asks.
+    if (!result.stopped) await offerTheNight(client, target, canAsk);
   } catch (err) {
     // Anything that went wrong mid-scan. The copy has already been dropped by
     // the `finally` inside the scan itself, so there is nothing to clean up

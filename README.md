@@ -76,18 +76,24 @@ attacks, this time, lost*.
 
 ## Prove the fix worked
 
-Paste the fix into Lovable or Cursor, let it deploy, then:
+Paste the fix into Lovable or Cursor, let it deploy, then run the same command
+again:
 
 ```
-npx kryptheon-night --recheck
+npx kryptheon-night
 ```
 
-It runs the same attacks again and compares. A problem that *disappeared* is
-not the same as a problem that was *fixed* — if a table could not be tested
-this time, or is no longer there, it says so rather than crediting you with a
-fix. Close everything, with nothing left untested, and it hands out a badge.
+It compares by itself — there is no flag to remember. A problem that
+*disappeared* is not the same as a problem that was *fixed*: if a table could
+not be tested this time, or is no longer there, it says so rather than
+crediting you with a fix. Close everything, with nothing left untested, and it
+hands out a badge.
 
 ## Or let it run every night, on its own
+
+You do not have to go looking for this — the command above offers it once the
+report is on the screen, and tells you if it is already running. If you would
+rather just say so:
 
 ```
 npx kryptheon-night install
