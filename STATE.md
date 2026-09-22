@@ -414,9 +414,11 @@ anything.
   *news*, never data - "Kryptheon found 3 things, run `kryptheon night` to see
   them" - no table names, nothing. That still needs somewhere to post to;
   Render is already in use for the site.
-- **The site claims a feature that does not exist.** `kryptheon.tech` and the
-  Instagram posts describe "causal chain analysis" / root-cause mapping.
-  Checked: the string `causal`, `root cause`, `domino` and `bug family` appear
-  nowhere in `kryptheon-v1`. The whole positioning rests on being honest
-  ("nothing leaves your machine", "the spec is yours to read"), and a feature
-  that is not there spends that.
+- **The site does not mention the night shift at all.** Checked on 2026-09-22:
+  `kryptheon.tech` describes v1 and only v1 - recording a flow, replaying it,
+  "A page that loads is not a page that works". Nothing about Postgres, row
+  level security, or the thing that has been published four times this week.
+  The earlier note here said the site claimed "causal chain analysis" it did
+  not have; that is no longer on the page, so the honesty problem is gone and
+  a plainer one is left in its place: the newer half of the product is
+  invisible to everybody who arrives.
