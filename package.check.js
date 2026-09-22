@@ -198,6 +198,41 @@ function main() {
       return { out: String(r.stdout || '') + String(r.stderr || ''), code: r.status };
     };
 
+    // What the require graph cannot see.
+    //
+    // Checks 1 and 5 follow `require()`, and `sqlengine.js` does not require
+    // `engine.sql` - it reads it with readFileSync at the moment somebody
+    // installs the nightly run. So the graph is satisfied, the install is
+    // complete as far as every static check goes, and the first customer to
+    // type `kryptheon-night install` gets ENOENT.
+    //
+    // There is no way to find that by reading the requires, so it is not
+    // looked for: the installed copy is asked to produce the engine, which is
+    // the thing that would fail.
+    check('5b. files the code reads rather than requires came too', (() => {
+      const problems = [];
+      const root = path.dirname(path.dirname(command));
+      const probe = spawnSync(process.execPath, [
+        '-e',
+        'const s = require(' + JSON.stringify(path.join(root, 'sqlengine.js')) + ');' +
+        'const text = s.engineFor("kn_probe");' +
+        'process.stdout.write(String(text.length));',
+      ], { encoding: 'utf8', timeout: 60000 });
+      if (probe.status !== 0) {
+        // The line that says what went wrong, not the last line - node ends
+        // its stack traces with its own version number, and reporting that
+        // as the reason is how a real fault reads like noise.
+        const said = String(probe.stderr || '').split('\n')
+          .map((l) => l.trim())
+          .filter((l) => /Error|ENOENT|Cannot find/.test(l));
+        problems.push('the installed copy cannot build the engine: ' +
+          (said[0] || 'it exited ' + probe.status + ' and said nothing'));
+      } else if (Number(probe.stdout) < 1000) {
+        problems.push('the engine it built is ' + probe.stdout + ' characters, which is not an engine');
+      }
+      return problems;
+    })());
+
     const help = run(['--help']);
     check('6. --help works from the installed copy', (() => {
       const problems = [];

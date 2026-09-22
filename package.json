@@ -20,7 +20,10 @@
     "intro.js",
     "trouble.js",
     "connect.js",
-    "README.md"
+    "README.md",
+    "installer.js",
+    "sqlengine.js",
+    "engine.sql"
   ],
   "engines": {
     "node": ">=18.0.0"

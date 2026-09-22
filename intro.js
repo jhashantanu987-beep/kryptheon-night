@@ -98,6 +98,57 @@ function consentLines(target) {
   ];
 }
 
+/**
+ * What staying costs, said before anything is left behind.
+ *
+ * The scan's consent screen above ends "I do not leave anything behind", and
+ * that is true of a scan and false of an install. Reusing it here would be
+ * the product lying on the one screen it exists to be honest on, so this is
+ * its own text and says the opposite plainly, first.
+ *
+ * Everything that gets left is named, because "it installs a few things" is
+ * the sentence somebody agrees to and then finds a `cron` schema they did not
+ * recognise. And the way out is on the screen where they say yes, not in a
+ * README they will not read again.
+ */
+function installConsentLines(schema, source, at) {
+  return [
+    'This one stays. Everything else this tool does is temporary; this is not.',
+    '',
+    'What I will leave in your database:',
+    '',
+    '  - A schema called "' + schema + '", holding the functions that do the',
+    '    checking. No data of yours goes in it.',
+    '',
+    '  - Two Postgres extensions, if they are not already there: pg_cron, which',
+    '    runs things on a schedule, and pg_net. Supabase provides both.',
+    '',
+    '  - One scheduled job, named kryptheon_nightly, set to ' + at + '.',
+    '',
+    'What it will do, every night:',
+    '',
+    '  - Exactly what the scan does now - copy the shape of your "' + source + '"',
+    '    tables into a temporary space, put two made-up people in it, attack',
+    '    that, write down what got through, and delete the copy.',
+    '',
+    '  - It still never reads your real data, and still sends nothing anywhere.',
+    '    Nothing leaves your database, because the checking happens inside it.',
+    '',
+    'One thing it cannot do:',
+    '',
+    '  - It cannot race two requests against each other, which is how the',
+    '    "can this exist twice" question is answered. That needs two',
+    '    connections at the same instant, and nothing living inside a database',
+    '    has them. The nightly report names every column it could not race.',
+    '    Running the command by hand still tests them properly.',
+    '',
+    'To take it all away again:  npx kryptheon-night uninstall',
+    '',
+    'That removes the job, the schema, and any extension I had to add - and',
+    'leaves alone anything that was already here.',
+  ];
+}
+
 /** Asks a question and hands back what was typed. */
 function ask(question) {
   return new Promise((resolve) => {
@@ -191,6 +242,7 @@ async function askForConnection(say) {
 module.exports = {
   whereToFindIt: whereToFindIt,
   consentLines: consentLines,
+  installConsentLines: installConsentLines,
   ask: ask,
   askSecret: askSecret,
   askYesNo: askYesNo,

@@ -30,6 +30,8 @@ const recheck = require('../recheck.js');
 const intro = require('../intro.js');
 const trouble = require('../trouble.js');
 const { howToConnect } = require('../connect.js');
+const installer = require('../installer.js');
+const finding = require('../finding.js');
 
 const line = (text) => process.stdout.write(text + '\n');
 const fail = (text) => process.stderr.write(text + '\n');
@@ -42,6 +44,17 @@ function usage() {
     '  Run it with nothing and it will ask you for what it needs:',
     '',
     '      npx kryptheon-night',
+    '',
+    '  Or let it do the same thing every night, from inside your database:',
+    '',
+    '      npx kryptheon-night install     set up the nightly run',
+    '      npx kryptheon-night night       read back the last night it ran',
+    '      npx kryptheon-night status      is it installed, and is it running',
+    '      npx kryptheon-night uninstall   take it all out again',
+    '',
+    '  The nightly run needs pg_cron and pg_net. Supabase has both. It cannot',
+    '  race two requests at once, so it is weaker than this command for the',
+    '  "can this exist twice" question, and its report says which columns.',
     '',
     '  Options, none of them necessary:',
     '',
@@ -58,9 +71,17 @@ function usage() {
   ];
 }
 
+// The things this can be asked to do besides scan. Kept to verbs nobody
+// names a schema: `public` is the schema almost everybody has, and a bare
+// word that is not one of these is still read as a schema so that
+// `kryptheon-night public` keeps working.
+const VERBS = ['install', 'uninstall', 'status', 'night'];
+
 /** What was asked for, and what was left to the default. */
 function readArgs(argv) {
-  const asked = { schema: null, recheck: false, yes: false, help: false, unknown: [] };
+  const asked = {
+    command: 'scan', schema: null, recheck: false, yes: false, help: false, unknown: [],
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--recheck') asked.recheck = true;
@@ -69,12 +90,132 @@ function readArgs(argv) {
     else if (arg === '--schema') asked.schema = argv[++i] || null;
     else if (arg.startsWith('--schema=')) asked.schema = arg.slice('--schema='.length);
     else if (arg.startsWith('-')) asked.unknown.push(arg);
-    // A bare word is the schema, so that somebody who has read the old
-    // instructions and types `kryptheon-night public` is not told off.
+    // The first bare word is a verb if it is one, and otherwise the schema -
+    // so that somebody who has read the old instructions and types
+    // `kryptheon-night public` is not told off. Anybody whose schema really
+    // is called `status` can say so with --schema.
+    else if (asked.command === 'scan' && !asked.schema && VERBS.includes(arg)) asked.command = arg;
     else if (!asked.schema) asked.schema = arg;
     else asked.unknown.push(arg);
   }
   return asked;
+}
+
+/**
+ * The three doors that are not a scan.
+ *
+ * Each returns the exit code, because anything automating this reads those
+ * and not the words: 0 for nothing got through or nothing to say, 1 for
+ * something did, 2 for could not.
+ */
+async function runVerb(command, client, target) {
+  if (command === 'status') {
+    const where = await installer.status(client, {});
+    if (!where) {
+      line('  The nightly run is not installed in this database.');
+      line('');
+      line('  npx kryptheon-night install   would set it up.');
+      line('');
+      return 0;
+    }
+    line('  Installed, and watching "' + where.source + '".');
+    line('');
+    if (where.job) {
+      line('    job        ' + where.job.jobname + '   ' + where.job.schedule +
+        (where.job.active ? '' : '   (NOT ACTIVE)'));
+    } else {
+      // The one failure that looks like success from every other angle: the
+      // schema is there, the functions are there, and nothing is running.
+      line('    job        MISSING - nothing is scheduled, so nothing runs');
+    }
+    line('    schema     ' + where.schema);
+    line('    since      ' + new Date(where.installed_at).toISOString().slice(0, 16).replace('T', ' '));
+    line('');
+    const { rows } = await client.query(
+      'SELECT count(*)::int AS n, max(ran_at) AS last FROM ' +
+        '"' + String(where.schema).split('"').join('""') + '".runs',
+    ).catch(() => ({ rows: [{ n: 0, last: null }] }));
+    line('    runs       ' + rows[0].n +
+      (rows[0].last ? '   last ' + new Date(rows[0].last).toISOString().slice(0, 16).replace('T', ' ') : ''));
+    line('');
+    return where.job ? 0 : 1;
+  }
+
+  if (command === 'install') {
+    line('  Installing ...');
+    const done = await installer.install(client, { source: target });
+    line('');
+    line('  Installed. It will run at ' + done.at + ', watching "' + done.source + '".');
+    line('');
+    if (done.made.extensions.length) {
+      line('  I had to add: ' + done.made.extensions.join(', ') + '.');
+      line('  Removing Kryptheon will take those back out again.');
+      line('');
+    }
+    line('  Tomorrow morning:  npx kryptheon-night night');
+    line('  To remove it:      npx kryptheon-night uninstall');
+    line('');
+    return 0;
+  }
+
+  if (command === 'uninstall') {
+    const was = await installer.status(client, {});
+    if (!was) {
+      line('  There is nothing installed here to remove.');
+      line('');
+      return 0;
+    }
+    const removed = await installer.uninstall(client, {});
+    line('  Removed.');
+    line('');
+    line('    the nightly job   ' + (removed.job ? 'gone' : 'there was none'));
+    line('    the schema        ' + (removed.schema ? 'gone' : 'left, it was not mine to drop'));
+    line('    extensions        ' + (removed.extensions.length
+      ? removed.extensions.join(', ') + ' - the ones I added'
+      : 'none removed; they were here before me'));
+    line('');
+    return 0;
+  }
+
+  if (command === 'night') {
+    const where = await installer.status(client, {});
+    if (!where) {
+      line('  The nightly run is not installed in this database, so there is');
+      line('  nothing to read back.');
+      line('');
+      line('  npx kryptheon-night          would scan it now.');
+      line('  npx kryptheon-night install  would set up the nightly run.');
+      line('');
+      return 2;
+    }
+    const quoted = '"' + String(where.schema).split('"').join('""') + '"';
+    const { rows } = await client.query(
+      'SELECT ran_at, source, stopped, attacks_run, findings, not_checked ' +
+        'FROM ' + quoted + '.runs ORDER BY ran_at DESC LIMIT 1',
+    );
+    if (!rows.length) {
+      // Installed and never run is not the same as run and found nothing, and
+      // saying "nothing got through" here would be the worst sentence in the
+      // product printed about a night that never happened.
+      line('  It is installed, and it has not run yet.');
+      line('');
+      line('  The first run is at ' + (where.job ? where.job.schedule : 'whenever it is scheduled') + '.');
+      line('');
+      return 0;
+    }
+    const run = rows[0];
+    line('  From the night of ' + new Date(run.ran_at).toISOString().slice(0, 16).replace('T', ' ') +
+      ', on "' + run.source + '":');
+    scanner.report({
+      stopped: run.stopped,
+      attacksRun: run.attacks_run,
+      notChecked: run.not_checked || [],
+      findings: finding.describeAll(run.findings || []),
+    });
+    return run.stopped ? 2 : (run.findings || []).length ? 1 : 0;
+  }
+
+  throw new Error('there is no command called ' + command);
 }
 
 /** Prints a block of plain lines with the indent the rest of the report uses. */
@@ -141,7 +282,11 @@ async function main() {
   line('');
   line('  Database: ' + trouble.withoutSecret(connection));
 
-  if (!asked.yes) {
+  // Reading does not need permission; changing does. `status` and `night` only
+  // read what is already written down, so asking would be ceremony.
+  const needsAYes = asked.command === 'scan' || asked.command === 'install';
+
+  if (needsAYes && !asked.yes) {
     if (!canAsk) {
       fail('');
       fail('  I will not connect to your database without being told yes, and');
@@ -151,7 +296,12 @@ async function main() {
       fail('');
       process.exit(2);
     }
-    block(intro.consentLines(target));
+    // Two different screens, because they promise different things. The scan's
+    // ends "I do not leave anything behind", which is true of a scan and false
+    // of an install - and this is the one screen the product cannot be loose on.
+    block(asked.command === 'install'
+      ? intro.installConsentLines(installer.SCHEMA, target, installer.AT)
+      : intro.consentLines(target));
     const yes = await intro.askYesNo('  Go ahead? (y/n) ');
     if (!yes) {
       line('');
@@ -190,6 +340,20 @@ async function main() {
 
   line('  Connected.');
   line('');
+
+  // The other three doors. Each one ends the command; only `scan` falls
+  // through to the attack below.
+  if (asked.command !== 'scan') {
+    try {
+      process.exitCode = await runVerb(asked.command, client, target);
+    } catch (err) {
+      block(trouble.explain(err, connection), fail);
+      process.exitCode = 2;
+    } finally {
+      await client.end().catch(() => {});
+    }
+    return;
+  }
 
   try {
     const result = await scanner.scan(client, target, {
