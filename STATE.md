@@ -133,18 +133,33 @@ kryptheon-night` is already one command with no install step.
 
 ### The next decision
 
-Two orders are possible and the choice matters:
+**A is done, in the sense that mattered.** `scan()` takes an engine now -
+six operations - and `sqlengine.adapterFor()` is those six in SQL.
+`engines.check.js` runs the whole scan twice, once down each, and compares the
+report a person would be handed; they come out identical. The collision race
+is deliberately outside that interface and stays in Node, because two requests
+in flight need two connections and nothing inside the database can have them.
 
-- **A. make `scan.js` use the SQL engine.** Two engines exist and only one is
-  used; the unused one rots however good the twin check is. This is what makes
-  both doors *actually* one engine rather than one on paper. Expect a
-  decision here: `scan.js` passes `openSession` for the collision race, which
-  the SQL engine cannot have (see below).
-- **B. build the installer.** Needs a real Supabase project - it cannot be
-  tested on Neon, measured below.
+**Be careful what that does not mean.** The npx door still runs the node
+engine by default, and neither `engine.sql` nor `sqlengine.js` is in the
+published package - so nothing a customer installs has changed. Flipping the
+default would mean installing a schema of functions into their database on
+every run, and that deserves its own decision rather than arriving as a side
+effect. The reason to flip it is the installer, which is B.
 
-A before B was the recommendation, so that a problem in the SQL engine is
-found once rather than in two places.
+What is left:
+
+- **B. the installer** (`pg_cron` + `pg_net`). No longer blocked: a real
+  Supabase project exists and has been scanned end to end. This is the door
+  where the engine has to live in the database, so it is also what decides
+  whether the npx door follows.
+
+A before B earned itself. Reaching for the SQL engine from `scan.js` found
+three things in one afternoon that the twin check could not see: it was
+building its copy against the customer's own tables, drawing the copy's keys
+from the customer's sequences, and returning no `rules`, so every write
+finding would have been explained with the fallback. All three were found once
+rather than twice.
 
 ---
 
