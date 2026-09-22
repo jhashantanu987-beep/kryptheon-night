@@ -7,38 +7,6 @@ database, not read off the code.
 
 ---
 
-## Stopped here, 2026-09-22 ~01:00
-
-Work is committed and the database is clean. Nothing is half-done in the repo;
-what is half-done is the verification.
-
-**Resume with the four suites that did not get to run:**
-
-    KN_DATABASE_URL=postgresql://...  bash scratchpad/suite-retry.sh shapes verdicts loop twin
-
-These ten passed, after the search_path fix, and do not need running again
-unless the code changes:
-
-| | | | |
-| --- | --- | --- | --- |
-| untouched ✓5 | blocked ✓4 | orphans ✓6 | guests ✓11 |
-| usable ✓6 | external ✓5 | schema ✓11 | collision ✓16 |
-| tamper ✓11 | orphan ✓13 | | |
-
-`npm run check:dry` was green too, at 64 checks. Budget about fifty minutes for
-the four that are left: `shapes` alone is twenty, and it is latency rather than
-work - see the 340 ms measurement below.
-
-**Then**, and only if all four are green: publish 0.1.3. The published 0.1.2
-advances a customer's sequences on any app that lives in `public`, which is
-every real one.
-
-Two throwaway Neon databases were claimed for this and **expire 2026-09-24**:
-one for the suites, one for the demo schemas `app_rls` and `app_no_rls`. Claim
-new ones with `neon claim create --env-pull` when they go.
-
----
-
 ## Two folders, one product
 
 Kryptheon is **one product being upgraded**, not two products. Both halves
@@ -48,7 +16,7 @@ looking at the screen, the other by looking at the database.
 | | `C:\Users\jhash\code\kryptheon-v1` | `C:\Users\jhash\code\kryptheon-night` |
 | --- | --- | --- |
 | what it is | the shipping CLI | the night shift |
-| npm | **published**, `kryptheon` 0.1.12 | **published**, `kryptheon-night` 0.1.2 |
+| npm | **published**, `kryptheon` 0.1.12 | **published**, `kryptheon-night` 0.1.2; 0.1.3 built, not yet pushed |
 | github | `jhashantanu987-beep/kryptheon-cli` | `jhashantanu987-beep/kryptheon-night` (private) |
 | commits | 3 | 21 |
 | built on | Playwright | Postgres |
@@ -339,6 +307,14 @@ of them was bought with a bug.
   and the tarball is now checked on disk.
 - **`npx <path-to-tarball>` silently does nothing** and exits 0. Use `npx -y
   --package="<tarball>" -- kryptheon-night`, or install it first.
+- **A sweep run straight after killing something proves nothing.** The sweep
+  cannot see what an uncommitted transaction is building. A run was stopped,
+  every `node` process confirmed gone, the database swept, and `kn_ left: 0`
+  read back - and the next morning two schemas and an `auth.users` were
+  sitting there, timestamped to the minute the run was killed. The dying
+  process had them in an open transaction the whole time, and committed on its
+  way out. Sweep, then look again later, or refuse to sweep at all while any
+  other connection is open.
 - **Killing a run leaves its connections and its schemas behind.** Stopping
   the wrapper does not stop the `node` it spawned: two backends sat idle on
   the database and four `kn_*` schemas stayed in it. It is the same disease as
