@@ -113,6 +113,35 @@ function suggest(schemas) {
 }
 
 /**
+ * The engine, as six operations, so the scan does not know which one it has.
+ *
+ * `scan.js` named `schema.js`, `attack.js`, `tamper.js` and `orphan.js`
+ * directly, which meant the SQL engine could only ever be reached by the twin
+ * check. Two engines and one of them never on the real path is how the unused
+ * one rots however good the comparison is.
+ *
+ * Deliberately not included: the collision race. It needs two requests in
+ * flight at once, which needs two connections, and no credential ever moves
+ * into the database - so the SQL engine cannot have it and says so. The scan
+ * keeps racing for real down `openSession` whichever engine it is given, and
+ * the report says what could not be raced when there is no second connection.
+ * That is the one place the two doors are honestly not the same, and it is
+ * named rather than papered over.
+ */
+function nodeEngine() {
+  return {
+    name: 'node',
+    readSchema: (client, target) => schema.readSchema(client, target),
+    writeSchema: (client, plan, into) => schema.writeSchema(client, plan, into),
+    seed: (client, into, tables) => attack.seed(client, into, tables),
+    impersonate: (client, into, tables) => attack.impersonate(client, into, tables),
+    tamper: (client, into, tables, seeded, policies) =>
+      tamper.tamper(client, into, tables, seeded, policies),
+    orphan: (client, into, tables, seeded) => orphan.orphan(client, into, tables, seeded),
+  };
+}
+
+/**
  * Runs the whole thing and hands back what got through.
  *
  * The copy is dropped in a `finally`, so a crash halfway does not leave a
@@ -122,6 +151,8 @@ async function scan(client, sourceSchema, options) {
   const opts = options || {};
   const copyName = 'kn_' + Date.now().toString(36);
   const say = opts.quiet ? () => {} : line;
+  // Whichever engine the caller handed over, or the one built in.
+  const engine = opts.engine || nodeEngine();
 
   // Anything an earlier run could not clean up after itself. The copy is
   // dropped in a `finally`, but a `finally` needs a connection: when the link
@@ -147,7 +178,7 @@ async function scan(client, sourceSchema, options) {
   }
 
   say('  Reading the shape of ' + sourceSchema + ' ...');
-  const plan = await schema.readSchema(client, sourceSchema);
+  const plan = await engine.readSchema(client, sourceSchema);
 
   if (!plan.tables.length) {
     // Nothing wrong with the database, but nothing was tested either, and
@@ -171,8 +202,8 @@ async function scan(client, sourceSchema, options) {
   say('  ' + plan.tables.length + ' tables, ' + plan.policies.length + ' rules. Building a copy ...');
 
   try {
-    await schema.writeSchema(client, plan, copyName);
-    const copyPlan = await schema.readSchema(client, copyName);
+    await engine.writeSchema(client, plan, copyName);
+    const copyPlan = await engine.readSchema(client, copyName);
 
     // The copy has to be the app, or nothing that follows means anything.
     const differences = schema.diffSchemas(plan, copyPlan);
@@ -192,7 +223,7 @@ async function scan(client, sourceSchema, options) {
     // from every attack, and a table nobody attacks has nothing to report.
     const standIns = new Set((plan.external || []).map((entry) => entry.stub));
     const theirs = copyPlan.tables.filter((table) => !standIns.has(table.name));
-    const sown = await attack.seed(client, copyName, theirs);
+    const sown = await engine.seed(client, copyName, theirs);
 
     // Views are read but never seeded: they have no rows of their own, they
     // show the rows of the tables underneath. That is exactly why they matter
@@ -206,7 +237,7 @@ async function scan(client, sourceSchema, options) {
       rlsEnabled: false,
       isView: true,
     }));
-    const impersonation = await attack.impersonate(client, copyName, theirs.concat(views));
+    const impersonation = await engine.impersonate(client, copyName, theirs.concat(views));
 
     // Every attack genuinely run, named the way a finding is named. The
     // re-check needs this: a finding that disappears because its attack never
@@ -246,7 +277,7 @@ async function scan(client, sourceSchema, options) {
     // The copy's own policies, not the app's - they are the same rules, and
     // the copy is what was actually attacked. The report needs them to say
     // which rule let a write through rather than assuming one.
-    const writes = await tamper.tamper(client, copyName, theirs, sown.seeded, copyPlan.policies);
+    const writes = await engine.tamper(client, copyName, theirs, sown.seeded, copyPlan.policies);
     for (const key of writes.completed) attempted.push(key);
     for (const stuck of writes.blocked) {
       notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });
@@ -254,7 +285,7 @@ async function scan(client, sourceSchema, options) {
 
     // Can a half-finished write survive? Rolled back like the writes above.
     say('  Looking for rows that could point at nothing ...');
-    const stranded = await orphan.orphan(client, copyName, theirs, sown.seeded);
+    const stranded = await engine.orphan(client, copyName, theirs, sown.seeded);
     for (const key of stranded.completed) attempted.push(key);
     for (const missed of stranded.notTried) {
       notChecked.push({

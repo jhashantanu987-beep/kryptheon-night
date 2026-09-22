@@ -141,6 +141,31 @@ async function collide(client, target, into, tables, indexes) {
 }
 
 /**
+ * The same six operations `scan.js` asks of an engine, done in SQL.
+ *
+ * Handed an engine schema that is already installed, because installing and
+ * removing it is the caller's business - `withEngine` below - and a scan
+ * should not have to know that this engine needs putting somewhere first.
+ *
+ * `collide` is not among them. The scan races two real requests down two real
+ * connections, which is something no engine living inside the database can do;
+ * that is measured and written up in STATE.md, and the report names what it
+ * could not race rather than leaving it out.
+ */
+function adapterFor(target) {
+  return {
+    name: 'sql',
+    readSchema: (client, source) => readSchema(client, target, source),
+    writeSchema: (client, plan, into) => writeSchema(client, target, plan, into),
+    seed: (client, into, tables) => seed(client, target, into, tables),
+    impersonate: (client, into, tables) => impersonate(client, target, into, tables),
+    tamper: (client, into, tables, sown, policies) =>
+      tamper(client, target, into, tables, sown, policies),
+    orphan: (client, into, tables, sown) => orphan(client, target, into, tables, sown),
+  };
+}
+
+/**
  * Installs the engine, does something with it, and takes it away.
  *
  * The schema is named for the moment it was made, the same as the copy is, so
@@ -170,5 +195,6 @@ module.exports = {
   tamper: tamper,
   orphan: orphan,
   collide: collide,
+  adapterFor: adapterFor,
   withEngine: withEngine,
 };

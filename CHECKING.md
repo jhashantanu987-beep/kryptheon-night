@@ -1,6 +1,6 @@
 # Running the checks
 
-Nineteen suites. Run them after every change, not at the end.
+Twenty suites. Run them after every change, not at the end.
 
     set KN_DATABASE_URL=postgresql://...
     npm run check
@@ -28,6 +28,7 @@ every time a word of the product is edited:
 | `tamper.check.js` | yes | "a stranger can change this" is only said when it can |
 | `orphan.check.js` | yes | "this can point at nothing" is only said where a key belongs |
 | `twin.check.js` | yes | the two engines are one engine, and stay one |
+| `engines.check.js` | yes | and the same report comes out of either |
 | `shapes.check.js` | yes | every shape a real app has can be tested at all |
 | `verdicts.check.js` | yes | the answer is right, not merely produced |
 | `loop.check.js` | yes | the whole thing, through the real command |
@@ -36,6 +37,20 @@ The ones that need a database build small apps in Postgres, use them, and take
 away exactly what they created - see **The checks are guests** below.
 
 ## What each one is guarding
+
+**engines.check.js** - the same scan, twice, down two engines, compared as a
+report rather than function by function. `twin.check.js` compares what each
+function decides, which is right and is not enough: every bug found on the
+21st and 22nd of September was at a seam rather than inside a function. A
+foreign key written without its schema, a serial default drawing the copy's
+keys from the customer's sequence, and `rules` reaching the report from one
+engine and not the other - each one had every function doing exactly what it
+was asked.
+
+Its app sits on the search_path, because every real app does and no fixture
+here did. It is short on purpose: the awkward shapes are twin's twelve
+minutes, and a seam shows up on an ordinary app as readily as on a strange
+one.
 
 **package.check.js** - the only check that tests the thing a customer receives
 rather than the thing in this folder. It runs `npm pack`, installs the tarball
