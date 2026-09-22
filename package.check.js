@@ -212,6 +212,27 @@ function main() {
     check('5b. files the code reads rather than requires came too', (() => {
       const problems = [];
       const root = path.dirname(path.dirname(command));
+
+      // And it is the same engine the suites ran against, byte for byte.
+      //
+      // "It is there and it is long enough" was the first version of this and
+      // it is not much of a claim. What the checks in this repo prove is that
+      // *this* engine.sql builds a copy that is the app, agrees with the node
+      // engine, and can be installed and removed - and none of that is worth
+      // anything if the tarball carries a different one. There is no database
+      // here to install it into, so identity is the strongest thing that can
+      // honestly be checked, and it is enough: same bytes, same behaviour.
+      const mine = fs.readFileSync(path.join(HERE, 'engine.sql'));
+      let shipped = null;
+      try {
+        shipped = fs.readFileSync(path.join(root, 'engine.sql'));
+      } catch (err) {
+        problems.push('engine.sql did not come with the package at all');
+      }
+      if (shipped && !shipped.equals(mine)) {
+        problems.push('the engine.sql that shipped is not the one the checks ran against (' +
+          shipped.length + ' bytes against ' + mine.length + ')');
+      }
       const probe = spawnSync(process.execPath, [
         '-e',
         'const s = require(' + JSON.stringify(path.join(root, 'sqlengine.js')) + ');' +
@@ -229,6 +250,21 @@ function main() {
           (said[0] || 'it exited ' + probe.status + ' and said nothing'));
       } else if (Number(probe.stdout) < 1000) {
         problems.push('the engine it built is ' + probe.stdout + ' characters, which is not an engine');
+      }
+
+      // Nothing of the placeholder left. `engineFor` replaces __KN__ with the
+      // schema the engine is being addressed to, and one that got through
+      // would be a syntax error at install time, in somebody else's database.
+      const addressed = spawnSync(process.execPath, [
+        '-e',
+        'const s = require(' + JSON.stringify(path.join(root, 'sqlengine.js')) + ');' +
+        'const t = s.engineFor("kn_probe");' +
+        'process.stdout.write(String(t.includes("__KN__")) + " " + String(t.includes(String.fromCharCode(34) + "kn_probe" + String.fromCharCode(34))));',
+      ], { encoding: 'utf8', timeout: 60000 });
+      if (addressed.status === 0) {
+        const [leftOver, addressedTo] = String(addressed.stdout).split(' ');
+        if (leftOver !== 'false') problems.push('the engine still has __KN__ in it after being addressed');
+        if (addressedTo !== 'true') problems.push('the engine was not addressed to the schema it was given');
       }
       return problems;
     })());

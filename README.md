@@ -87,6 +87,39 @@ not the same as a problem that was *fixed* — if a table could not be tested
 this time, or is no longer there, it says so rather than crediting you with a
 fix. Close everything, with nothing left untested, and it hands out a badge.
 
+## Or let it run every night, on its own
+
+```
+npx kryptheon-night install
+```
+
+This one **stays**, and it tells you so before it does anything. It puts the
+checking functions into a schema called `kryptheon`, adds `pg_cron` and
+`pg_net` if they are not already there, and schedules one job at 3am. Then
+every night it does what the command above does — copies the shape of your
+tables, attacks the copy, writes down what got through, deletes the copy.
+
+```
+npx kryptheon-night night       read back the last night it ran
+npx kryptheon-night status      is it installed, and is it running
+npx kryptheon-night uninstall   take it all out again
+```
+
+**Nothing leaves your database**, because the checking happens inside it — the
+connection string is not stored anywhere and nothing is uploaded. It is also
+much faster for the same reason: on a real project the command line took 2
+minutes 16 seconds and the nightly run took 1 second, and both found the same
+five problems.
+
+**One thing it cannot do.** Racing two requests against each other — the "can
+this exist twice" question — needs two connections at the same instant, and
+nothing living inside a database has them. The nightly report names every
+column it could not race. Running the command by hand still tests them
+properly.
+
+`uninstall` removes the job, the schema, and any extension it had to add, and
+leaves alone anything that was already there.
+
 ## Three answers, three exit codes
 
 | exit | meaning |
