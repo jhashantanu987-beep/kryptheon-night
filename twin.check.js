@@ -475,16 +475,22 @@ async function main() {
       let theirsWrote = null;
       await sqlengine.withEngine(client, async (target) => {
         engineForWriting = target;
-        const { rows } = await client.query(
-          'SELECT ' + schema.quote(target) + '.tamper($1, $2::jsonb, $3::jsonb) AS answer',
-          [bySql, JSON.stringify(fromSql.tables), JSON.stringify(theirsSeeded.seeded)],
+        theirsWrote = await sqlengine.tamper(
+          client, target, bySql, fromSql.tables, theirsSeeded.seeded, fromSql.policies,
         );
-        theirsWrote = rows[0].answer;
       });
 
+      // `rules` is compared, not only what got through.
+      //
+      // It is what the report uses to say WHY a write landed, and it was
+      // added to the node engine alone - so for half a day one engine named
+      // the rule that let a stranger in and the other could only say that
+      // something had. The comparison could not see it, because it was
+      // comparing table, who and what. Now it cannot happen quietly.
       const wrote = (r) => JSON.stringify({
         findings: (r.findings || [])
-          .map((f) => f.table + '/' + f.who + '/' + [...(f.can || [])].sort().join('+'))
+          .map((f) => f.table + '/' + f.who + '/' + [...(f.can || [])].sort().join('+') +
+            '/rules:' + [...(f.rules || [])].map((x) => String(x).toUpperCase()).sort().join('+'))
           .sort(),
         completed: [...(r.completed || [])].sort(),
         blocked: (r.blocked || []).map((b) => b.key).sort(),

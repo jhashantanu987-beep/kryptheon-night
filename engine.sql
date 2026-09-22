@@ -1806,7 +1806,8 @@ END $$;
  * `seeded` carries the shape of row that worked when the table was seeded, so
  * the insert here is not rejected by some CHECK the seeder already solved.
  */
-CREATE OR REPLACE FUNCTION __KN__.tamper(source text, tables jsonb, seeded jsonb)
+CREATE OR REPLACE FUNCTION __KN__.tamper(source text, tables jsonb, seeded jsonb,
+                                       policies jsonb DEFAULT '[]'::jsonb)
 RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
   findings jsonb := '[]'::jsonb;
@@ -1828,6 +1829,10 @@ DECLARE
   move jsonb;
   result jsonb;
   outcome text;
+  -- Which rules each table actually has, so the report can say why a write
+  -- got through instead of assuming. Permissive only: a restrictive policy can
+  -- narrow what is allowed and never open it, so it is never the reason.
+  rules_for jsonb;
   named jsonb;
 BEGIN
   FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
@@ -1837,6 +1842,17 @@ BEGIN
      WHERE s->>'table' = tab->>'name';
     CONTINUE WHEN NOT FOUND;
     shape := coalesce(shape, 0);
+
+    -- Read off the table, never assumed. The node engine said of every
+    -- writable table with row level security on that its rule "covers every
+    -- command rather than only reading"; measured against a table whose only
+    -- policy was FOR INSERT, that was false twice over. The finding was
+    -- proved and the explanation invented, so the explanation is now read.
+    SELECT coalesce(jsonb_agg(DISTINCT upper(p->>'cmd')), '[]'::jsonb)
+      INTO rules_for
+      FROM jsonb_array_elements(coalesce(policies, '[]'::jsonb)) p
+     WHERE p->>'table_name' = tab->>'name'
+       AND upper(coalesce(p->>'permissive', 'PERMISSIVE')) = 'PERMISSIVE';
 
     owner := __KN__.owner_column(tab);
     at := __KN__.always_quote(source) || '.' || __KN__.always_quote(tab->>'name');
@@ -1905,7 +1921,8 @@ BEGIN
           'changed', changed,
           'owner', owner,
           'columns', named,
-          'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+          'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false),
+          'rules', rules_for));
       END IF;
     END LOOP;
   END LOOP;

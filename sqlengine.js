@@ -76,6 +76,70 @@ async function writeSchema(client, target, plan, into) {
   return rows[0].statements;
 }
 
+/*
+ * The attacks.
+ *
+ * Thin on purpose: each one hands the engine the same arguments its Node twin
+ * takes and gives back the same shape, so a caller can be pointed at either
+ * without knowing which it has. `twin.check.js` has been calling these through
+ * raw SQL since they were written; they are functions here so that `scan.js`
+ * can reach them too, which is what makes the two doors one engine rather than
+ * one on paper.
+ */
+
+/** Puts two fake people in the copy, and says what it could not seed. */
+async function seed(client, target, into, tables) {
+  const { rows } = await client.query(
+    'SELECT ' + quote(target) + '.seed($1, $2::jsonb) AS answer',
+    [into, JSON.stringify(tables)],
+  );
+  return rows[0].answer;
+}
+
+/** Can the wrong person read this? */
+async function impersonate(client, target, into, tables) {
+  const { rows } = await client.query(
+    'SELECT ' + quote(target) + '.impersonate($1, $2::jsonb) AS answer',
+    [into, JSON.stringify(tables)],
+  );
+  return rows[0].answer;
+}
+
+/** Can a stranger change it? Every write rolled back inside the engine. */
+async function tamper(client, target, into, tables, seeded, policies) {
+  const { rows } = await client.query(
+    'SELECT ' + quote(target) + '.tamper($1, $2::jsonb, $3::jsonb, $4::jsonb) AS answer',
+    [into, JSON.stringify(tables), JSON.stringify(seeded), JSON.stringify(policies || [])],
+  );
+  return rows[0].answer;
+}
+
+/** Can a half-finished row survive? */
+async function orphan(client, target, into, tables, seeded) {
+  const { rows } = await client.query(
+    'SELECT ' + quote(target) + '.orphan($1, $2::jsonb, $3::jsonb) AS answer',
+    [into, JSON.stringify(tables), JSON.stringify(seeded)],
+  );
+  return rows[0].answer;
+}
+
+/**
+ * Can the same thing exist twice?
+ *
+ * Inside the database this one cannot actually race anything - two requests at
+ * the same instant need two connections, and no credential ever moves - so it
+ * comes back with every column it would have tried in `notTried`, with the
+ * reason. That is deliberate and is the honest answer: reporting nothing at
+ * all would read as safety.
+ */
+async function collide(client, target, into, tables, indexes) {
+  const { rows } = await client.query(
+    'SELECT ' + quote(target) + '.collide($1, $2::jsonb, $3::jsonb) AS answer',
+    [into, JSON.stringify(tables), JSON.stringify(indexes)],
+  );
+  return rows[0].answer;
+}
+
 /**
  * Installs the engine, does something with it, and takes it away.
  *
@@ -101,5 +165,10 @@ module.exports = {
   readSchema: readSchema,
   copyStatements: copyStatements,
   writeSchema: writeSchema,
+  seed: seed,
+  impersonate: impersonate,
+  tamper: tamper,
+  orphan: orphan,
+  collide: collide,
   withEngine: withEngine,
 };
