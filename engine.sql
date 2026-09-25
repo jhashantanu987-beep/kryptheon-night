@@ -488,6 +488,45 @@ $$;
  * rewritten - and the copy was created holding a live reference into the
  * customer's real schema.
  */
+/* Points a rule's references to the app's own tables and views at the copy,
+   and nothing else - functions are not copied, so a rule calling one must
+   keep calling the original. The same as rewriteOwnTableRefs in schema.js:
+   without it, a rule written "FROM kn_app.members" was replayed verbatim and
+   the copy's rule read the customer's table. */
+CREATE OR REPLACE FUNCTION __KN__.rewrite_own_table_refs(expr text, plan jsonb, target text)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  out text := expr;
+  src text := plan->>'schema';
+  name_ text;
+  s text;
+  n text;
+  schema_forms text[];
+  name_forms text[];
+  esc text := '([.*+?^${}()|\[\]\\])';
+BEGIN
+  IF expr IS NULL THEN RETURN NULL; END IF;
+  schema_forms := ARRAY[__KN__.always_quote(src)]
+    || CASE WHEN src ~ '^[a-z_][a-z0-9_$]*$' THEN ARRAY[src] ELSE ARRAY[]::text[] END;
+  FOR name_ IN
+    SELECT x->>'name' FROM jsonb_array_elements(coalesce(plan->'tables', '[]'::jsonb) || coalesce(plan->'views', '[]'::jsonb)) x
+  LOOP
+    name_forms := ARRAY[__KN__.always_quote(name_)]
+      || CASE WHEN name_ ~ '^[a-z_][a-z0-9_$]*$' THEN ARRAY[name_] ELSE ARRAY[]::text[] END;
+    FOREACH s IN ARRAY schema_forms LOOP
+      FOREACH n IN ARRAY name_forms LOOP
+        out := regexp_replace(
+          out,
+          regexp_replace(s || '.' || n, esc, '\\\1', 'g')
+            || CASE WHEN left(n, 1) = '"' THEN '' ELSE '(?![A-Za-z0-9_$])' END,
+          replace(__KN__.always_quote(target) || '.' || __KN__.always_quote(name_), '\', '\\'),
+          'g');
+      END LOOP;
+    END LOOP;
+  END LOOP;
+  RETURN out;
+END $$;
+
 CREATE OR REPLACE FUNCTION __KN__.rewrite_schema_refs(expr text, from_schema text, to_schema text)
 RETURNS text LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN expr IS NULL THEN NULL ELSE
@@ -564,9 +603,12 @@ BEGIN
   RETURN out;
 END $$;
 
-/* Two people who do not exist, used wherever a stand-in row is needed. */
+/* Everyone the attacks act as - the seeded pair and the two who own nothing
+   (user_c, user_d) - so a row added under any of them satisfies a foreign key
+   to a stand-in. The same four as schema.js IDENTITIES. */
 CREATE OR REPLACE FUNCTION __KN__.identities() RETURNS text[] LANGUAGE sql IMMUTABLE AS $$
-  SELECT ARRAY['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
+  SELECT ARRAY['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222',
+               '55555555-5555-4555-8555-555555555555', '66666666-6666-4666-8666-666666666666'];
 $$;
 
 /* Something of the right type to put in a stand-in row. */
@@ -749,7 +791,7 @@ BEGIN
                    || ' (' || array_to_string(cols, ', ')
                    || ', PRIMARY KEY (' || (SELECT string_agg(__KN__.always_quote(c->>'name'), ', ')
                                               FROM jsonb_array_elements(stub->'columns') c) || '))');
-    FOR nth IN 0..1 LOOP
+    FOR nth IN 0..(array_length(__KN__.identities(), 1) - 1) LOOP
       values_ := ARRAY[]::text[];
       FOR col IN SELECT * FROM jsonb_array_elements(stub->'columns') LOOP
         values_ := values_ || __KN__.stub_value(col->>'type', nth);
@@ -842,8 +884,10 @@ BEGIN
       || ' FOR ' || (pol->>'cmd')
       || ' TO ' || coalesce(nullif((SELECT string_agg(r, ', ')
                                       FROM jsonb_array_elements_text(pol->'roles') r), ''), 'PUBLIC')
-      || CASE WHEN pol->>'qual' IS NOT NULL THEN ' USING (' || (pol->>'qual') || ')' ELSE '' END
-      || CASE WHEN pol->>'with_check' IS NOT NULL THEN ' WITH CHECK (' || (pol->>'with_check') || ')' ELSE '' END
+      || CASE WHEN pol->>'qual' IS NOT NULL
+              THEN ' USING (' || __KN__.rewrite_own_table_refs(pol->>'qual', plan, target) || ')' ELSE '' END
+      || CASE WHEN pol->>'with_check' IS NOT NULL
+              THEN ' WITH CHECK (' || __KN__.rewrite_own_table_refs(pol->>'with_check', plan, target) || ')' ELSE '' END
     );
   END LOOP;
 
@@ -916,6 +960,18 @@ BEGIN
       JOIN pg_class cl ON cl.oid = ad.adrelid
       JOIN pg_namespace cn ON cn.oid = cl.relnamespace
       JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+      JOIN pg_class rc ON rc.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+      JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+     WHERE cn.nspname = target AND rn.nspname <> target AND rn.nspname <> 'pg_catalog'
+    UNION ALL
+    -- And the rules: a policy that reads another table must read the copy's,
+    -- never the customer's. The same clause as schema.js, for the same reason.
+    SELECT pol.polname || ' rule on ' || cl.relname,
+           rn.nspname || '.' || rc.relname
+      FROM pg_depend d
+      JOIN pg_policy pol ON pol.oid = d.objid AND d.classid = 'pg_policy'::regclass
+      JOIN pg_class cl ON cl.oid = pol.polrelid
+      JOIN pg_namespace cn ON cn.oid = cl.relnamespace
       JOIN pg_class rc ON rc.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
       JOIN pg_namespace rn ON rn.oid = rc.relnamespace
      WHERE cn.nspname = target AND rn.nspname <> target AND rn.nspname <> 'pg_catalog'

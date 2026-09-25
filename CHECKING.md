@@ -31,6 +31,7 @@ every time a word of the product is edited:
 | `engines.check.js` | yes | and the same report comes out of either |
 | `shapes.check.js` | yes | every shape a real app has can be tested at all |
 | `verdicts.check.js` | yes | the answer is right, not merely produced |
+| `shop.check.js` | yes | a Supabase-shaped shop is attacked whole, by both engines |
 | `loop.check.js` | yes | the whole thing, through the real command |
 
 And one that is deliberately **not** in `npm run check`:
@@ -218,6 +219,18 @@ failure here on purpose.
 **verdicts.check.js** - seventeen apps that each declare the honest answer up
 front, because a hole reported as nothing and a correct app reported as broken
 both leave no warning behind to notice.
+
+**shop.check.js** - the test app a person is handed to try by hand, as a
+check. Written on 2026-09-25, when that app got "I could not check this app"
+from 0.1.5 because a rule on `order_items` read `orders`; then, once that was
+fixed, four of its five holes came back as not tested, because nearly every
+table's `user_id` points at `auth.users` and the attacks acted as somebody
+never put in the copy's stand-in. Fixing the first turned up an older one: a
+rule written with its schema was replayed verbatim, so the copy's rule read
+the customer's table - the word-for-word comparison had passed it, since both
+sides printed the same words. Now the rule guard asks `pg_depend`, and a rule
+reading a table in another schema is refused out loud. Both engines, every
+hole, the safe table left alone. Seven mutations, each caught.
 
 **loop.check.js** - nothing stubbed. Build an app with real holes, shell out to
 `scan.js` the way a person would, apply the fixes the report asked for,

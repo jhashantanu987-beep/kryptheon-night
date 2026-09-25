@@ -500,6 +500,43 @@ function rewriteSchemaRefs(expr, fromSchema, toSchema) {
 }
 
 /**
+ * Points a rule's references to the app's own tables and views at the copy -
+ * and leaves everything else alone.
+ *
+ * A rule is copied as Postgres printed it. For an app outside the search_path
+ * that includes the schema - "EXISTS (SELECT 1 FROM kn_app.members m ...)" -
+ * and replayed verbatim into the copy, the copy's rule read the customer's
+ * members table. Caught by the pg_depend guard in writeSchema the day it
+ * learned to look at rules; the text comparison had passed it for months,
+ * since source and copy printed the same words.
+ *
+ * Not rewriteSchemaRefs, which moves every "kn_app." it finds: a rule calling
+ * one of the app's functions (kn_app.whoami()) has to keep calling it,
+ * because functions are not copied, and pointing it at the copy makes the
+ * CREATE POLICY fail. Only names that are tables or views of this app move.
+ * A name followed by more identifier characters is a different name -
+ * members_log is not members - so the match stops at a word boundary.
+ */
+function rewriteOwnTableRefs(expr, plan, target) {
+  if (expr === null || expr === undefined) return expr;
+  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const simple = (s) => /^[a-z_][a-z0-9_$]*$/.test(s);
+  const schemaForms = [quote(plan.schema)].concat(simple(plan.schema) ? [plan.schema] : []);
+  const own = (plan.tables || []).map((t) => t.name).concat((plan.views || []).map((v) => v.name));
+  let out = String(expr);
+  for (const name of own) {
+    const nameForms = [quote(name)].concat(simple(name) ? [name] : []);
+    for (const s of schemaForms) {
+      for (const n of nameForms) {
+        const tail = n.charAt(0) === '"' ? '' : '(?![A-Za-z0-9_$])';
+        out = out.replace(new RegExp(escape(s + '.' + n) + tail, 'g'), quote(target) + '.' + quote(name));
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Points a reference with no schema on it at the copy.
  *
  * The one the other two rewrites could not see. `pg_get_constraintdef` writes
@@ -572,7 +609,20 @@ function rewriteExternalRefs(expr, external, toSchema) {
 }
 
 /** Two people who do not exist, used wherever a stand-in row is needed. */
-const IDENTITIES = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
+// Everyone the attacks ever act as: the seeded pair (A, B) and the two who
+// own nothing (C, D, see attack.js) - the same values, kept literal here
+// because attack.js requires this file. All four go into every stand-in.
+// With only A and B there, a row an attack added under C was refused by the
+// foreign key to auth.users before any rule was consulted, and "anyone can
+// place an order" or "two accounts share one email" came back as not tested.
+// Measured on a test app shaped like a Supabase shop, where nearly every
+// table's user_id points at auth.users - so on real apps, most of them.
+const IDENTITIES = [
+  '11111111-1111-4111-8111-111111111111',
+  '22222222-2222-4222-8222-222222222222',
+  '55555555-5555-4555-8555-555555555555',
+  '66666666-6666-4666-8666-666666666666',
+];
 
 /** Something of the right type to put in a stand-in row. */
 function stubValue(type, nth) {
@@ -816,8 +866,8 @@ async function writeSchema(client, plan, target) {
       'FOR ' + policy.cmd,
       'TO ' + roles,
     ];
-    if (policy.qual) parts.push('USING (' + policy.qual + ')');
-    if (policy.with_check) parts.push('WITH CHECK (' + policy.with_check + ')');
+    if (policy.qual) parts.push('USING (' + rewriteOwnTableRefs(policy.qual, plan, target) + ')');
+    if (policy.with_check) parts.push('WITH CHECK (' + rewriteOwnTableRefs(policy.with_check, plan, target) + ')');
     statements.push(parts.join(' '));
   }
 
@@ -893,6 +943,22 @@ async function writeSchema(client, plan, target) {
        JOIN pg_class cl ON cl.oid = ad.adrelid
        JOIN pg_namespace cn ON cn.oid = cl.relnamespace
        JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+       JOIN pg_class rc ON rc.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+       JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+      WHERE cn.nspname = $1 AND rn.nspname <> $1 AND rn.nspname <> 'pg_catalog'
+      UNION ALL
+     -- And the rules. A policy that reads another table - "items of my
+     -- orders" - has to read the copy's orders; one reading the customer's
+     -- would evaluate the attack against their real rows. The text comparison
+     -- further down never caught this for an app in public: a reference to
+     -- public.orders prints as plain "orders" either way. Postgres records
+     -- every relation a policy expression uses, so ask it.
+     SELECT pol.polname || ' rule on ' || cl.relname AS what,
+            rn.nspname || '.' || rc.relname AS points_at
+       FROM pg_depend d
+       JOIN pg_policy pol ON pol.oid = d.objid AND d.classid = 'pg_policy'::regclass
+       JOIN pg_class cl ON cl.oid = pol.polrelid
+       JOIN pg_namespace cn ON cn.oid = cl.relnamespace
        JOIN pg_class rc ON rc.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
        JOIN pg_namespace rn ON rn.oid = rc.relnamespace
       WHERE cn.nspname = $1 AND rn.nspname <> $1 AND rn.nspname <> 'pg_catalog'`,
@@ -1014,11 +1080,24 @@ function diffSchemas(source, copy) {
     }
   }
 
-  // The policies matter most, so they are compared word for word.
-  const asText = (list, schema) =>
+  // The policies matter most, so they are compared word for word - except for
+  // the schema names, which differ by design. A rule that looks at another of
+  // the app's own tables ("items of my orders": EXISTS (SELECT 1 FROM orders
+  // ...)) comes back from the copy naming the copy's orders, kn_xxx.orders,
+  // which is exactly right. Compared raw, that read as "the copy came out
+  // changed" and the whole app went unscanned - found on a test app built to
+  // look like a Lovable shop, where this rule is ordinary. And a rule calling
+  // one of the app's functions keeps naming the original schema in both,
+  // because functions are not copied - so both names are taken out of both
+  // sides. Where a rule actually points - the copy's table or the customer's -
+  // is not left to this text: writeSchema asks pg_depend, and refuses a copy
+  // whose rules read anything outside it.
+  const bothSchemas = (text) => withoutSchema(withoutSchema(text, source), copy);
+  const asText = (list) =>
     list
       .map((p) =>
-        [p.table_name, p.name, p.permissive, roleList(p.roles).join('+'), p.cmd, p.qual, p.with_check]
+        [p.table_name, p.name, p.permissive, roleList(p.roles).join('+'), p.cmd,
+          bothSchemas(p.qual), bothSchemas(p.with_check)]
           .map((x) => String(x === null || x === undefined ? '' : x))
           .join(' :: '),
       )

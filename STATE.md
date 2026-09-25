@@ -168,6 +168,35 @@ rather than twice.
 
 Every line here came from running something.
 
+**0.1.5 could not check an ordinary Supabase shop (2026-09-25).** A test app
+written for the user to try by hand - profiles, waitlist, orders, order_items,
+accounts, notes, every user_id pointing at auth.users - got *"I could not check
+this app"*: a rule on order_items read orders, the copy printed it naming the
+copy's orders, and the word-for-word policy comparison called that a changed
+copy. Fixed that, and four of five holes came back *not tested*: the attacks
+add rows as USER_C / USER_D, who were never put in the stand-in auth.users, so
+the foreign key refused the row before any rule was asked. And fixing the first
+exposed an older one: a rule written with its schema (FROM kn_app.members) was
+replayed verbatim, so the copy's rule read the customer's table - the text
+comparison passed it because both sides printed the same words. 0.1.6: rules
+point at the copy's own tables (only tables and views - functions are not
+copied), all four identities go in every stand-in, the pg_depend guard covers
+rules, and a rule reading a table in another schema is refused out loud.
+`shop.check.js` holds all of it, both engines; seven mutations, each caught.
+Still open: a rule calling one of the app's functions (Lovable's `has_role`)
+calls the original, which reads the customer's `user_roles` - read only, but a
+read. pg_depend records the rule's dependency on the function, not the
+function's on the table.
+
+**The suites run in two minutes against a local Postgres.** `embedded-postgres`
+from npm (Postgres 18 on Windows) in the session scratchpad, database
+`suites_c` created with `LC_COLLATE 'C'`. Two things it needs: a database with
+no `auth.users` of its own (`guests.check` refuses one), and C collation -
+under the Windows default, Postgres sorted "User Groups" after the lowercase
+names and Node sorted it first, and `twin.check` failed on the order alone,
+with or without any change. Neon took about an hour for the same suite, at
+340 ms a round trip.
+
 **Collision cannot run inside the database.** It needs two requests at the
 same instant - the second insert in flight while the first transaction is
 still open. `dblink` is available on Neon and a non-superuser may even create
@@ -352,7 +381,7 @@ of them was bought with a bug.
 
 ## The checks
 
-Nineteen suites, five of which need no database at all. `npm run check` for
+Twenty suites, five of which need no database at all. `npm run check` for
 all of them, `npm run check:dry` for the five.
 
 Those five - `package`, `trouble`, `intro`, `finding`, `recheck` - are what
