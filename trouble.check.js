@@ -298,6 +298,53 @@ async function main() {
     return problems;
   })());
 
+  check('a database without pg_net or pg_cron is told so - not "I could not connect"', (() => {
+    // Measured on a plain Postgres 18: the screen said "Connected." and then
+    // "I could not connect to the database", which sends people checking a
+    // password that was fine.
+    const problems = [];
+    for (const name of ['pg_net', 'pg_cron']) {
+      const lines = trouble.explain(new Error('this database does not offer ' + name + ', so the nightly run cannot be installed. Supabase has it; a plain Postgres may not.'), 'postgresql://u:secret@h/db');
+      const text = lines.join('\n');
+      if (/could not connect/i.test(text)) problems.push(name + ': still says it could not connect');
+      if (!/cannot run the nightly check/.test(text)) problems.push(name + ': does not say what is actually wrong:\n' + text);
+      if (text.indexOf(name) === -1) problems.push(name + ': does not name the missing extension');
+      if (!/npx kryptheon-night/.test(text)) problems.push(name + ': does not say the scan still works');
+      if (/secret/.test(text)) problems.push(name + ': the password came back');
+    }
+    return problems;
+  })());
+
+  check('install asks about both extensions before it creates either', await (async () => {
+    // A database offering pg_net and not pg_cron used to get pg_net created,
+    // then the install refused - leaving an extension nobody recorded, which
+    // uninstall would never take back out. Driven with a client that answers
+    // like such a database and remembers every statement it was sent.
+    const installer = require('./installer.js');
+    const sent = [];
+    const fake = {
+      query: async (text, values) => {
+        sent.push(String(text));
+        if (/pg_available_extensions/.test(text)) {
+          return { rows: values && values[0] === 'pg_net' ? [{ installed_version: null }] : [] };
+        }
+        return { rows: [{ n: 0 }] };
+      },
+    };
+    const problems = [];
+    let threw = null;
+    try {
+      await installer.install(fake, { source: 'public' });
+    } catch (err) {
+      threw = err;
+    }
+    if (!threw) problems.push('it installed on a database without pg_cron');
+    else if (threw.missingExtension !== 'pg_cron') problems.push('it refused, but not for pg_cron: ' + threw.message);
+    const created = sent.filter((s) => /CREATE (EXTENSION|SCHEMA|TABLE|FUNCTION)/i.test(s));
+    if (created.length) problems.push('it created things before refusing: ' + created.map((s) => s.slice(0, 60)).join(' | '));
+    return problems;
+  })());
+
   console.log('');
   let failures = 0;
   for (const result of results) {

@@ -408,6 +408,25 @@ function explain(err, raw) {
     return BY_CODE['28P01'].slice();
   }
 
+  // The install refused because the database cannot schedule or post. It had
+  // connected - the line above this on screen says "Connected." - and falling
+  // through to "I could not connect" sent people checking a password that
+  // was fine. Measured on a plain Postgres 18.
+  const missing = /does not offer (pg_[a-z_]+)/.exec(message);
+  if (missing) {
+    return [
+      'This database cannot run the nightly check.',
+      '',
+      'It does not offer ' + missing[1] + ', which the nightly run needs (pg_cron to',
+      'wake itself at night, pg_net to report). Supabase has both; a plain',
+      'Postgres or Neon may not. Nothing was installed.',
+      '',
+      'The scan itself does not need either, and works here:',
+      '',
+      '  npx kryptheon-night',
+    ];
+  }
+
   // Nothing matched. Say what happened and where, without pretending to know
   // why, and without the stack.
   const lines = [

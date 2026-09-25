@@ -87,6 +87,21 @@ async function install(client, options) {
   const at = opts.at || AT;
   const made = { extensions: [], schema: false, jobid: null };
 
+  // Both asked about before either is made. pg_net used to be created first
+  // and pg_cron checked after, so a database offering one and not the other
+  // kept a pg_net nobody recorded - and uninstall only removes what the
+  // record names. Nothing is created until everything needed is there.
+  for (const name of ['pg_net', 'pg_cron']) {
+    if (!(await extensionState(client, name)).available) {
+      const err = new Error(
+        'this database does not offer ' + name + ', so the nightly run cannot be installed. ' +
+        'Supabase has it; a plain Postgres may not.',
+      );
+      err.missingExtension = name;
+      throw err;
+    }
+  }
+
   // pg_net first: it is the one that lands in the wrong place if nobody
   // says where, and it is easier to take back out before anything depends
   // on it.
