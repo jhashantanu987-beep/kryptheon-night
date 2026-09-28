@@ -344,13 +344,21 @@ async function scan(client, sourceSchema, options) {
       }
     }
 
+    // Where people actually sign in decides how bad a duplicate email is. On
+    // Supabase that is auth.users, which keeps emails unique; a public table's
+    // email column is then a copy. Only read, never written.
+    const loginElsewhere = (await client.query("select to_regclass('auth.users') is not null as found")).rows[0].found;
+    const raced = collisions.findings.map((f) =>
+      f.expectation === 'identity' ? Object.assign({}, f, { loginElsewhere: loginElsewhere }) : f,
+    );
+
     return {
       stopped: null,
       attacksRun: attempted.length,
       notChecked: notChecked,
       attempted: attempted,
       findings: finding.describeAll(
-        impersonation.findings.concat(writes.findings, stranded.findings, collisions.findings),
+        impersonation.findings.concat(writes.findings, stranded.findings, raced),
       ),
     };
   } finally {

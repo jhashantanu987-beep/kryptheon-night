@@ -39,6 +39,7 @@ const SHOP = 'kn_shop_' + STAMP;
 const MEMBERS = 'kn_shop_members_' + STAMP;
 const OUTSIDE = 'kn_shop_outside_' + STAMP;
 const ELSEWHERE = 'kn_shop_elsewhere_' + STAMP;
+const NOAUTH = 'kn_shop_noauth_' + STAMP;
 
 const results = [];
 function check(name, problems) {
@@ -199,6 +200,18 @@ async function main() {
         if (problems.length) problems.push('it found:\n        ' + found.split('\n').join('\n        '));
         return problems;
       })());
+
+      check('3' + (which === 'node' ? 'c' : 'd') + '. ' + which + ': with auth.users here, a duplicate email is not called a shared login', (() => {
+        // This app signs people in through auth.users, which keeps emails
+        // unique. accounts.email is a copy, so the duplicate is real but it
+        // does not put two accounts behind one login.
+        const dup = ((r.result && r.result.findings) || []).find((f) => f.table === 'accounts' && f.kind === 'duplicated');
+        if (!dup) return ['no duplicate finding on accounts to judge'];
+        const problems = [];
+        if (dup.severity !== 'HIGH') problems.push('severity ' + dup.severity + ', expected HIGH');
+        if (!/Signing in is not affected/.test(dup.body)) problems.push('body: ' + dup.body);
+        return problems;
+      })());
     }
 
     check('4. both engines hand over the same findings', (() => {
@@ -225,9 +238,31 @@ async function main() {
         return [];
       })());
     }
+
+    // The other half of 3c/3d: a plain Postgres app with no auth.users, where
+    // accounts.email may well be the login itself, keeps the strong claim.
+    // Only possible when this run made auth.users and can take it away again;
+    // on a database that has its own, the check says it could not run.
+    if (users.made) {
+      await undoUsers();
+      undoUsers = async () => {};
+      await client.query('CREATE SCHEMA ' + schema.quote(NOAUTH));
+      await client.query('CREATE TABLE ' + schema.quote(NOAUTH) + '.accounts (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL)');
+      const plain = await scan(client, NOAUTH, { quiet: true, openSession: openSessionFor(CONNECTION) });
+      check('7. without auth.users, a duplicate email in accounts is still called a shared login', (() => {
+        const dup = (plain.findings || []).find((f) => f.table === 'accounts' && f.kind === 'duplicated');
+        if (!dup) return ['no duplicate finding: ' + (plain.stopped || headlines({ result: plain }).join(' / '))];
+        const problems = [];
+        if (dup.severity !== 'CRITICAL') problems.push('severity ' + dup.severity + ', expected CRITICAL');
+        if (!/same login/.test(dup.body)) problems.push('body: ' + dup.body);
+        return problems;
+      })());
+    } else {
+      check('7. without auth.users (could not run: this database has its own auth.users)', ['not run - this is not a pass']);
+    }
   } finally {
     await client.query('SET search_path TO "$user", public').catch(() => {});
-    for (const name of [SHOP, MEMBERS, OUTSIDE, ELSEWHERE]) {
+    for (const name of [SHOP, MEMBERS, OUTSIDE, ELSEWHERE, NOAUTH]) {
       await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(name) + ' CASCADE').catch(() => {});
     }
     await undoUsers().catch(() => {});

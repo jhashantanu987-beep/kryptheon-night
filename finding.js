@@ -90,7 +90,13 @@ function severityOf(finding, contents) {
     // the table. A second row holding the same session token is critical even
     // if the table has nothing personal in it at all.
     if (finding.expectation === 'credential') return 'CRITICAL';
-    if (finding.expectation === 'identity') return 'CRITICAL';
+    // Critical only while this column could be the login itself. When the
+    // database has Supabase's auth.users, sign-in goes through that table,
+    // which keeps every email unique - so a duplicate here is a copy that
+    // disagrees with itself, not two accounts sharing one login. Found on a
+    // real app: the report said "two accounts can answer to the same login"
+    // about a profiles table the login never read.
+    if (finding.expectation === 'identity') return finding.loginElsewhere ? 'HIGH' : 'CRITICAL';
     return 'HIGH';
   }
   if (contents.secrets.length) return 'CRITICAL';
@@ -263,6 +269,17 @@ const COST_OF_A_DUPLICATE = {
   code: 'A one-time code that can exist twice can be redeemed twice.',
 };
 
+// Said instead of the login sentence when sign-in happens in auth.users.
+const COST_OF_A_COPIED_IDENTITY =
+  'Signing in is not affected: your app signs people in through auth.users, ' +
+  'which keeps each email unique. But anything that looks a person up by this ' +
+  'column can get two rows back and pick the wrong one.';
+
+function costOf(finding) {
+  if (finding.expectation === 'identity' && finding.loginElsewhere) return COST_OF_A_COPIED_IDENTITY;
+  return COST_OF_A_DUPLICATE[finding.expectation] || '';
+}
+
 function bodyFor(finding, contents) {
   const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
   const rowWord = finding.readable === 1 ? 'row' : 'rows';
@@ -306,8 +323,7 @@ function bodyFor(finding, contents) {
     return (
       'I opened two connections to a copy of your app and inserted the same ' +
       finding.column + ' from both at the same moment. Both were accepted, so there are ' +
-      'now ' + finding.copies + ' rows holding the identical value. ' +
-      (COST_OF_A_DUPLICATE[finding.expectation] || '')
+      'now ' + finding.copies + ' rows holding the identical value. ' + costOf(finding)
     ).trim();
   }
 
@@ -418,17 +434,50 @@ function fixPromptFor(finding) {
         '". I proved it by inserting the same value from two connections at the same ' +
         'moment, and both were accepted.',
       '',
-      'Add a unique constraint on "' + finding.table + '"."' + finding.column +
-        '" in the database itself. Checking in application code before inserting is not ' +
-        'enough - between the check and the insert, the other request has already gone in.',
+      // First, because it has to happen before anything is changed. Learned
+      // by applying the short version of this prompt literally to a real app:
+      // the constraint cannot be created while duplicates exist, and an
+      // assistant told only "add a constraint" may delete rows to get there.
+      'First, find the rows that already share a value and show them to me. Do not ' +
+        'delete or merge any of them without asking me: the rule below cannot be ' +
+        'created while they exist, and deleting rows to make it pass loses real data.',
+      '',
+      (finding.expectation === 'identity'
+        ? 'Then add a unique index on lower("' + finding.column + '"), so that "' + finding.table +
+          '"."' + finding.column + '" is unique whatever the case - Ann@example.com and ' +
+          'ann@example.com are the same person.'
+        : 'Then add a unique constraint on "' + finding.table + '"."' + finding.column + '".') +
+        ' It has to be in the database itself. Checking in application code before inserting ' +
+        'is not enough - between the check and the insert, the other request has already gone in.',
       '',
       // Said because the obvious fix is wrong for multi-tenant apps, and being
       // told to drop a legitimate design would cost them more than the bug.
-      'If the same value is allowed to repeat for different owners, make the constraint ' +
-        'cover both columns together rather than leaving it off.',
+      'If the same value is allowed to repeat for different owners, make it cover both ' +
+        'columns together rather than leaving it off.',
       '',
-      'Then look for the same missing constraint on every other table and fix those too.',
-    ]
+    ].concat(
+      [
+        'Find everything that writes this column - app code, and any database trigger or ' +
+          'function, such as one that copies each new sign-up into this table - and make ' +
+          'sure each one handles "this value already exists" instead of failing. If people ' +
+          'can edit this column themselves, decide whether they should: once it is unique, ' +
+          'someone who puts another person\'s value in first will block that person.',
+        '',
+      ],
+      finding.expectation === 'identity' && finding.loginElsewhere
+        ? [
+          'Sign-in uses auth.users, so this column is only a copy of the email there. ' +
+            'Consider not letting people edit it at all and keeping it in step with auth.users.',
+          '',
+        ]
+        : [],
+      [
+        'Afterwards, sign up a brand-new account and edit an existing profile to make sure ' +
+          'both still work, and run this check again.',
+        '',
+        'Then look for the same missing constraint on every other table and fix those too.',
+      ],
+    )
     : finding.isView
       ? [
         'My app has a security problem.',

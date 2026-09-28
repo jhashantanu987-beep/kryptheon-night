@@ -361,6 +361,52 @@ const cases = [
       return problems;
     },
   },
+  {
+    name: 'a duplicate email where sign-in happens elsewhere is not called a shared login',
+    run: () => {
+      const problems = [];
+      const dup = (extra) => finding.describe(Object.assign({
+        kind: 'duplicated', table: 'profiles', column: 'email', copies: 2,
+        expectation: 'identity', columns: ['id', 'email'],
+      }, extra));
+      const copy = dup({ loginElsewhere: true });
+      const login = dup({ loginElsewhere: false });
+      if (copy.severity !== 'HIGH') problems.push('with auth.users present it said ' + copy.severity);
+      if (/same login|password reset/i.test(copy.body)) problems.push('it still claims a shared login: ' + copy.body);
+      if (!/Signing in is not affected/.test(copy.body)) problems.push('it does not say sign-in is unaffected');
+      // Without auth.users this column may really be the login, and the
+      // stronger claim stays.
+      if (login.severity !== 'CRITICAL') problems.push('without auth.users it said ' + login.severity);
+      if (!/same login/.test(login.body)) problems.push('the login cost disappeared where it applies');
+      return problems;
+    },
+  },
+  {
+    name: 'the duplicate fix prompt protects existing data and the flows that write the column',
+    run: () => {
+      const problems = [];
+      const make = (expectation, extra) => finding.describe(Object.assign({
+        kind: 'duplicated', table: 't', column: expectation === 'identity' ? 'email' : 'token',
+        copies: 2, expectation: expectation, columns: ['id'],
+      }, extra)).fixPrompt.replace(/\s+/g, ' ');
+      const identity = make('identity', { loginElsewhere: true });
+      const credential = make('credential');
+      for (const [name, p] of [['identity', identity], ['credential', credential]]) {
+        const find = p.indexOf('find the rows that already share a value');
+        const add = p.search(/add a unique (constraint|index)/i);
+        if (find === -1) problems.push(name + ': it never asks for existing duplicates first');
+        else if (add !== -1 && find > add) problems.push(name + ': it asks for the constraint before checking existing rows');
+        if (!/Do not delete or merge/.test(p)) problems.push(name + ': it does not forbid deleting rows to make it pass');
+        if (!/trigger or function/.test(p)) problems.push(name + ': it does not send the assistant to what writes the column');
+        if (!/sign up a brand-new account/.test(p)) problems.push(name + ': it asks for no test afterwards');
+      }
+      if (!/lower\("email"\)/.test(identity)) problems.push('an email is not made case-insensitive');
+      if ((identity.match(/add a unique/gi) || []).length !== 1) problems.push('the identity prompt asks for more than one rule');
+      if (/lower\(/.test(credential)) problems.push('a credential was lower-cased - tokens are case-sensitive');
+      if (!/only a copy of the email/.test(identity)) problems.push('it does not say the column copies auth.users');
+      return problems;
+    },
+  },
 ];
 
 let failures = 0;
