@@ -566,7 +566,10 @@ async function main() {
       const verdict = recheck.compare(before, result);
       recheck.describe(verdict).forEach(line);
       recheck.badgeLines(verdict, result.attacksRun || 0).forEach(line);
+      // The report ends with what was not tested; with nothing left to report
+      // that list still has to be printed, or the re-check goes quiet about it.
       if (result.findings.length) scanner.report(result);
+      else scanner.notTestedLines(result).forEach(line);
       scanner.saveRun(file, result);
       process.exitCode = result.stopped ? 2 : verdict.allClear ? 0 : 1;
     }

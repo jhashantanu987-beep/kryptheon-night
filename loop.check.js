@@ -176,6 +176,8 @@ function must(condition, what) {
     must(/Kryptheon Verified/.test(again.out), 'it hands out the badge');
     must(!/could NOT confirm/.test(again.out), 'it does not hedge on a fix it proved');
     must(!/still open/.test(again.out), 'it does not report anything still open');
+    // With nothing left to report, the limits of the answer still close it.
+    must(/What I did not test/.test(again.out), 'the re-check still ends with what it did not test');
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(appA) + ' CASCADE');
   }

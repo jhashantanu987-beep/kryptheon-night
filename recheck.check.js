@@ -381,6 +381,34 @@ const cases = [
       return problems;
     },
   },
+  {
+    name: '16. a fix confirmed while other tables went untested says why there is no green light',
+    run: () => {
+      // Found on a real app: "1 problem is fixed", nothing else, and exit 1
+      // with no reason given. The reason was untested tables elsewhere.
+      const r = recheck.compare(
+        BEFORE,
+        after({
+          findings: [],
+          notChecked: [
+            { table: 'invoices', why: 'could not seed it' },
+            { table: 'refunds', why: 'a check constraint refused the test row' },
+          ],
+        }),
+      );
+      const problems = [];
+      if (r.allClear) problems.push('it went green with two tables untested');
+      if (r.fixed.length !== 2) problems.push('fixed ' + r.fixed.length + ', expected 2');
+      const said = recheck.describe(r).join('\n');
+      if (!/No green light yet: 2 parts of your app were/.test(said)) {
+        problems.push('it does not say why there is no green light: ' + said);
+      }
+      // And a run where everything was tested must not say it.
+      const clean = recheck.describe(recheck.compare(BEFORE, after({ findings: [] }))).join('\n');
+      if (/No green light/.test(clean)) problems.push('it withholds green on a fully tested run');
+      return problems;
+    },
+  },
 ];
 
 let failures = 0;

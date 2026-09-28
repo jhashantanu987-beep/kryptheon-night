@@ -116,6 +116,9 @@ function compare(before, after) {
     stillOpen: stillOpen,
     unverifiable: unverifiable,
     newlyBroken: newlyBroken,
+    // Carried so the re-check can say why there is no green light when the
+    // only thing standing in the way is what could not be tested.
+    untested: skipped,
     // Green is the strictest thing this program says, so it is the hardest to
     // earn: everything that was wrong is now provably right, nothing new broke,
     // and nothing at all was left untested.
@@ -205,6 +208,18 @@ function describe(result) {
 
   if (!result.fixed.length && !result.stillOpen.length && !result.unverifiable.length && !result.newlyBroken.length) {
     lines.push('  Nothing to re-check - there was nothing open.');
+    lines.push('');
+  }
+
+  // Found on a real app: "1 problem is fixed", nothing else, and a non-zero
+  // exit with no word about why. The reason was parts of the app that could
+  // not be tested - which has to be said, or the exit code reads as a bug.
+  const untested = result.untested || [];
+  if (untested.length) {
+    lines.push('  No green light yet: ' + untested.length + ' ' +
+      (untested.length === 1 ? 'part of your app was' : 'parts of your app were') +
+      ' not tested this time, so I cannot');
+    lines.push('  call it clear. They are listed at the end, with the reason for each.');
     lines.push('');
   }
 

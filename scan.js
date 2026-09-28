@@ -604,6 +604,7 @@ async function main() {
     recheck.badgeLines(verdict, result.attacksRun || 0).forEach(line);
     // The verdict says what changed; this says what to do about what did not.
     if (result.findings.length) report(result);
+    else notTestedLines(result).forEach(line);
     saveRun(file, result);
     process.exitCode = result.stopped ? 2 : verdict.allClear ? 0 : 1;
   } finally {
