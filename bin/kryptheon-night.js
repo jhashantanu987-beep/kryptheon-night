@@ -26,6 +26,7 @@ const path = require('path');
 const { Client } = require('pg');
 
 const scanner = require('../scan.js');
+const store = require('../store.js');
 const recheck = require('../recheck.js');
 const intro = require('../intro.js');
 const trouble = require('../trouble.js');
@@ -485,7 +486,19 @@ async function main() {
   //
   // The flag still works, because anything scripted may be passing it, and
   // now it changes nothing: with an earlier run here, this always compares.
-  const file = path.resolve(scanner.LAST_RUN);
+  let file;
+  try {
+    file = scanner.lastRunFile(line);
+  } catch (err) {
+    // Nowhere to keep this run means nothing to compare the next one against,
+    // and a re-check with nothing to compare against is not an answer.
+    fail('');
+    fail('  Kryptheon keeps its last run for this project in ' + store.dirFor(process.cwd()));
+    fail('  and could not write there: ' + err.message);
+    fail('  Set KRYPTHEON_HOME to a folder you can write to, and run this again.');
+    fail('');
+    process.exit(2);
+  }
   const before = scanner.loadLastRun(file);
   if (asked.recheck && !before) {
     // Asked for explicitly and impossible, which is worth saying. Arriving

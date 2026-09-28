@@ -21,6 +21,10 @@
 // The app lives on the search_path, because every real app does, and that one
 // condition is what three of this year's worst bugs needed.
 
+// A run this check causes is saved to a scratch store, never the real
+// ~/.kryptheon (see store.js).
+process.env.KRYPTHEON_HOME = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'kryptheon-home-'));
+
 const { Client } = require('pg');
 const schema = require('./schema.js');
 const fixture = require('./fixture.js');

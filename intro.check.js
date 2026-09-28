@@ -5,6 +5,10 @@
 // checked through the real command, because a consent screen that is printed
 // and then not honoured is worse than no consent screen at all.
 
+// A run this check causes is saved to a scratch store, never the real
+// ~/.kryptheon (see store.js).
+process.env.KRYPTHEON_HOME = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'kryptheon-home-'));
+
 const path = require('path');
 const { spawnSync } = require('child_process');
 const intro = require('./intro.js');

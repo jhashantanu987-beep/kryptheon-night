@@ -17,6 +17,10 @@
 //
 // It was written as a throwaway hunt and found eight bugs on its first run,
 // which is why it now lives here and runs with everything else.
+// A run this check causes is saved to a scratch store, never the real
+// ~/.kryptheon (see store.js).
+process.env.KRYPTHEON_HOME = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'kryptheon-home-'));
+
 const { Client } = require('pg');
 const schema = require('./schema.js');
 const fixture = require('./fixture.js');

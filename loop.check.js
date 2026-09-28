@@ -13,6 +13,10 @@
 // disappear from the report in exactly the way a real fix does, and a re-check
 // that cannot tell those apart is a re-check that will one day hand a badge to
 // an app nobody secured.
+// A run this check causes is saved to a scratch store, never the real
+// ~/.kryptheon (see store.js).
+process.env.KRYPTHEON_HOME = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'kryptheon-home-'));
+
 const { Client } = require('pg');
 const { spawnSync } = require('child_process');
 const fs = require('fs');
@@ -25,17 +29,18 @@ const CONN = process.argv[2] || process.env.KN_DATABASE_URL;
 
 // Undoes only the auth schema this run created, and only if it created it.
 let undoAuth = async () => {};
-const SAVED = path.join(HERE, '.kryptheon-last.json');
+// Where scan.js keeps the last run for the project it was run in (cwd: HERE).
+const SAVED = require('./store.js').pathsFor(HERE).nightLast;
 
 /** Runs scan.js the way a person does, and hands back what they would see. */
-function cli(args) {
+function cli(args, cwd) {
   // A preload is honoured only so this can run on a network that blocks 5432
   // outbound, where the driver has to reach Postgres over 443 instead. It
   // swaps the driver underneath and nothing else; every line being checked
   // here is the same one that runs in production.
   const before = process.env.KN_PRELOAD ? ['--require', process.env.KN_PRELOAD] : [];
   const r = spawnSync(process.execPath, before.concat([path.join(HERE, 'scan.js'), CONN], args), {
-    cwd: HERE,
+    cwd: cwd || HERE,
     encoding: 'utf8',
     timeout: 300000,
   });
@@ -132,6 +137,23 @@ function must(condition, what) {
       (saved.attempted || []).some((key) => /^duplicated:/.test(key)),
       'it saved the collision attacks it ran, not only the impersonation ones',
     );
+    must(!fs.existsSync(path.join(HERE, '.kryptheon-last.json')), 'the saved run is not in the project folder');
+
+    // A project from before the store: its last run sits in the project as
+    // .kryptheon-last.json. Moving it must not cost the re-check - a lost run
+    // would make the next one "the first", which proves nothing.
+    const older = fs.mkdtempSync(path.join(require('os').tmpdir(), 'kn-older-'));
+    try {
+      fs.writeFileSync(path.join(older, '.kryptheon-last.json'), fs.readFileSync(SAVED, 'utf8'));
+      const moved = cli([appA, '--recheck'], older);
+      must(!/no earlier run/.test(moved.out), 'an older project\'s saved run is found after the move');
+      must(/Moved out of this folder/.test(moved.out) && /\.kryptheon-last\.json/.test(moved.out), 'the move is said, by name');
+      must(!fs.existsSync(path.join(older, '.kryptheon-last.json')), 'the saved run is gone from the older project');
+      must(moved.code === 1, 'the re-check still holds the three open problems against it, got ' + moved.code);
+      must(/still open/.test(moved.out), 'it compares, and says what is still open');
+    } finally {
+      fs.rmSync(older, { recursive: true, force: true });
+    }
 
     // The person does what the pasted prompts told them to do.
     const q = (t) => schema.quote(appA) + '.' + schema.quote(t);

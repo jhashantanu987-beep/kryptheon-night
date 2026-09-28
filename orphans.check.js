@@ -15,6 +15,10 @@
 // leaving the rubbish, and sweeping away a copy that belongs to a scan running
 // in another window right now.
 
+// A run this check causes is saved to a scratch store, never the real
+// ~/.kryptheon (see store.js).
+process.env.KRYPTHEON_HOME = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'kryptheon-home-'));
+
 const { Client } = require('pg');
 const schema = require('./schema.js');
 const { sweepOldCopies, ABANDONED_AFTER } = require('./scan.js');

@@ -15,6 +15,10 @@
 // run before publishing without a connection string, and `prepublishOnly`
 // runs it.
 
+// A run this check causes is saved to a scratch store, never the real
+// ~/.kryptheon (see store.js).
+process.env.KRYPTHEON_HOME = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'kryptheon-home-'));
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');

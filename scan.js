@@ -21,11 +21,26 @@ const collision = require('./collision.js');
 const tamper = require('./tamper.js');
 const orphan = require('./orphan.js');
 const recheck = require('./recheck.js');
+const store = require('./store.js');
 
-// Where the last run is kept so the next one has something to compare against.
-// Beside the person's own project, not in a temp folder, because a re-check a
-// week later has to find it.
-const LAST_RUN = '.kryptheon-last.json';
+// Where the last run is kept so the next one has something to compare against:
+// the project's store under ~/.kryptheon, not a temp folder, because a
+// re-check a week later has to find it - and not the project, because a saved
+// run lists one app's tables and exactly where it is weak, which is the last
+// thing that should ever be committed. It used to be .kryptheon-last.json in
+// the project; the store moves one it finds there, once, and says so.
+//
+// Throws when the store cannot be made: a run that could not be saved would
+// leave the next re-check nothing to hold anyone to.
+function lastRunFile(say) {
+  const opened = store.open(process.cwd());
+  const lines = store.migrationLines(opened);
+  if (lines.length && say) {
+    say('');
+    lines.forEach(say);
+  }
+  return opened.nightLast;
+}
 
 const line = (text) => process.stdout.write(text + '\n');
 
@@ -530,7 +545,17 @@ async function main() {
     process.exit(2);
   }
 
-  const file = path.resolve(LAST_RUN);
+  let file;
+  try {
+    file = lastRunFile(line);
+  } catch (err) {
+    // 2, not 1: nothing was attacked, so nothing "got through".
+    console.error('');
+    console.error('  There is nowhere to keep this run (' + err.message + ').');
+    console.error('  Set KRYPTHEON_HOME to a folder you can write to, and run this again.');
+    console.error('');
+    process.exit(2);
+  }
   const before = again ? loadLastRun(file) : null;
   if (again && !before) {
     // Running a fresh scan and calling it a re-check would report every
@@ -595,6 +620,6 @@ module.exports = {
   saveRun: saveRun,
   sweepOldCopies: sweepOldCopies,
   notTestedLines: notTestedLines,
-  LAST_RUN: LAST_RUN,
+  lastRunFile: lastRunFile,
   ABANDONED_AFTER: ABANDONED_AFTER,
 };

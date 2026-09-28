@@ -21,6 +21,10 @@
 // table whose name happened to start the same way as this tool's own stand-ins;
 // a foreign key over two columns; and a view over a locked table, which does
 // not just go unreported - it took the whole scan down.
+// A run this check causes is saved to a scratch store, never the real
+// ~/.kryptheon (see store.js).
+process.env.KRYPTHEON_HOME = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'kryptheon-home-'));
+
 const { Client } = require('pg');
 const schema = require('./schema.js');
 const fixture = require('./fixture.js');
