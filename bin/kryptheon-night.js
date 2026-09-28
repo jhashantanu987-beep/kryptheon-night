@@ -32,6 +32,7 @@ const trouble = require('../trouble.js');
 const { howToConnect } = require('../connect.js');
 const installer = require('../installer.js');
 const finding = require('../finding.js');
+const outside = require('../outside.js');
 
 const line = (text) => process.stdout.write(text + '\n');
 const fail = (text) => process.stderr.write(text + '\n');
@@ -44,6 +45,12 @@ function usage() {
     '  There is one command. It asks for what it needs:',
     '',
     '      npx kryptheon-night',
+    '',
+    '  No connection string? Give it your running app instead. It reads the app',
+    '  the way a stranger does and tells you which tables anyone can read -',
+    '  counts only, nothing written:',
+    '',
+    '      npx kryptheon-night https://your-app.example.com',
     '',
     '  Run it again after you fix something and it tells you what is actually',
     '  closed - you do not have to ask it to. It also offers to do the same',
@@ -85,11 +92,15 @@ const VERBS = ['install', 'uninstall', 'status', 'night'];
 /** What was asked for, and what was left to the default. */
 function readArgs(argv) {
   const asked = {
-    command: 'scan', schema: null, recheck: false, yes: false, help: false, unknown: [],
+    command: 'scan', schema: null, appUrl: null, recheck: false, yes: false, help: false, unknown: [],
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--recheck') asked.recheck = true;
+    // An address is the outside attack: the running app, read the way a
+    // stranger's browser reads it. Never a schema name - no schema is called
+    // https://anything.
+    if (/^https?:\/\//i.test(arg) && !asked.appUrl) asked.appUrl = arg;
+    else if (arg === '--recheck') asked.recheck = true;
     else if (arg === '--yes' || arg === '-y') asked.yes = true;
     else if (arg === '--help' || arg === '-h') asked.help = true;
     else if (arg === '--schema') asked.schema = argv[++i] || null;
@@ -322,6 +333,45 @@ async function offerTheNight(client, target, canAsk) {
   }
 }
 
+/**
+ * The attack from outside, end to end: find the backend in the app, ask each
+ * table as a stranger, say what came back and what could not be tested.
+ *
+ * Exit codes are the same three as the scan: 1 when a stranger read rows, 0
+ * when nothing came back, 2 when it could not run at all.
+ */
+async function runOutside(appUrl) {
+  line('');
+  line('  Kryptheon Night Shift - from outside');
+  line('  I read your app the way a stranger\'s browser does, and ask your');
+  line('  database what it lets a stranger see. Counts only, nothing written.');
+  line('');
+  line('  Reading ' + appUrl + ' ...');
+
+  let found;
+  try {
+    found = await outside.discover(appUrl);
+  } catch (err) {
+    fail('');
+    fail('  ' + (err.code ? err.message : 'I could not read ' + appUrl + ': ' + err.message));
+    fail('');
+    return 2;
+  }
+
+  let result;
+  try {
+    result = await outside.prowl(found);
+  } catch (err) {
+    fail('');
+    fail('  I found your database but could not ask it anything: ' + err.message);
+    fail('');
+    return 2;
+  }
+
+  outside.reportLines(found, result).forEach(line);
+  return result.findings.length ? 1 : 0;
+}
+
 /** Prints a block of plain lines with the indent the rest of the report uses. */
 function block(lines, write) {
   (write || line)('');
@@ -341,6 +391,15 @@ async function main() {
     fail('  I do not know the option ' + asked.unknown[0] + '.');
     usage().forEach(fail);
     process.exit(2);
+  }
+
+  // The outside attack. Needs no connection string, no copy and no yes: it
+  // only asks the live app what it already answers any visitor, and asks for
+  // counts, never rows. So nothing below - the string, the consent screen,
+  // the connection - applies to it.
+  if (asked.appUrl) {
+    process.exitCode = await runOutside(asked.appUrl);
+    return;
   }
 
   line('');

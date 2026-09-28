@@ -312,6 +312,19 @@ function bodyFor(finding, contents) {
   }
 
   if (finding.kind === 'exposed') {
+    // Two different proofs, said as two different things. The copy-based scan
+    // signed in with the anon key and pulled the rows out; the outside check
+    // (outside.js) asked the live app for the count alone and never pulled a
+    // row, so it may not claim it did.
+    if (finding.countOnly) {
+      const many = finding.readable === 1 ? 'is 1 row' : 'are ' + finding.readable + ' rows';
+      return (
+        'Anyone on the internet, without logging in and without an account, can read ' +
+        'this table. I asked your live app as a stranger and it let me - there ' + many +
+        ' in it. I asked only for the count, so I never pulled a row out; a real ' +
+        'attacker would have taken them.'
+      );
+    }
     return (
       'Anyone on the internet, without logging in and without an account, can read ' +
       'this table. I did it myself just now and got back ' + finding.readable + ' ' + rowWord +
@@ -476,6 +489,9 @@ function describe(finding) {
     proof: finding.kind === 'duplicated'
       ? 'I created ' + finding.copies + ' rows in "' + finding.table + '" holding the same ' +
         finding.column + '.'
+      : finding.countOnly
+      ? 'I counted ' + finding.readable + ' ' + (finding.readable === 1 ? 'row' : 'rows') +
+        ' in "' + finding.table + '" that a stranger can read, without pulling any of them out.'
       : 'I read ' + finding.readable + ' ' + (finding.readable === 1 ? 'row' : 'rows') +
         ' from "' + finding.table + '" that should not have been readable.',
     fixPrompt: fixPromptFor(finding),

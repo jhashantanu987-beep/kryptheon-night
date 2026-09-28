@@ -37,6 +37,27 @@ If you paste the wrong thing — the project URL, an API key, the line with
 `[YOUR-PASSWORD]` still in it — it says so and tells you where the right one
 is. It does not just fail.
 
+## No connection string? Check your app from outside
+
+```
+npx kryptheon-night https://your-app.example.com
+```
+
+Give it your running app instead. It reads the app the way a stranger's
+browser does — the Supabase address and public key every visitor is already
+handed — and asks each table your app uses one question: can a stranger read
+this? It asks for a **count only**, so no customer's row is ever pulled out,
+and it writes nothing. About ten seconds, no password, no yes to give.
+
+It is a narrower check than the full scan, and it says so:
+
+- It only proves a leak when a stranger actually gets rows back. A table that
+  answers with none looks the same whether it is well protected or open and
+  empty, so it is reported as "could not tell", never as safe.
+- One customer reading another's rows, adding or deleting rows, and the same
+  thing saved twice at once all change data, so they are only ever tried on
+  a copy — the full scan above.
+
 ## What you get back
 
 Four questions, asked against the copy:
