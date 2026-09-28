@@ -362,6 +362,48 @@ const cases = [
     },
   },
   {
+    name: 'an anon-callable definer function is reported as verification-required, never as proven',
+    run: () => {
+      const problems = [];
+      const writes = finding.describe({ kind: 'privileged', fn: 'claim', args: 'k text', writes: true, hasFixedSearchPath: true, columns: [] });
+      const reads = finding.describe({ kind: 'privileged', fn: 'peek', args: '', writes: false, hasFixedSearchPath: false, columns: [] });
+      if (writes.status !== 'verification required') problems.push('status was ' + writes.status);
+      if (writes.severity !== 'HIGH') problems.push('severity was ' + writes.severity + ', expected HIGH (never CRITICAL - it was not run)');
+      if (writes.table !== 'claim') problems.push('the function name is not the headline subject: ' + writes.table);
+      // Never claim it was executed.
+      if (/\bI (ran|called|inserted|read)\b/.test(writes.body)) problems.push('the body claims it did something: ' + writes.body);
+      if (!/did not call/.test(writes.proof)) problems.push('the proof does not say it was not executed: ' + writes.proof);
+      // Writes vs reads changes the words, not the verdict.
+      if (!/writes to your data/.test(writes.body)) problems.push('a writing function does not say so');
+      if (/writes to your data/.test(reads.body)) problems.push('a read-only function was said to write');
+      // The missing search_path is raised only when it is missing.
+      if (!/search_path/.test(reads.body)) problems.push('a function with no fixed search_path did not mention it');
+      if (/search_path/.test(writes.body)) problems.push('a function with a fixed search_path was warned about it anyway');
+      // The fix names the revoke and includes PUBLIC, not just anon.
+      if (!/REVOKE EXECUTE ON FUNCTION "claim"/.test(writes.fixPrompt)) problems.push('the fix does not name the revoke');
+      if (!/FROM anon, PUBLIC/.test(writes.fixPrompt)) problems.push('the fix revokes from anon but forgets PUBLIC');
+      if (!/service_role/.test(writes.fixPrompt)) problems.push('the fix does not point at service_role');
+      if (!/check it rather than assume/.test(writes.fixPrompt)) problems.push('the prompt does not tell the assistant to verify first');
+      return problems;
+    },
+  },
+  {
+    name: 'a definer finding does not crowd out or get crowded out by a real one',
+    run: () => {
+      const all = finding.describeAll([
+        { kind: 'privileged', fn: 'claim', args: '', writes: true, hasFixedSearchPath: true, columns: [] },
+        CUSTOMERS_OPEN,
+      ]);
+      const problems = [];
+      const priv = all.find((d) => d.kind === 'privileged');
+      const open = all.find((d) => d.kind === 'exposed');
+      if (!priv || !open) return ['one of the two findings was dropped: ' + JSON.stringify(all.map((d) => d.kind))];
+      // The proven, public leak ranks above the unproven reach.
+      if (all.indexOf(open) > all.indexOf(priv)) problems.push('the verification-required item was listed above a confirmed leak');
+      return problems;
+    },
+  },
+  {
     name: 'a duplicate email where sign-in happens elsewhere is not called a shared login',
     run: () => {
       const problems = [];

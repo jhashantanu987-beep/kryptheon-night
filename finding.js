@@ -72,6 +72,14 @@ function listOf(items) {
  * should be fixed - there is no such thing as a low finding here.
  */
 function severityOf(finding, contents) {
+  if (finding.kind === 'privileged') {
+    // Not proven, so never CRITICAL: this is a reach that exists, not a break
+    // that was demonstrated. A function anon can call that also writes is worth
+    // more attention than one that only reads, but both stay HIGH and both
+    // carry "verification required" - the person has to say whether the anon
+    // call was intended.
+    return 'HIGH';
+  }
   if (finding.kind === 'orphaned') {
     // Nothing is exposed and nothing is destroyed, so this is not the same
     // order of thing as a table anyone can empty. It stays serious because
@@ -253,6 +261,9 @@ function headlineFor(finding) {
   if (finding.kind === 'duplicated') {
     return 'Your ' + finding.table + ' table lets the same ' + finding.column + ' exist twice.';
   }
+  if (finding.kind === 'privileged') {
+    return 'Anyone on the internet can call your ' + finding.fn + ' function, and it runs with full rights.';
+  }
   if (finding.kind === 'exposed') {
     return 'Your ' + finding.table + ' ' + (finding.isView ? 'view' : 'table') + ' can be read by anyone.';
   }
@@ -317,6 +328,25 @@ function bodyFor(finding, contents) {
       'kept, and your live app was never touched.';
   }
 
+  if (finding.kind === 'privileged') {
+    // Said as what is true, not as what was done - nothing was executed. The
+    // reach is real; whether it is a mistake is the person's to say, so the
+    // wording asks rather than accuses.
+    return (
+      'This function is SECURITY DEFINER, so it runs as whoever created it, not ' +
+      'as the visitor calling it - which means the row level security on the tables ' +
+      'it touches is checked against the owner and skipped for the caller. It is ' +
+      'granted to anon, the role a visitor with no account uses, so anyone on the ' +
+      'internet can call it' +
+      (finding.writes ? ' - and it writes to your data, so a caller can change rows the rules would otherwise protect.'
+                       : ', reaching whatever it reads past the rules on those tables.') +
+      ' I did not call it: whether an open function like this is intended is ' +
+      'something only you can confirm.' +
+      (finding.hasFixedSearchPath ? ''
+        : ' It also does not pin its search_path, so a caller can point the names ' +
+          'inside it at their own objects.')
+    );
+  }
   if (finding.kind === 'duplicated') {
     // Said as what was done, not as what it implies. Two connections, one
     // moment, both accepted, and here is the count afterwards.
@@ -384,7 +414,36 @@ function fixPromptFor(finding) {
   const cause = causeOf(finding);
   const owner = finding.owner ? '"' + finding.owner + '"' : 'the column that says who each row belongs to';
 
-  const lines = finding.kind === 'orphaned'
+  const lines = finding.kind === 'privileged'
+    ? [
+      'My app may have a security problem - please check it rather than assume it.',
+      '',
+      'The database function "' + finding.fn + '(' + (finding.args || '') + ')" is SECURITY ' +
+        'DEFINER, so it runs with its owner\'s rights and ignores row level security. It is ' +
+        'granted EXECUTE to "anon", so anyone who is not logged in can call it' +
+        (finding.writes ? ', and it writes to tables.' : '.'),
+      '',
+      'First tell me: is it meant to be callable by logged-out visitors? If it is not, ' +
+        'REVOKE EXECUTE ON FUNCTION "' + finding.fn + '"(' + (finding.args || '') + ') FROM anon, PUBLIC, ' +
+        'and GRANT EXECUTE only to the role that should run it - usually service_role, the ' +
+        'backend key, the way an admin-only function like this should be reached.',
+      '',
+    ].concat(
+      finding.hasFixedSearchPath
+        ? []
+        : [
+          'It also does not set a fixed search_path. Add SET search_path = pg_catalog, public (or ' +
+            'the schemas it truly needs) so a caller cannot make it resolve names to their own objects.',
+          '',
+        ],
+      [
+        'If it is meant to be public, keep it, but make sure everything inside it checks what the ' +
+          'caller is allowed to see or change itself - the table rules will not do it here.',
+        '',
+        'Then look at every other SECURITY DEFINER function for the same grant.',
+      ],
+    )
+    : finding.kind === 'orphaned'
     ? [
       'My app has a data problem.',
       '',
@@ -520,7 +579,15 @@ function describe(finding) {
   const cause = causeOf(finding);
   return {
     severity: severityOf(finding, contents),
-    table: finding.table,
+    // Every other finding here was proven by an attack that ran; this is the
+    // one the tool reasons about without executing, so it says so. The report
+    // and the re-check both read this: a "verification required" finding is
+    // never counted towards a clean re-check on its own.
+    status: finding.kind === 'privileged' ? 'verification required' : 'confirmed',
+    table: finding.kind === 'privileged' ? finding.fn : finding.table,
+    fn: finding.fn,
+    args: finding.args,
+    writes: finding.writes,
     kind: finding.kind,
     // Carried through because a table can have two different columns that each
     // accept a duplicate, and the re-check tells one finding from another by
@@ -532,10 +599,15 @@ function describe(finding) {
     expectation: finding.expectation,
     headline: headlineFor(finding, contents),
     body: bodyFor(finding, contents),
-    cause: cause.long,
+    // For a privileged function there is no "why the door is open" the way a
+    // table has one; the body already carries the whole explanation, so the
+    // cause line would only repeat it. Left empty and skipped by the report.
+    cause: finding.kind === 'privileged' ? '' : cause.long,
     who: finding.who,
     can: finding.can,
-    proof: finding.kind === 'duplicated'
+    proof: finding.kind === 'privileged'
+      ? 'I did not call "' + finding.fn + '". This is a reach that exists in the grants, not a break I ran.'
+      : finding.kind === 'duplicated'
       ? 'I created ' + finding.copies + ' rows in "' + finding.table + '" holding the same ' +
         finding.column + '.'
       : finding.countOnly
@@ -573,7 +645,7 @@ function describeAll(findings) {
   // ones that need an account, and those before the ones that need two requests
   // to arrive together.
   // Writes above reads: a table somebody emptied is worse than one they read.
-  const byKind = { writable: 0, exposed: 1, crossed: 2, duplicated: 3, orphaned: 4 };
+  const byKind = { writable: 0, exposed: 1, crossed: 2, duplicated: 3, orphaned: 4, privileged: 5 };
   const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (byKind[d.kind] === undefined ? 9 : byKind[d.kind]);
   return described.sort((a, b) => rank(a) - rank(b));
 }

@@ -178,6 +178,65 @@ async function readIndexes(client, schema) {
  * pg_policies hands back `qual` and `with_check` already rendered as SQL, which
  * is what makes an exact copy possible at all.
  */
+/**
+ * Functions an anonymous visitor can call that run with their owner's rights.
+ *
+ * A SECURITY DEFINER function runs as whoever wrote it, not as the caller, so
+ * the row level security on every table it touches is checked against the
+ * owner - and bypassed for the caller. That is exactly what such a function is
+ * for; it is only a problem when the person allowed to call it is somebody who
+ * should not have that reach.
+ *
+ * Only `anon` is treated as that person here, on purpose. anon is the whole
+ * internet with no account. A definer function granted only to `authenticated`
+ * is the ordinary Supabase RPC pattern - it is meant to be called by signed-in
+ * users and guarded inside with auth.uid() - and flagging every one of those
+ * would bury the real finding under the intended design. So the low-false-
+ * alarm signal is: security definer, callable by anon, and not a trigger.
+ *
+ * Trigger functions are excluded because calling one directly does nothing (it
+ * needs a row event), so "anon can call it" is not a reach anon actually has.
+ *
+ * This is read only. Nothing is executed - the finding it produces is a
+ * "verification required", not a proven break, because whether an anon RPC is
+ * intended is a question only the person who wrote it can answer.
+ */
+async function readAnonDefinerFunctions(client, schema) {
+  const { rows } = await client.query(
+    `SELECT p.proname AS name,
+            pg_get_function_identity_arguments(p.oid) AS args,
+            p.proconfig::text AS config,
+            pg_get_functiondef(p.oid) AS def
+       FROM pg_proc p
+       JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = $1
+        AND p.prosecdef
+        AND p.prorettype <> 'pg_catalog.trigger'::regtype
+        AND has_function_privilege('anon', p.oid, 'EXECUTE')
+      ORDER BY p.proname`,
+    [schema],
+  );
+  return rows.map((row) => {
+    // A definer function with no search_path pinned is a second, separate
+    // hazard: the caller can set their own search_path and make the function
+    // resolve to their objects. Said as part of the same finding.
+    const config = row.config || '';
+    const hasFixedSearchPath = /(^|,)search_path=/i.test(config.replace(/[{}"]/g, ''));
+    // The body is only used to say, in the report, whether it writes - which
+    // decides how the finding is worded, not whether it is reported. A comment
+    // could fool this, and that is acceptable: it never turns a non-finding
+    // into a finding, only "can read" into "can change".
+    const body = String(row.def || '').replace(/--[^\n]*/g, ' ');
+    const writes = /\b(insert\s+into|update\s+\w|delete\s+from|truncate|merge\s+into)\b/i.test(body);
+    return {
+      name: row.name,
+      args: row.args || '',
+      writes: writes,
+      hasFixedSearchPath: hasFixedSearchPath,
+    };
+  });
+}
+
 async function readPolicies(client, schema) {
   const { rows } = await client.query(
     `SELECT tablename AS table_name,
@@ -452,6 +511,7 @@ async function readSchema(client, schema) {
     views: await readViewsWithColumns(client, schema),
     viewGrants: await readViewGrants(client, schema),
     external: external,
+    anonFunctions: await readAnonDefinerFunctions(client, schema),
     unsupported: unsupported,
   };
 }
@@ -1119,6 +1179,7 @@ function diffSchemas(source, copy) {
 
 module.exports = {
   readSchema: readSchema,
+  readAnonDefinerFunctions: readAnonDefinerFunctions,
   writeSchema: writeSchema,
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,

@@ -352,13 +352,29 @@ async function scan(client, sourceSchema, options) {
       f.expectation === 'identity' ? Object.assign({}, f, { loginElsewhere: loginElsewhere }) : f,
     );
 
+    // Functions an anonymous visitor can call that run past the rules. Read
+    // from the shape, not attacked: nothing is executed, because whether such
+    // a function is meant to be public is a question only the owner answers.
+    // Each one still counts as re-checked - it was read again this run - so a
+    // grant that has since been revoked reads as fixed rather than unverifiable.
+    const privileged = (plan.anonFunctions || []).map((fn) => ({
+      kind: 'privileged',
+      fn: fn.name,
+      table: fn.name,
+      args: fn.args,
+      writes: fn.writes,
+      hasFixedSearchPath: fn.hasFixedSearchPath,
+      columns: [],
+    }));
+    for (const f of privileged) attempted.push('privileged:' + f.fn);
+
     return {
       stopped: null,
       attacksRun: attempted.length,
       notChecked: notChecked,
       attempted: attempted,
       findings: finding.describeAll(
-        impersonation.findings.concat(writes.findings, stranded.findings, raced),
+        impersonation.findings.concat(writes.findings, stranded.findings, raced, privileged),
       ),
     };
   } finally {
@@ -485,18 +501,29 @@ function report(result) {
 
   sayWhatWasMissed();
 
-  const count = result.findings.length;
+  // Confirmed breaks and things that only need a look are not the same claim,
+  // so they are counted apart. Saying "3 problems" when one of them was never
+  // executed is the kind of overstatement that costs the next report its trust.
+  const confirmed = result.findings.filter((f) => f.status !== 'verification required');
+  const toVerify = result.findings.filter((f) => f.status === 'verification required');
   line('');
-  line('  ' + count + (count === 1 ? ' problem' : ' problems') + ' found.');
+  if (confirmed.length) {
+    line('  ' + confirmed.length + (confirmed.length === 1 ? ' problem' : ' problems') + ' found.');
+  }
+  if (toVerify.length) {
+    line('  ' + toVerify.length + ' thing' + (toVerify.length === 1 ? '' : 's') +
+      ' to check - I did not attack ' + (toVerify.length === 1 ? 'it' : 'them') + ', only spotted the risk.');
+  }
 
   for (const item of result.findings) {
     line('');
     line('  ' + '-'.repeat(68));
-    line('  ' + item.severity + '   ' + item.table);
+    line('  ' + item.severity + '   ' + item.table +
+      (item.status === 'verification required' ? '   (verification required)' : ''));
     line('');
     line('  ' + item.headline);
     line('');
-    for (const paragraph of [item.body, item.cause]) {
+    for (const paragraph of [item.body, item.cause].filter(Boolean)) {
       wrap(paragraph, 70).forEach((l) => line('  ' + l));
       line('');
     }
