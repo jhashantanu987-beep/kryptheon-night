@@ -200,21 +200,32 @@ async function readIndexes(client, schema) {
  * This is read only. Nothing is executed - the finding it produces is a
  * "verification required", not a proven break, because whether an anon RPC is
  * intended is a question only the person who wrote it can answer.
+ *
+ * Every definer function is returned, each with `callable` saying whether the
+ * role can run it. The ones that cannot are what makes a fix provable: a
+ * re-check needs to know the function was looked at again and the grant was
+ * gone, which is different from the function no longer being there at all.
  */
-async function readAnonDefinerFunctions(client, schema) {
+async function readAnonDefinerFunctions(client, schema, role) {
+  const caller = role || 'anon';
+  // A plain Postgres with no anon role has no anonymous caller at all, so
+  // nothing is callable by it - and has_function_privilege() on a role that
+  // does not exist throws, which took the whole scan down with it before this
+  // was checked first.
+  const exists = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [caller]);
   const { rows } = await client.query(
     `SELECT p.proname AS name,
             pg_get_function_identity_arguments(p.oid) AS args,
             p.proconfig::text AS config,
-            pg_get_functiondef(p.oid) AS def
+            pg_get_functiondef(p.oid) AS def,
+            ${exists.rows.length ? "has_function_privilege($2, p.oid, 'EXECUTE')" : 'false'} AS callable
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = $1
         AND p.prosecdef
         AND p.prorettype <> 'pg_catalog.trigger'::regtype
-        AND has_function_privilege('anon', p.oid, 'EXECUTE')
       ORDER BY p.proname`,
-    [schema],
+    exists.rows.length ? [schema, caller] : [schema],
   );
   return rows.map((row) => {
     // A definer function with no search_path pinned is a second, separate
@@ -233,6 +244,7 @@ async function readAnonDefinerFunctions(client, schema) {
       args: row.args || '',
       writes: writes,
       hasFixedSearchPath: hasFixedSearchPath,
+      callable: row.callable === true,
     };
   });
 }

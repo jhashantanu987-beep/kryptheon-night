@@ -561,7 +561,7 @@ async function main() {
     if (!before) {
       scanner.report(result);
       scanner.saveRun(file, result);
-      process.exitCode = result.stopped ? 2 : result.findings.length ? 1 : 0;
+      process.exitCode = scanner.exitCodeFor(result);
     } else {
       const verdict = recheck.compare(before, result);
       recheck.describe(verdict).forEach(line);

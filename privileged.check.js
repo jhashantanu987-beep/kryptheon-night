@@ -14,6 +14,7 @@ const { Client } = require('pg');
 const schema = require('./schema.js');
 const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
+const recheck = require('./recheck.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 const STAMP = Date.now().toString(36);
@@ -86,8 +87,12 @@ async function main() {
     await fixture.ensureRoles(client, null, q);
     await build(client);
     const fns = await schema.readAnonDefinerFunctions(client, APP);
-    const byName = new Map(fns.map((f) => [f.name, f]));
-    const names = fns.map((f) => f.name).sort();
+    // Everything examined, and within that what anon can actually call. Only
+    // the second list becomes findings; the first is what the re-check needs.
+    const examined = fns.map((f) => f.name).sort();
+    const flagged = fns.filter((f) => f.callable);
+    const byName = new Map(flagged.map((f) => [f.name, f]));
+    const names = flagged.map((f) => f.name).sort();
 
     check('it flags the definer function anon can call', (() => {
       return byName.has('claim') ? [] : ['claim was not flagged; got ' + JSON.stringify(names)];
@@ -124,10 +129,41 @@ async function main() {
       return peek.hasFixedSearchPath ? ['peek has no SET search_path but was read as if it had one'] : [];
     })());
 
+    // A database with no anon role at all - plain Postgres, not Supabase. There
+    // is no anonymous caller, so nothing to report; and it must not throw,
+    // because this runs inside every scan and a throw here stops all of it.
+    let missingRole;
+    try {
+      missingRole = await schema.readAnonDefinerFunctions(client, APP, 'kn_no_such_role_' + STAMP);
+    } catch (err) {
+      missingRole = err;
+    }
+    check('a database without the anon role reports nothing and does not crash the scan', (() => {
+      if (missingRole instanceof Error) return ['it threw: ' + missingRole.message];
+      const callable = missingRole.filter((f) => f.callable);
+      return callable.length ? ['it called ' + callable.length + ' functions callable by a role that does not exist'] : [];
+    })());
+
     check('exactly the three risky functions are flagged, no more', (() => {
       const want = ['claim', 'peek', 'viapublic'];
       const got = names;
       return JSON.stringify(got) === JSON.stringify(want) ? [] : ['expected ' + JSON.stringify(want) + ', got ' + JSON.stringify(got)];
+    })());
+
+    check('every definer function is examined, including the ones anon cannot call', (() => {
+      // mine is definer but authenticated-only: examined, not flagged. The
+      // trigger and the invoker function are not definer-callables at all.
+      const want = ['claim', 'mine', 'peek', 'viapublic'];
+      return JSON.stringify(examined) === JSON.stringify(want) ? [] : ['expected ' + JSON.stringify(want) + ', got ' + JSON.stringify(examined)];
+    })());
+
+    // The role the reader asks about is the role it reports on. Asked as
+    // authenticated, mine becomes callable too.
+    const asAuthed = (await schema.readAnonDefinerFunctions(client, APP, 'authenticated'))
+      .filter((f) => f.callable).map((f) => f.name).sort();
+    check('the reader answers for the role it is asked about', (() => {
+      const want = ['claim', 'mine', 'peek', 'viapublic'];
+      return JSON.stringify(asAuthed) === JSON.stringify(want) ? [] : ['as authenticated expected ' + JSON.stringify(want) + ', got ' + JSON.stringify(asAuthed)];
     })());
 
     // The reader is one thing; a full scan carrying its output into the report
@@ -145,6 +181,25 @@ async function main() {
       // It was read again this run, so a later run where the grant is gone can
       // call it fixed rather than "could not confirm".
       if (!(result.attempted || []).includes('privileged:claim')) problems.push('the re-check has no record that this was looked at');
+      return problems;
+    })());
+
+    // The loop the whole product is sold on: fix, re-check, and the fix is
+    // proven. Revoking the grant is securing it; dropping the function is not
+    // the same act and must not be credited as a fix.
+    await client.query('REVOKE EXECUTE ON FUNCTION ' + q(APP) + '.claim(text) FROM anon, PUBLIC');
+    await client.query('DROP FUNCTION ' + q(APP) + '.viapublic()');
+    const again = await scan(client, APP, { quiet: true });
+    const verdict = recheck.compare(result, again);
+    check('a revoked grant is confirmed fixed; a dropped function is not', (() => {
+      const problems = [];
+      const fixed = verdict.fixed.map((f) => f.table);
+      const unknown = verdict.unverifiable.map((f) => f.table);
+      const open = verdict.stillOpen.map((f) => f.table);
+      if (!fixed.includes('claim')) problems.push('revoking anon did not read as fixed; fixed=' + JSON.stringify(fixed) + ' unknown=' + JSON.stringify(unknown));
+      if (fixed.includes('viapublic')) problems.push('a dropped function was credited as fixed');
+      if (!unknown.includes('viapublic')) problems.push('a dropped function was not reported as unconfirmed; unknown=' + JSON.stringify(unknown));
+      if (!open.includes('peek')) problems.push('peek, still open, was not reported as still open');
       return problems;
     })());
   } finally {

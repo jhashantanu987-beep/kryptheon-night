@@ -355,9 +355,14 @@ async function scan(client, sourceSchema, options) {
     // Functions an anonymous visitor can call that run past the rules. Read
     // from the shape, not attacked: nothing is executed, because whether such
     // a function is meant to be public is a question only the owner answers.
-    // Each one still counts as re-checked - it was read again this run - so a
-    // grant that has since been revoked reads as fixed rather than unverifiable.
-    const privileged = (plan.anonFunctions || []).map((fn) => ({
+    //
+    // Every definer function read this run counts as examined, whether or not
+    // anon can call it. That is what lets the re-check call a revoked grant
+    // fixed: the function was looked at again and the reach was gone. The first
+    // version recorded only the flagged ones, so a revoke made the function
+    // vanish from both lists and the fix came back as "could not confirm".
+    for (const fn of plan.anonFunctions || []) attempted.push('privileged:' + fn.name);
+    const privileged = (plan.anonFunctions || []).filter((fn) => fn.callable).map((fn) => ({
       kind: 'privileged',
       fn: fn.name,
       table: fn.name,
@@ -366,7 +371,6 @@ async function scan(client, sourceSchema, options) {
       hasFixedSearchPath: fn.hasFixedSearchPath,
       columns: [],
     }));
-    for (const f of privileged) attempted.push('privileged:' + f.fn);
 
     return {
       stopped: null,
@@ -385,6 +389,17 @@ async function scan(client, sourceSchema, options) {
       line('  WARNING: the copy ' + copyName + ' could not be deleted: ' + err.message);
     }
   }
+}
+
+/**
+ * The exit code of a first run: 2 could not run, 1 something got through, 0
+ * every attack lost. Only confirmed findings count as "got through" - a
+ * function flagged for verification was never executed, and a script reading
+ * 1 would act on a break nobody demonstrated.
+ */
+function exitCodeFor(result) {
+  if (result.stopped) return 2;
+  return (result.findings || []).some((f) => f.status !== 'verification required') ? 1 : 0;
 }
 
 /** The last run, or null if there has not been one worth keeping. */
@@ -622,7 +637,7 @@ async function main() {
       // Three answers, three codes: 0 clean, 1 problems found, 2 could not
       // run. A scan that stopped used to exit 0 with no findings, which is
       // what any script watching it would read as a pass.
-      process.exitCode = result.stopped ? 2 : result.findings.length ? 1 : 0;
+      process.exitCode = exitCodeFor(result);
       return;
     }
 
@@ -657,5 +672,6 @@ module.exports = {
   sweepOldCopies: sweepOldCopies,
   notTestedLines: notTestedLines,
   lastRunFile: lastRunFile,
+  exitCodeFor: exitCodeFor,
   ABANDONED_AFTER: ABANDONED_AFTER,
 };

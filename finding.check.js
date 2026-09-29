@@ -388,6 +388,20 @@ const cases = [
     },
   },
   {
+    name: 'a run whose only finding needs verification does not exit as "something got through"',
+    run: () => {
+      const { exitCodeFor } = require('./scan.js');
+      const problems = [];
+      const toCheck = { status: 'verification required' };
+      const proven = { status: 'confirmed' };
+      if (exitCodeFor({ stopped: null, findings: [toCheck] }) !== 0) problems.push('only a to-check item exited non-zero');
+      if (exitCodeFor({ stopped: null, findings: [toCheck, proven] }) !== 1) problems.push('a confirmed break next to a to-check item did not exit 1');
+      if (exitCodeFor({ stopped: null, findings: [] }) !== 0) problems.push('a clean run did not exit 0');
+      if (exitCodeFor({ stopped: 'could not connect', findings: [] }) !== 2) problems.push('a run that could not happen did not exit 2');
+      return problems;
+    },
+  },
+  {
     name: 'a definer finding does not crowd out or get crowded out by a real one',
     run: () => {
       const all = finding.describeAll([
