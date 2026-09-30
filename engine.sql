@@ -1885,6 +1885,25 @@ END $$;
  * `seeded` carries the shape of row that worked when the table was seeded, so
  * the insert here is not rejected by some CHECK the seeder already solved.
  */
+/*
+ * Whose name an insert is written under: nobody's yet (user C), unless the
+ * owner column is a key into one of the app's own tables, where only the two
+ * seeded people exist - then the one who is not the signed-in caller.
+ */
+CREATE OR REPLACE FUNCTION __KN__.write_as_for(tab jsonb, owner text, tables jsonb)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF owner IS NOT NULL AND EXISTS (
+    SELECT 1 FROM jsonb_array_elements(__KN__.foreign_keys(tab)) k
+     WHERE jsonb_array_length(k->'columns') = 1 AND k->'columns'->>0 = owner
+       AND EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(tables, '[]'::jsonb)) t
+                    WHERE t->>'name' = k->>'refTable'))
+  THEN
+    RETURN __KN__.user_a();
+  END IF;
+  RETURN __KN__.user_c();
+END $$;
+
 CREATE OR REPLACE FUNCTION __KN__.tamper(source text, tables jsonb, seeded jsonb,
                                        policies jsonb DEFAULT '[]'::jsonb)
 RETURNS jsonb LANGUAGE plpgsql AS $$
@@ -1948,7 +1967,10 @@ BEGIN
     -- Written under a name nobody has used, which is both what makes the row
     -- land at all and what makes it the right test: adding a row of your own
     -- is the feature, adding one under somebody else's name is not.
-    row_ := __KN__.row_for(source, tab, __KN__.user_c(), '7', NULL, shape);
+    -- Unless the owner is a key into one of the app's own tables, where only
+    -- the two seeded people exist: then the one who is not the signed-in
+    -- caller. Found on a blind test, where the nameless insert hit the key.
+    row_ := __KN__.row_for(source, tab, __KN__.write_as_for(tab, owner, tables), '7', NULL, shape);
 
     -- Every statement written out before anybody changes role.
     moves := jsonb_build_array(

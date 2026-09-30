@@ -131,7 +131,13 @@ async function tamper(client, schema, tables, seeded, policies) {
       // Written under a name nobody has used, which is both what makes the
       // row land at all and what makes it the right test: adding a row of
       // your own is the feature, adding one under somebody else name is not.
-      const row = await attack.rowFor(client, schema, table, attack.USER_C, 7, null, shapeFor.get(table.name));
+      //
+      // Unless the owner is a key into one of the app's own tables - provider_id
+      // -> profiles.id - where only the two seeded people exist. Found on a
+      // blind test: the nameless insert hit the foreign key, and "any provider
+      // can add appointments for any other" came back as not tested. The other
+      // seeded person is still somebody else's name to the signed-in caller.
+      const row = await attack.rowFor(client, schema, table, writeAsFor(table, owner, tables), 7, null, shapeFor.get(table.name));
       const placeholders = row.values.map((_, i) => '$' + (i + 1));
       const attempts = [
         row.columns.length
@@ -187,6 +193,18 @@ async function tamper(client, schema, tables, seeded, policies) {
 }
 
 /**
+ * Whose name an insert is written under: nobody's yet (USER_C), unless the
+ * owner column is a key into one of the app's own tables, where only the two
+ * seeded people exist - then the one who is not the signed-in caller.
+ */
+function writeAsFor(table, owner, tables) {
+  if (!owner) return attack.USER_C;
+  const key = attack.foreignKeys(table).find((k) => k.columns.length === 1 && k.columns[0] === owner);
+  const inApp = key && (tables || []).some((t) => t.name === key.refTable);
+  return inApp ? attack.USER_A : attack.USER_C;
+}
+
+/**
  * A column an UPDATE can harmlessly set to itself.
  *
  * Setting a column to its own value changes nothing about the row while still
@@ -204,5 +222,6 @@ module.exports = {
   tryWrite: tryWrite,
   whatHappened: whatHappened,
   firstWritable: firstWritable,
+  writeAsFor: writeAsFor,
   tamper: tamper,
 };

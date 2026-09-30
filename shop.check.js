@@ -95,6 +95,26 @@ async function buildShop(client) {
   await client.query('CREATE TABLE ' + q('visits') + ' (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, provider_id uuid NOT NULL REFERENCES ' + q('profiles') + ' (id), patient_name text NOT NULL)');
   await client.query('ALTER TABLE ' + q('visits') + ' ENABLE ROW LEVEL SECURITY');
   await client.query('CREATE POLICY every_visit ON ' + q('visits') + ' FOR SELECT TO authenticated USING (true)');
+  // And books visits under any provider's name. With the owner a key into
+  // profiles, where only the two seeded people exist, a nameless insert hit
+  // the key and this came back as not tested.
+  await client.query('CREATE POLICY any_booking ON ' + q('visits') + ' FOR INSERT TO authenticated WITH CHECK (true)');
+
+  // Safe, the same shape done right: a provider books and sees only their own.
+  // Written under the caller's own name, an insert here lands - and must not
+  // be reported, because adding a row of your own is the feature.
+  await client.query('CREATE TABLE ' + q('slots') + ' (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, provider_id uuid NOT NULL REFERENCES ' + q('profiles') + ' (id), note text NOT NULL)');
+  await client.query('ALTER TABLE ' + q('slots') + ' ENABLE ROW LEVEL SECURITY');
+  await client.query('CREATE POLICY own_slots ON ' + q('slots') + ' FOR SELECT TO authenticated USING (provider_id = auth.uid())');
+  await client.query('CREATE POLICY book_own ON ' + q('slots') + ' FOR INSERT TO authenticated WITH CHECK (provider_id = auth.uid())');
+
+  // One row per person, keyed to auth.users, and anyone signed in may add one
+  // for anybody. Only a name nobody has used yet can land here: the seeded
+  // people already have their row.
+  await client.query('CREATE TABLE ' + q('settings') + ' (user_id uuid PRIMARY KEY REFERENCES auth.users (id), theme text NOT NULL)');
+  await client.query('ALTER TABLE ' + q('settings') + ' ENABLE ROW LEVEL SECURITY');
+  await client.query('CREATE POLICY see_mine ON ' + q('settings') + ' FOR SELECT TO authenticated USING (user_id = auth.uid())');
+  await client.query('CREATE POLICY add_any ON ' + q('settings') + ' FOR INSERT TO authenticated WITH CHECK (true)');
 
   // Safe, and two people on every row: whose row it is cannot be told, so
   // reading a message sent to you must not be reported as a break.
@@ -210,7 +230,10 @@ async function main() {
           [/order_items: .*point at/i, 'order_items can point at nothing'],
           [/accounts: .*same email/i, 'accounts: the same email twice'],
           [/visits: .*one customer read another/i, "visits: one provider reads another's"],
+          [/visits: .*signed-in customer can add/i, "visits: any provider books under another's name"],
+          [/settings: .*signed-in customer can add/i, 'settings: a row added for somebody else'],
         ];
+        if (/ slots: /.test(found)) problems.push('the safe slots table was reported: ' + found.split('\n').filter((l) => / slots: /.test(l)).join(' / '));
         for (const [pattern, what] of want) if (!pattern.test(found)) problems.push('missing: ' + what);
         // One mistake, one finding: the waitlist's rule opens it to reading and
         // writing, and that is said once, with both proofs kept inside it.
