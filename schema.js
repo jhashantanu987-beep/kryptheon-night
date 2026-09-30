@@ -206,6 +206,49 @@ async function readIndexes(client, schema) {
  * re-check needs to know the function was looked at again and the grant was
  * gone, which is different from the function no longer being there at all.
  */
+/**
+ * Whether a function turns the caller away before it does anything.
+ *
+ * Found on a blind test: create_admin_export opens with
+ *   if not public.is_org_admin(p_org_id) then raise exception ...
+ * and was reported as "anyone can call it, with full rights". A visitor with
+ * no account is not an admin of anything, so the first line refuses them and
+ * nothing else runs. That is a guard, and the function is examined, not
+ * reported.
+ *
+ * Only a refusal counts - IF NOT <check> THEN RAISE - and only one that comes
+ * before the first write and the first RETURN, because a check made after the
+ * work is done guards nothing. The check has to ask about the caller: a call
+ * to one of the schema's yes/no helpers that ask auth.uid(), or a condition
+ * of its own that asks auth.uid() whether they are an admin, owner or member.
+ * "Is anybody signed in at all" is not enough, and neither is a check on an
+ * argument the caller chose.
+ */
+function guardedAtTheDoor(body, helpers) {
+  const text = String(body || '');
+  const writes = /\b(insert\s+into|update\s+(only\s+)?["\w]+|delete\s+from|truncate|merge\s+into)\b/i.exec(text);
+  const returns = /\breturn\b/i.exec(text);
+  const firstAct = Math.min(writes ? writes.index : Infinity, returns ? returns.index : Infinity);
+  // The condition may not run past a THEN, or two IFs would be read as one;
+  // and END IF is not the start of one.
+  const guard = /(?<!\bend\s+)\bif\b((?:(?!\bthen\b)[\s\S])*?)\bthen\s+raise\b(?!\s+(?:notice|warning|info|log|debug)\b)/gi;
+  // The name as a call, bare or schema-qualified (public.is_org_admin), and
+  // never as the tail of a longer name.
+  const asks = (cond, name) => new RegExp('(^|[^\\w$"])"?' +
+    name.replace(/[$]/g, '\\$') + '"?\\s*\\(', 'i').test(cond);
+  let found;
+  while ((found = guard.exec(text)) !== null) {
+    if (found.index > firstAct) break;
+    const cond = found[1].trim();
+    // Refusing when the check fails, not when it passes.
+    const refusesOnNo = /^not\b/i.test(cond) || /\bis\s+(not\s+true|false)\s*$/i.test(cond) || /=\s*false\s*$/i.test(cond);
+    if (!refusesOnNo) continue;
+    if ((helpers || []).some((name) => asks(cond, name))) return true;
+    if (/\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(cond) && /admin|owner|member|role/i.test(cond)) return true;
+  }
+  return false;
+}
+
 async function readAnonDefinerFunctions(client, schema, role) {
   const caller = role || 'anon';
   // A plain Postgres with no anon role has no anonymous caller at all, so
@@ -228,6 +271,21 @@ async function readAnonDefinerFunctions(client, schema, role) {
       ORDER BY p.proname`,
     exists.rows.length ? [schema, caller] : [schema],
   );
+  // The schema's yes/no helpers about the caller - is_org_admin(org) asking
+  // whether auth.uid() is an admin of it - definer or not, since a guard can
+  // call either. Read once, for guardedAtTheDoor.
+  const { rows: yesNo } = await client.query(
+    `SELECT p.proname AS name, pg_get_functiondef(p.oid) AS def
+       FROM pg_proc p
+       JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = $1 AND p.prokind = 'f' AND p.prorettype = 'pg_catalog.bool'::regtype`,
+    [schema],
+  );
+  const helpers = yesNo.filter((row) => {
+    const body = String(row.def || '').replace(/--[^\n]*/g, ' ');
+    return /\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(body) &&
+      !/\b(insert\s+into|update\s+(only\s+)?["\w]+|delete\s+from|truncate|merge\s+into)\b/i.test(body);
+  }).map((row) => row.name);
   return rows.map((row) => {
     // A definer function with no search_path pinned is a second, separate
     // hazard: the caller can set their own search_path and make the function
@@ -257,6 +315,7 @@ async function readAnonDefinerFunctions(client, schema, role) {
       args: row.args || '',
       writes: writes,
       aboutCaller: aboutCaller,
+      guarded: guardedAtTheDoor(body, helpers),
       hasFixedSearchPath: hasFixedSearchPath,
       callable: row.callable === true,
     };
@@ -1206,6 +1265,7 @@ function diffSchemas(source, copy) {
 module.exports = {
   readSchema: readSchema,
   readAnonDefinerFunctions: readAnonDefinerFunctions,
+  guardedAtTheDoor: guardedAtTheDoor,
   writeSchema: writeSchema,
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,
