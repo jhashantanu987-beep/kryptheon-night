@@ -372,13 +372,19 @@ async function scan(client, sourceSchema, options) {
       columns: [],
     }));
 
+    // Whether each table is tied to Supabase's sign-in decides what its fix
+    // can be. Read from the original schema: the copy points auth.users keys
+    // at a stand-in, and would call every table untied.
+    const ties = finding.authTiesOf(plan);
+    const tagged = (f) => (ties.has(f.table) ? Object.assign({}, f, { authTied: ties.get(f.table) }) : f);
+
     return {
       stopped: null,
       attacksRun: attempted.length,
       notChecked: notChecked,
       attempted: attempted,
       findings: finding.describeAll(
-        impersonation.findings.concat(writes.findings, stranded.findings, raced, privileged),
+        impersonation.findings.concat(writes.findings, stranded.findings, raced, privileged).map(tagged),
       ),
     };
   } finally {

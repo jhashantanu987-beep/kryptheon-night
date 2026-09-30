@@ -409,6 +409,34 @@ const cases = [
       return problems;
     },
   },
+  {
+    // One table, one finding - but a partial fix must still read as partial.
+    name: 'a grouped finding is compared proof by proof: writes closed, reads still open, is not fixed',
+    run: () => {
+      const problems = [];
+      const read = { kind: 'exposed', table: 'users', severity: 'CRITICAL', headline: 'Your users table can be read by anyone.' };
+      const write = { kind: 'writable', table: 'users', who: 'anyone', severity: 'CRITICAL', headline: 'Anyone can add rows to your users table.' };
+      const grouped = { kind: 'writable', table: 'users', who: 'anyone', severity: 'CRITICAL', headline: 'Anyone can read and add rows in your users table.', members: [read, write] };
+      const before = { findings: [grouped] };
+      const tried = ['exposed:users', 'writable:users:anyone'];
+      const r = recheck.compare(before, { findings: [read], attempted: tried, notChecked: [] });
+      if (r.allClear) problems.push('called all clear while the table is still readable');
+      if (!r.fixed.some((f) => f.kind === 'writable')) problems.push('the closed write is not listed as fixed: ' + JSON.stringify(r.fixed.map((f) => f.kind)));
+      if (!r.stillOpen.some((f) => f.kind === 'exposed')) problems.push('the open read is not listed as still open: ' + JSON.stringify(r.stillOpen.map((f) => f.kind)));
+      if (r.newlyBroken.length) problems.push('the read was reported as newly broken: ' + JSON.stringify(r.newlyBroken.map((f) => f.kind)));
+      // The report after can be grouped too; its proofs are what count.
+      const regrouped = recheck.compare(before, { findings: [grouped], attempted: tried, notChecked: [] });
+      if (regrouped.newlyBroken.length || regrouped.stillOpen.length !== 2) problems.push('a grouped report after was not read proof by proof');
+      const done = recheck.compare(before, { findings: [], attempted: tried, notChecked: [] });
+      if (!done.allClear) problems.push('both proofs closed and tried, but not all clear');
+      // Two proofs of one table fixed: each line says which one, not "users, users".
+      const said = recheck.describe(done).join('\n');
+      if (!/users \(read by anyone\)/.test(said) || !/users \(written by anyone\)/.test(said)) problems.push('the fixed lines do not say which proof was closed: ' + said);
+      const half = recheck.describe(r).join('\n');
+      if (!/users \(written by anyone\) - I ran the same attack again/.test(half)) problems.push('the closed write is not named: ' + half);
+      return problems;
+    },
+  },
 ];
 
 let failures = 0;

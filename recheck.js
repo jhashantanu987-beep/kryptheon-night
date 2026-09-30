@@ -42,9 +42,20 @@ function keyOf(item) {
  * untestable table would land in `fixed`, and a green badge would be handed to
  * an app nobody checked.
  */
+/**
+ * A report shows one finding per table, but each one keeps the proofs it was
+ * made of. Those are what get compared: closing a table to strangers' writes
+ * while it stays readable is one proof fixed and one still open, not "the
+ * table's finding" either fixed or not. Reports saved before findings were
+ * grouped have no members, and are read as they are.
+ */
+function proofsOf(list) {
+  return (list || []).reduce((all, item) => all.concat(item.members && item.members.length ? item.members : [item]), []);
+}
+
 function compare(before, after) {
-  const was = (before && before.findings) || [];
-  const now = (after && after.findings) || [];
+  const was = proofsOf(before && before.findings);
+  const now = proofsOf(after && after.findings);
 
   // The second run failed outright. Nothing can be claimed about anything.
   if (after && after.stopped) {
@@ -149,6 +160,21 @@ function badgeLines(result, attacksRun) {
   ];
 }
 
+/**
+ * Which proof a line is about. One table can have several - strangers reading
+ * it, strangers writing to it - and "waitlist, waitlist" under "fixed" would
+ * not say which one was closed.
+ */
+function whatOf(item) {
+  if (item.kind === 'exposed') return 'read by anyone';
+  if (item.kind === 'crossed') return "customers reading each other's rows";
+  if (item.kind === 'writable') return item.who === 'anyone' ? 'written by anyone' : 'written by any signed-in customer';
+  if (item.kind === 'duplicated') return 'the same ' + (item.column || 'value') + ' twice';
+  if (item.kind === 'orphaned') return 'rows left pointing at nothing';
+  if (item.kind === 'privileged') return 'a function anyone can call';
+  return item.kind;
+}
+
 /** What the re-check says, in the order it matters. */
 function describe(result) {
   const lines = [''];
@@ -165,7 +191,7 @@ function describe(result) {
     lines.push('  ' + result.fixed.length + (result.fixed.length === 1 ? ' problem is' : ' problems are') + ' fixed:');
     lines.push('');
     for (const item of result.fixed) {
-      lines.push('    ' + item.table + ' - I ran the same attack again and it was refused.');
+      lines.push('    ' + item.table + ' (' + whatOf(item) + ') - I ran the same attack again and it was refused.');
     }
     lines.push('');
   }
@@ -185,7 +211,7 @@ function describe(result) {
     lines.push('  ' + result.unverifiable.length + ' I could NOT confirm:');
     lines.push('');
     for (const item of result.unverifiable) {
-      lines.push('    ' + item.table + ' - ' + item.why);
+      lines.push('    ' + item.table + ' (' + whatOf(item) + ') - ' + item.why);
     }
     lines.push('');
     lines.push('  These are not fixed and not broken - they are unknown. The problem');

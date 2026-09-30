@@ -190,12 +190,28 @@ async function main() {
         const problems = [];
         const want = [
           [/profiles: .*read by anyone/i, 'profiles readable by anyone'],
-          [/waitlist: .*read by anyone/i, 'waitlist readable by anyone'],
+          // One finding for the table now, headed "Anyone can read, ... rows in
+          // your waitlist table" - the read is one of its proofs.
+          [/waitlist: .*(read by anyone|can read)/i, 'waitlist readable by anyone'],
           [/orders: .*(add rows|can add)/i, 'orders: anyone can add'],
           [/order_items: .*point at/i, 'order_items can point at nothing'],
           [/accounts: .*same email/i, 'accounts: the same email twice'],
         ];
         for (const [pattern, what] of want) if (!pattern.test(found)) problems.push('missing: ' + what);
+        // One mistake, one finding: the waitlist's rule opens it to reading and
+        // writing, and that is said once, with both proofs kept inside it.
+        const waitlist = ((r.result && r.result.findings) || []).filter((f) => f.table === 'waitlist');
+        if (waitlist.length !== 1) problems.push('waitlist is reported ' + waitlist.length + ' times, expected once');
+        else {
+          const kinds = (waitlist[0].members || []).map((m) => m.kind + ':' + (m.who || ''));
+          if (!kinds.includes('exposed:') && !kinds.some((k) => k.startsWith('exposed'))) problems.push('the waitlist finding does not keep the read as a proof: ' + JSON.stringify(kinds));
+          if (!kinds.some((k) => k.startsWith('writable'))) problems.push('the waitlist finding does not keep the write as a proof: ' + JSON.stringify(kinds));
+          // Nothing in waitlist points at auth.users and no rule asks auth.uid(),
+          // so its fix cannot be an owner rule. orders is tied, so its fix is.
+          if (!/service_role/.test(waitlist[0].fixPrompt)) problems.push('the waitlist fix asks for a sign-in rule it cannot have');
+        }
+        const orders = ((r.result && r.result.findings) || []).filter((f) => f.table === 'orders');
+        if (!orders.length || orders.some((f) => /service_role/.test(f.fixPrompt))) problems.push('the orders fix, tied to Supabase sign-in, was told to use service_role');
         if (/ notes: /.test(found)) problems.push('the safe notes table was reported: ' + found.split('\n').filter((l) => / notes: /.test(l)).join(' / '));
         if (problems.length) problems.push('it found:\n        ' + found.split('\n').join('\n        '));
         return problems;

@@ -410,6 +410,102 @@ function wrapTo(text, width) {
   return out;
 }
 
+/**
+ * Which tables are tied to Supabase's own sign-in: a foreign key to
+ * auth.users, or a rule that asks auth.uid() or auth.jwt(). Read from the
+ * original schema, not the copy - the copy points those keys at a stand-in.
+ * A table missing from the map is unknown, which the prompts treat as tied.
+ */
+function authTiesOf(plan) {
+  const ties = new Map();
+  for (const table of (plan && plan.tables) || []) {
+    ties.set(table.name, (table.constraints || []).some((c) =>
+      c.kind === 'f' && /references\s+"?auth"?\s*\.\s*"?users"?\s*\(/i.test(String(c.definition || ''))));
+  }
+  for (const policy of (plan && plan.policies) || []) {
+    const text = String(policy.qual || '') + ' ' + String(policy.with_check || '');
+    if (/\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(text)) ties.set(policy.table_name, true);
+  }
+  return ties;
+}
+
+/**
+ * The fix for a table that is not tied to Supabase's sign-in. Found on an app
+ * with its own login: "compare the owner to the id of the signed-in user"
+ * cannot be done there - auth.uid() is empty for everybody - and an assistant
+ * that writes it anyway locks the app out of its own table.
+ */
+function ownSignInLines(table) {
+  return [
+    'Nothing in "' + table + '" points at auth.users and no rule on it uses auth.uid(), so your ' +
+      'app signs people in its own way. A rule comparing a column to the signed-in user cannot ' +
+      'work here - auth.uid() is empty for everyone - and adding one would lock your own app out.',
+    '',
+    'If only your server reads and writes this table: keep row level security on, drop the rules ' +
+      'that let everyone in, and add none for anon or authenticated. Have your server use the ' +
+      'service_role key, which skips these rules - and keep that key on the server only, never ' +
+      'in the browser or in the app\'s public code.',
+    '',
+    'If the browser needs to read or write part of it directly, tell me which part first, so we ' +
+      'write the narrowest rule for exactly that.',
+    '',
+  ];
+}
+
+/**
+ * One prompt for everything wrong with one table's rules - read and write,
+ * strangers and customers - because it is one rule to replace, not four.
+ */
+function groupPromptFor(members) {
+  const lead = members.find((m) => m.kind === 'writable') || members[0];
+  const cause = causeOf(lead);
+  const table = lead.table;
+  const owner = (members.find((m) => m.owner) || {}).owner;
+  const ownerWords = owner ? '"' + owner + '"' : 'the column that says who each row belongs to';
+  const read = members.find((m) => m.kind === 'exposed');
+  const writers = members.filter((m) => m.kind === 'writable');
+  const anyoneWrites = writers.find((w) => w.who === 'anyone');
+  const customersWrite = writers.find((w) => w.who !== 'anyone');
+  const what = [];
+  if (read) what.push('read');
+  if (writers.length) what.push('written');
+  const who = read || anyoneWrites ? 'anyone who is not logged in' : 'any signed-in user, including other users\' rows';
+  const did = [];
+  if (read) did.push('read ' + read.readable + ' ' + (read.readable === 1 ? 'row' : 'rows'));
+  const moves = [];
+  for (const w of writers) for (const m of w.can || []) if (!moves.includes(m)) moves.push(m);
+  for (const m of ['add', 'change', 'delete']) {
+    if (moves.includes(m)) did.push({ add: 'added a row', change: 'changed rows', delete: 'deleted rows' }[m]);
+  }
+  const lines = [
+    'My app has a security problem.',
+    '',
+    'The "' + table + '" table can be ' + what.join(' and ') + ' by ' + who +
+      ', because ' + cause.short + '. I proved it on a copy: I ' + listOf(did) + '.' +
+      (anyoneWrites && customersWrite ? ' Signed-in users can do the same.' : ''),
+    '',
+  ].concat(
+    lead.authTied === false
+      ? ownSignInLines(table)
+      : [
+        'Switch row level security on for this table, remove the rule that lets everyone in, and ' +
+          'write separate rules for reading, inserting, updating and deleting. A rule written FOR ALL ' +
+          'covers far more than reading.',
+        '',
+        'Each of them should compare ' + ownerWords + ' to the id of the signed-in user (auth.uid()): ' +
+          'USING for reading, updating and deleting, WITH CHECK for inserting and updating, so nobody ' +
+          'reads, changes or writes a row under somebody else\'s name. Give logged-out visitors no rule ' +
+          'at all unless they truly need one.',
+        '',
+      ],
+    ['Then check every other table for the same thing.'],
+  );
+  return lines
+    .map((paragraph) => (paragraph ? wrapTo(paragraph, 72) : ['']))
+    .reduce((all, part) => all.concat(part), [])
+    .join('\n');
+}
+
 function fixPromptFor(finding) {
   const cause = causeOf(finding);
   const owner = finding.owner ? '"' + finding.owner + '"' : 'the column that says who each row belongs to';
@@ -474,17 +570,24 @@ function fixPromptFor(finding) {
         (finding.can || []).map((what) => ({ add: 'added a row', change: 'changed rows', delete: 'deleted rows' })[what])
           .join(', ') + '.',
       '',
-      'Switch row level security on for this table, then write separate rules for ' +
-        'reading, inserting, updating and deleting. A rule written FOR SELECT does ' +
-        'not cover writes, and a rule written FOR ALL covers far more than reading.',
-      '',
-      'For insert and update, use WITH CHECK comparing ' + owner +
-        ' to the id of the signed-in user, so nobody can write a row under somebody ' +
-        "else's name.",
-      '',
-      'Then check every other table for the same thing - a table with no row level ' +
-        'security on it is writable by default.',
-    ]
+    ].concat(
+      finding.authTied === false
+        ? ownSignInLines(finding.table)
+        : [
+          'Switch row level security on for this table, then write separate rules for ' +
+            'reading, inserting, updating and deleting. A rule written FOR SELECT does ' +
+            'not cover writes, and a rule written FOR ALL covers far more than reading.',
+          '',
+          'For insert and update, use WITH CHECK comparing ' + owner +
+            ' to the id of the signed-in user, so nobody can write a row under somebody ' +
+            "else's name.",
+          '',
+        ],
+      [
+        'Then check every other table for the same thing - a table with no row level ' +
+          'security on it is writable by default.',
+      ],
+    )
     : finding.kind === 'duplicated'
     ? [
       'My app has a security problem.',
@@ -559,11 +662,16 @@ function fixPromptFor(finding) {
             ? 'can be read by anyone who is not logged in, because ' + cause.short + '.'
             : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
         '',
-        'Fix it so a person can only read their own rows: compare ' + owner +
-          ' against the id of the signed-in user, and make sure logged-out visitors get nothing.',
-        '',
-        'Then look for the same mistake on every other table and fix those too.',
-      ];
+      ].concat(
+        finding.authTied === false
+          ? ownSignInLines(finding.table)
+          : [
+            'Fix it so a person can only read their own rows: compare ' + owner +
+              ' against the id of the signed-in user, and make sure logged-out visitors get nothing.',
+            '',
+          ],
+        ['Then look for the same mistake on every other table and fix those too.'],
+      );
   // Wrapped here rather than by whoever prints it: this text is pasted into a
   // chat box as often as it is read in a terminal, and an unwrapped paragraph
   // is a wall in both.
@@ -620,6 +728,50 @@ function describe(finding) {
   };
 }
 
+/** Everything wrong with one table's rules, said once. */
+function mergeTable(group, one) {
+  const members = group.map(one);
+  const read = group.find((m) => m.kind === 'exposed');
+  const anyoneWrites = group.find((m) => m.kind === 'writable' && m.who === 'anyone');
+  const customersWrite = group.find((m) => m.kind === 'writable' && m.who !== 'anyone');
+  const lead = anyoneWrites || customersWrite || read;
+  const leadItem = members[group.indexOf(lead)];
+  const table = lead.table;
+  const order = ['delete', 'change', 'add'];
+  const does = (w) => order.filter((m) => (w.can || []).includes(m)).map((m) => WRITE_WORDS[m]);
+  let headline;
+  if (read && anyoneWrites) {
+    const verbs = ['read'].concat(order.filter((m) => (anyoneWrites.can || []).includes(m)));
+    headline = 'Anyone can ' + listOf(verbs) + ' rows in your ' + table + ' table.';
+  } else if (read && customersWrite) {
+    headline = 'Anyone can read your ' + table + ' table, and any signed-in customer can ' + listOf(does(customersWrite)) + ' it.';
+  } else {
+    headline = leadItem.headline;
+  }
+  // The customers' part is said in one line when strangers can already do it.
+  const bodies = [];
+  for (let i = 0; i < group.length; i++) {
+    if (group[i] === customersWrite && anyoneWrites) continue;
+    bodies.push(members[i].body);
+  }
+  if (customersWrite && anyoneWrites) bodies.push('Signed-in customers can do the same.');
+  const severity = members.some((m) => m.severity === 'CRITICAL') ? 'CRITICAL' : leadItem.severity;
+  const can = [];
+  for (const m of group) for (const c of m.can || []) if (!can.includes(c)) can.push(c);
+  return Object.assign({}, leadItem, {
+    severity: severity,
+    status: 'confirmed',
+    kind: lead.kind,
+    who: read || anyoneWrites ? 'anyone' : leadItem.who,
+    can: can,
+    headline: headline,
+    body: bodies.join(' '),
+    proof: members.map((m) => m.proof).join(' '),
+    fixPrompt: groupPromptFor(group),
+    members: members,
+  });
+}
+
 /** The whole report, in the order a person should read it. */
 function describeAll(findings) {
   // A table anyone can read is also, necessarily, a table one customer can read
@@ -628,18 +780,38 @@ function describeAll(findings) {
   // is kept, and it carries the rest.
   const raw = findings || [];
   const publiclyOpen = new Set(raw.filter((f) => f.kind === 'exposed').map((f) => f.table));
-  const described = raw
-    .filter((f) => !(f.kind === 'crossed' && publiclyOpen.has(f.table)))
-    .map((f) =>
-      Object.assign(describe(f), {
-        alsoCrossed:
-          f.kind === 'exposed' && raw.some((o) => o.kind === 'crossed' && o.table === f.table),
-      }),
-    );
-  for (const item of described) {
-    if (item.alsoCrossed) {
-      item.body += ' Your signed-in customers can read each other\'s rows for the same reason.';
+  const kept = raw.filter((f) => !(f.kind === 'crossed' && publiclyOpen.has(f.table)));
+  const one = (f) => {
+    const item = Object.assign(describe(f), {
+      alsoCrossed: f.kind === 'exposed' && raw.some((o) => o.kind === 'crossed' && o.table === f.table),
+    });
+    if (item.alsoCrossed) item.body += ' Your signed-in customers can read each other\'s rows for the same reason.';
+    return item;
+  };
+
+  // One table, one finding. A single rule written FOR ALL USING (true) opens a
+  // table to reading and writing, for strangers and customers alike - four
+  // proofs of one mistake. Listed as four, a real app's report showed six
+  // CRITICAL findings for two rules, and the person reads six problems where
+  // there are two to fix. The proofs are kept as members, so a re-check can
+  // still tell "strangers can no longer write" from "strangers can still read".
+  const grouped = new Map();
+  for (const f of kept) {
+    if ((f.kind !== 'exposed' && f.kind !== 'writable') || f.isView || f.countOnly) continue;
+    if (!grouped.has(f.table)) grouped.set(f.table, []);
+    grouped.get(f.table).push(f);
+  }
+  const described = [];
+  const done = new Set();
+  for (const f of kept) {
+    const group = grouped.get(f.table);
+    if (!group || group.length < 2 || group.indexOf(f) === -1) {
+      described.push(one(f));
+      continue;
     }
+    if (done.has(f.table)) continue;
+    done.add(f.table);
+    described.push(mergeTable(group, one));
   }
   // Worst first, and within that the ones open to the whole internet before the
   // ones that need an account, and those before the ones that need two requests
@@ -678,6 +850,7 @@ function allClearLines(attacksRun) {
 }
 
 module.exports = {
+  authTiesOf: authTiesOf,
   readContents: readContents,
   severityOf: severityOf,
   causeOf: causeOf,

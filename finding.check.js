@@ -463,6 +463,113 @@ const cases = [
       return problems;
     },
   },
+  {
+    // Six CRITICAL findings for two rules, on a real app: read by strangers,
+    // written by strangers, written by customers - all one FOR ALL USING (true).
+    name: 'one table, one finding: read and write proofs of one rule are said once, and kept inside',
+    run: () => {
+      const problems = [];
+      const cols = ['id', 'email', 'password_hash', 'name'];
+      const all = finding.describeAll([
+        { kind: 'exposed', table: 'users', readable: 1, columns: cols, rlsEnabled: true },
+        { kind: 'writable', table: 'users', who: 'anyone', can: ['add', 'change', 'delete'], changed: { change: 1, delete: 1 }, columns: cols, rlsEnabled: true, rules: ['ALL'] },
+        { kind: 'writable', table: 'users', who: 'signed-in', can: ['add', 'change', 'delete'], changed: { change: 1, delete: 1 }, columns: cols, rlsEnabled: true, rules: ['ALL'] },
+        { kind: 'exposed', table: 'bookings', readable: 2, columns: ['phone'], rlsEnabled: true },
+        COUNTERS_OPEN,
+      ]);
+      const users = all.filter((f) => f.table === 'users');
+      if (users.length !== 1) return ['users reported ' + users.length + ' times, expected once'];
+      const u = users[0];
+      if ((u.members || []).length !== 3) problems.push('users keeps ' + (u.members || []).length + ' proofs, expected 3');
+      if (u.severity !== 'CRITICAL') problems.push('severity ' + u.severity);
+      if (!/read/.test(u.headline) || !/delete/.test(u.headline)) problems.push('headline does not say read and delete: ' + u.headline);
+      if (!/Signed-in customers can do the same/.test(u.body)) problems.push('the customers part is not said: ' + u.body);
+      if (u.fixPrompt.split('My app has a security problem').length !== 2) problems.push('more than one prompt in one');
+      // A table with one proof is left as it was, and other tables stay apart.
+      const bookings = all.filter((f) => f.table === 'bookings');
+      if (bookings.length !== 1 || bookings[0].members) problems.push('a single-proof table was grouped: ' + JSON.stringify(bookings.map((b) => b.members)));
+      if (all.length !== 3) problems.push('expected 3 findings (users, bookings, counters), got ' + all.length);
+      return problems;
+    },
+  },
+  {
+    name: 'grouping keeps the worst severity, and leaves apart what is not the same rule',
+    run: () => {
+      const problems = [];
+      // Only adding is HIGH on its own; the read leaks an API key, which is CRITICAL.
+      const keys = finding.describeAll([
+        CREDENTIALS_OPEN,
+        { kind: 'writable', table: 'integrations', who: 'anyone', can: ['add'], changed: {}, columns: CREDENTIALS_OPEN.columns, rlsEnabled: false },
+      ]);
+      if (keys.length !== 1 || keys[0].severity !== 'CRITICAL') problems.push('an API-key leak grouped with an add-only write is not CRITICAL: ' + JSON.stringify(keys.map((k) => k.severity)));
+      // One customer reading another's rows is a different rule from strangers writing.
+      const orders = finding.describeAll([
+        ORDERS_CROSSED,
+        { kind: 'writable', table: 'orders', who: 'signed-in', can: ['change'], changed: { change: 1 }, columns: ORDERS_CROSSED.columns, rlsEnabled: true },
+      ]);
+      if (orders.length !== 2 || orders.some((o) => o.members)) problems.push('a crossed read was grouped with a write: ' + orders.length + ' findings');
+      // A table that only gives away its row count is said on its own terms.
+      const counted = finding.describeAll([
+        Object.assign({}, COUNTERS_OPEN, { countOnly: true }),
+        { kind: 'writable', table: 'page_counters', who: 'anyone', can: ['change'], changed: { change: 1 }, columns: COUNTERS_OPEN.columns, rlsEnabled: false },
+      ]);
+      if (counted.length !== 2 || counted.some((o) => o.members)) problems.push('a count-only read was grouped with a write: ' + counted.length + ' findings');
+      return problems;
+    },
+  },
+  {
+    name: 'which tables are tied to Supabase sign-in: a key to auth.users, or a rule asking auth.uid()',
+    run: () => {
+      const ties = finding.authTiesOf({
+        tables: [
+          { name: 'notes', constraints: [{ kind: 'f', definition: 'FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE' }] },
+          { name: 'posts', constraints: [] },
+          { name: 'bookings', constraints: [{ kind: 'f', definition: 'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL' }] },
+          { name: 'users', constraints: [{ kind: 'p', definition: 'PRIMARY KEY (id)' }] },
+        ],
+        policies: [
+          { table_name: 'posts', qual: '(author = auth.uid())', with_check: null },
+          { table_name: 'users', qual: 'true', with_check: 'true' },
+        ],
+      });
+      const want = { notes: true, posts: true, bookings: false, users: false };
+      const problems = [];
+      for (const t of Object.keys(want)) if (ties.get(t) !== want[t]) problems.push(t + ': ' + ties.get(t) + ', expected ' + want[t]);
+      return problems;
+    },
+  },
+  {
+    // Found on an app with its own login (users.id bigint, no auth.users): the
+    // prompt said to compare the owner to the signed-in user - impossible
+    // there, and an assistant doing it locks the app out of its own table.
+    name: 'a table not tied to Supabase sign-in gets a fix that does not rely on auth.uid()',
+    run: () => {
+      const problems = [];
+      const base = { table: 'bookings', columns: ['phone'], rlsEnabled: true, rules: ['ALL'] };
+      const own = [
+        Object.assign({ kind: 'exposed', readable: 1, authTied: false }, base),
+        Object.assign({ kind: 'writable', who: 'anyone', can: ['add'], changed: {}, authTied: false }, base),
+      ];
+      const prompts = {
+        single: finding.fixPromptFor(own[1]),
+        read: finding.fixPromptFor(own[0]),
+        group: finding.describeAll(own)[0].fixPrompt,
+      };
+      for (const k of Object.keys(prompts)) {
+        const p = prompts[k].replace(/\s+/g, ' ');
+        if (!/service_role/.test(p)) problems.push(k + ': does not say to use service_role from the server');
+        if (/WITH CHECK comparing/.test(p)) problems.push(k + ': still asks for an owner rule');
+        if (!/never in the browser/.test(p)) problems.push(k + ': does not say to keep the key out of the browser');
+      }
+      // Tied, or unknown: the owner rule is the fix.
+      const tied = finding.fixPromptFor(Object.assign({ kind: 'writable', who: 'anyone', can: ['add'], changed: {}, owner: 'user_id', authTied: true }, base)).replace(/\s+/g, ' ');
+      if (!/WITH CHECK comparing "user_id"/.test(tied)) problems.push('a tied table lost its owner rule');
+      if (/service_role/.test(tied)) problems.push('a tied table was told to use service_role');
+      const unknown = finding.fixPromptFor(Object.assign({ kind: 'writable', who: 'anyone', can: ['add'], changed: {} }, base)).replace(/\s+/g, ' ');
+      if (/service_role/.test(unknown)) problems.push('a table of unknown ties was told to use service_role');
+      return problems;
+    },
+  },
 ];
 
 let failures = 0;
