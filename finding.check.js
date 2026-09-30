@@ -574,6 +574,10 @@ const cases = [
       // Tied, or unknown: the owner rule is the fix.
       const tied = finding.fixPromptFor(Object.assign({ kind: 'writable', who: 'anyone', can: ['add'], changed: {}, owner: 'user_id', authTied: true }, base)).replace(/\s+/g, ' ');
       if (!/WITH CHECK comparing "user_id"/.test(tied)) problems.push('a tied table lost its owner rule');
+      // Found on the blind test's fix: only WITH CHECK was asked for, so an
+      // update left USING (true) - anyone could take another provider's
+      // appointment and rewrite it as their own.
+      if (!/For update and delete, add USING/.test(tied)) problems.push('the fix does not close USING on update and delete');
       if (/service_role/.test(tied)) problems.push('a tied table was told to use service_role');
       // Supabase sign-in, but no column saying whose row it is (a waitlist):
       // there is nothing for an owner rule to compare, so the same way out.

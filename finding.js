@@ -588,7 +588,9 @@ function fixPromptFor(finding) {
           '',
           'For insert and update, use WITH CHECK comparing ' + owner +
             ' to the id of the signed-in user, so nobody can write a row under somebody ' +
-            "else's name.",
+            "else's name. For update and delete, add USING with the same comparison: " +
+            'with USING (true) left on the update, anyone can take a row that is not ' +
+            'theirs and rewrite it as their own.',
           '',
         ],
       [
