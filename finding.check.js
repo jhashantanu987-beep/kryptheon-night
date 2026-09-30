@@ -221,6 +221,35 @@ const cases = [
     },
   },
   {
+    // Blind test (StudyNest): profiles readable by anyone, holding
+    // display_name, is_admin and a moderator_code added in production - and
+    // the report said only "got back 2 rows".
+    name: '10b. a code that grants something, who is an admin, and compound names are named, with their columns',
+    run: () => {
+      const problems = [];
+      const d = finding.describe({
+        kind: 'exposed', table: 'profiles', readable: 2, rlsEnabled: true,
+        columns: ['id', 'display_name', 'bio', 'is_admin', 'created_at', 'moderator_code'],
+      });
+      if (d.severity !== 'CRITICAL') problems.push('severity ' + d.severity + ' - a readable moderator_code is someone becoming a moderator');
+      for (const said of ['secret codes (moderator_code)', 'who is an admin (is_admin)', 'names (display_name)']) {
+        if (!d.body.includes(said)) problems.push('the body does not say "' + said + '": ' + d.body);
+      }
+      // Codes that grant nothing, and look-alikes of the admin flag.
+      const plain = finding.readContents(['zip_code', 'country_code', 'postal_code', 'promo_code', 'status_code', 'error_code', 'code', 'product_name', 'admin_notes', 'roles_updated_at', 'emailed_admin']);
+      if (plain.secrets.length) problems.push('an ordinary code was read as a secret: ' + JSON.stringify(plain.secrets));
+      if (plain.privilege.length) problems.push('a look-alike was read as the admin flag: ' + JSON.stringify(plain.privilege));
+      if (plain.identity.length) problems.push('product_name was read as a person\'s name: ' + JSON.stringify(plain.identity));
+      // Who is an admin, alone, is said but does not make a table CRITICAL.
+      const flags = finding.describe({ kind: 'exposed', table: 'flags', readable: 1, rlsEnabled: true, columns: ['id', 'is_admin'] });
+      if (flags.severity !== 'HIGH') problems.push('a table holding only is_admin was ' + flags.severity);
+      if (!/who is an admin \(is_admin\)/.test(flags.body)) problems.push('is_admin alone was not named: ' + flags.body);
+      const otp = finding.readContents(['otp', 'reset_code', 'user_invite_code']);
+      if (otp.secrets.length !== 1 || !/otp, reset_code, user_invite_code/.test(otp.secrets[0])) problems.push('real codes missed: ' + JSON.stringify(otp.secrets));
+      return problems;
+    },
+  },
+  {
     name: '11. a table open to everyone is reported once, not twice',
     run: () => {
       // The attack legitimately returns both: anyone can read it, and one

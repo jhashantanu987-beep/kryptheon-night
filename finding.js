@@ -20,7 +20,10 @@
 const IDENTITY = [
   [/\b(email|e_mail|mail)\b/i, 'email addresses'],
   [/\b(phone|mobile|contact_number|telephone)\b/i, 'phone numbers'],
-  [/\b(full_name|first_name|last_name|given_name|surname|name)\b/i, 'names'],
+  // `\b` treats "_" as part of a word, so display_name never matched `name` -
+  // found on a blind test, where a public profiles table was reported as
+  // holding nothing in particular. The compound names are listed instead.
+  [/\b(full_name|first_name|last_name|given_name|surname|name|display_name|username|user_name|nickname|screen_name)\b/i, 'names'],
   [/\b(address|street|city|postcode|zip|pincode)\b/i, 'addresses'],
   [/\b(dob|date_of_birth|birth_date|birthday)\b/i, 'dates of birth'],
 ];
@@ -31,15 +34,27 @@ const SECRETS = [
   [/\b(password|passwd|pass_hash|password_hash)\b/i, 'passwords'],
   [/\b(token|api_key|apikey|secret|private_key|access_key)\b/i, 'access tokens'],
   [/\b(card|card_number|cvv|iban|account_number|upi)\b/i, 'payment details'],
+  // A code that grants something: whoever reads a moderator_code can become a
+  // moderator. Found on a blind test, added straight in production and readable
+  // by anyone - reported only as "2 rows".
+  [/^(?:\w+_)?(moderator|invite|invitation|access|reset|verification|recovery|admin|join|auth|login|magic|security|otp)_code$|^(otp|pin)$/i, 'secret codes'],
 ];
+
+// Who holds power in the app. Not a secret in itself, but a list of exactly
+// which accounts are worth attacking.
+const PRIVILEGE = [/^(is_admin|is_superuser|is_super_admin|is_staff|is_moderator|is_owner|role|roles|permissions)$/i, 'who is an admin'];
 
 const MONEY = [/\b(amount|total|price|balance|salary|revenue|invoice)\b/i, 'amounts of money'];
 
+// Each kind named with the columns that showed it: "secret codes
+// (moderator_code)" can be found in the table; "secret codes" has to be
+// looked for.
 function matched(columns, table) {
-  const names = columns || [];
+  const names = (columns || []).map(String);
   const found = [];
   for (const [pattern, label] of table) {
-    if (names.some((column) => pattern.test(String(column)))) found.push(label);
+    const hits = names.filter((column) => pattern.test(column));
+    if (hits.length) found.push(label + ' (' + hits.join(', ') + ')');
   }
   return found;
 }
@@ -49,7 +64,13 @@ function readContents(columns) {
   const identity = matched(columns, IDENTITY);
   const secrets = matched(columns, SECRETS);
   const money = matched(columns, [MONEY]);
-  return { identity: identity, secrets: secrets, money: money };
+  const privilege = matched(columns, [PRIVILEGE]);
+  return { identity: identity, secrets: secrets, money: money, privilege: privilege };
+}
+
+/** Everything worth naming, worst first. */
+function heldIn(contents) {
+  return contents.secrets.concat(contents.identity, contents.privilege || [], contents.money);
 }
 
 /** A list, written the way a person writes one. */
@@ -292,7 +313,7 @@ function costOf(finding) {
 }
 
 function bodyFor(finding, contents) {
-  const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
+  const holds = listOf(heldIn(contents));
   const rowWord = finding.readable === 1 ? 'row' : 'rows';
 
   if (finding.kind === 'orphaned') {
@@ -308,7 +329,7 @@ function bodyFor(finding, contents) {
   }
 
   if (finding.kind === 'writable') {
-    const holds = listOf(contents.secrets.concat(contents.identity, contents.money));
+    const holds = listOf(heldIn(contents));
     const who = finding.who === 'anyone'
       ? 'Without logging in and without an account, I '
       : 'Signed in as one of your customers, I ';
