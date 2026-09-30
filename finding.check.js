@@ -250,6 +250,23 @@ const cases = [
     },
   },
   {
+    // Blind test (VaultBoard): integration_token, access_token and
+    // signing_secret were readable by anyone, and the report named none.
+    name: '10c. a secret named with a prefix is still a secret; a column about one is not',
+    run: () => {
+      const problems = [];
+      const secret = ['integration_token', 'access_token', 'refresh_token', 'signing_secret', 'client_secret', 'stripe_api_key', 'secret_key', 'hashed_password', 'encrypted_password'];
+      const about = ['token_expires_at', 'tokenised_flag', 'secret_question', 'key', 'monkey', 'primary_key_id', 'api_key_last_used', 'password_changed_at', 'tokens_used_count', 'keyboard'];
+      const missed = secret.filter((c) => !finding.readContents([c]).secrets.length);
+      const wrong = about.filter((c) => finding.readContents([c]).secrets.length);
+      if (missed.length) problems.push('secrets missed: ' + missed.join(', '));
+      if (wrong.length) problems.push('read as secrets: ' + wrong.join(', '));
+      const d = finding.describe({ kind: 'exposed', table: 'webhook_deliveries', readable: 1, rlsEnabled: false, columns: ['id', 'endpoint_url', 'signing_secret', 'request_body'] });
+      if (d.severity !== 'CRITICAL' || !/signing_secret/.test(d.body)) problems.push('an open table with a signing secret: ' + d.severity + ' / ' + d.body);
+      return problems;
+    },
+  },
+  {
     name: '11. a table open to everyone is reported once, not twice',
     run: () => {
       // The attack legitimately returns both: anyone can read it, and one
