@@ -465,9 +465,33 @@ function authTiesOf(plan) {
  * locks the app out of its own table. Or the table has no column saying whose
  * row it is - a waitlist, a contact form - so there is nothing to compare.
  */
+// A column that says which organization a row belongs to. Such a table is
+// not "nobody's" - its rows are a team's.
+const TENANT_COLUMN = /^(org_id|organization_id|workspace_id|team_id|tenant_id|company_id)$/i;
+
 function serverOnlyLines(finding) {
   const table = finding.table;
   let why;
+  // Found on a fix test: api_usage has org_id, and the prompt said it had no
+  // column saying whose row it is. The assistant applying it had to correct
+  // the prompt; a less careful one would have locked the table away from the
+  // members who use it.
+  const tenant = finding.authTied !== false && finding.owned === false &&
+    (finding.columns || []).find((c) => TENANT_COLUMN.test(String(c)));
+  if (tenant) {
+    return [
+      'Rows in "' + table + '" belong to an organization ("' + tenant + '"), not to one person. So the ' +
+        'rule should let a signed-in user in only when they are a member of that row\'s organization - ' +
+        'checked through your membership table, or a helper function that asks it - and give logged-out ' +
+        'visitors nothing.',
+      '',
+      'Write separate rules for reading, inserting, updating and deleting, each with that membership ' +
+        'check (USING for reading, updating and deleting, WITH CHECK for inserting and updating), and ' +
+        'decide whether every member should be able to write or only admins. If only your server ' +
+        'writes this table, add no write rules at all.',
+      '',
+    ];
+  }
   if (finding.authTied === false) {
     why = 'Nothing in "' + table + '" points at auth.users and no rule on it uses auth.uid(), so your ' +
       'app signs people in its own way. A rule comparing a column to the signed-in user cannot ' +

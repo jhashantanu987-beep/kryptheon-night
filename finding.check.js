@@ -267,6 +267,24 @@ const cases = [
     },
   },
   {
+    // Fix test (OpsForge): api_usage has org_id, and the prompt said it had
+    // no column saying whose row it is.
+    name: '10d. a table whose rows belong to an organization gets a membership rule, not "nobody\'s rows"',
+    run: () => {
+      const problems = [];
+      const base = { kind: 'exposed', readable: 1, rlsEnabled: false, authTied: true, owned: false };
+      const team = finding.fixPromptFor(Object.assign({ table: 'api_usage', columns: ['id', 'org_id', 'endpoint', 'tokens'] }, base)).replace(/\s+/g, ' ');
+      if (!/belong to an organization \("org_id"\)/.test(team)) problems.push('the organization column is not named: ' + team.slice(0, 300));
+      if (/has no column that says whose row it is/.test(team)) problems.push('a team table was called nobody\'s');
+      if (!/member of that row's organization/.test(team)) problems.push('no membership rule asked for');
+      const alone = finding.fixPromptFor(Object.assign({ table: 'waitlist', columns: ['id', 'email'] }, base)).replace(/\s+/g, ' ');
+      if (!/has no column that says whose row it is/.test(alone) || !/service_role/.test(alone)) problems.push('a table with no owner and no organization lost its server-only fix');
+      const own = finding.fixPromptFor(Object.assign({ table: 'api_usage', columns: ['id', 'org_id'] }, base, { authTied: false })).replace(/\s+/g, ' ');
+      if (!/signs people in its own way/.test(own) || /member of that row's organization/.test(own)) problems.push('an app with its own login got the Supabase membership rule');
+      return problems;
+    },
+  },
+  {
     name: '11. a table open to everyone is reported once, not twice',
     run: () => {
       // The attack legitimately returns both: anyone can read it, and one

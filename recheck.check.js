@@ -434,6 +434,11 @@ const cases = [
       if (!/users \(read by anyone\)/.test(said) || !/users \(written by anyone\)/.test(said)) problems.push('the fixed lines do not say which proof was closed: ' + said);
       const half = recheck.describe(r).join('\n');
       if (!/users \(written by anyone\) - I ran the same attack again/.test(half)) problems.push('the closed write is not named: ' + half);
+      // A function is read, never called: its fix is not "the attack was refused".
+      const fn = { kind: 'privileged', table: 'rotate_key', fn: 'rotate_key', severity: 'HIGH', headline: 'Anyone can call rotate_key.' };
+      const fnSaid = recheck.describe(recheck.compare({ findings: [fn] }, { findings: [], attempted: ['privileged:rotate_key'], notChecked: [] })).join('\n');
+      if (!/rotate_key \(a function anyone can call\) - I looked again, and a visitor with no account can no longer call it/.test(fnSaid)) problems.push('a function fix is worded as an attack: ' + fnSaid);
+      if (/rotate_key.*attack again/.test(fnSaid)) problems.push('it claims to have attacked a function it never calls');
       return problems;
     },
   },

@@ -191,7 +191,12 @@ function describe(result) {
     lines.push('  ' + result.fixed.length + (result.fixed.length === 1 ? ' problem is' : ' problems are') + ' fixed:');
     lines.push('');
     for (const item of result.fixed) {
-      lines.push('    ' + item.table + ' (' + whatOf(item) + ') - I ran the same attack again and it was refused.');
+      // A function is never called, only read - so its fix is said as what
+      // was seen, not as an attack that was refused. Found on a fix test.
+      const how = item.kind === 'privileged'
+        ? 'I looked again, and a visitor with no account can no longer call it.'
+        : 'I ran the same attack again and it was refused.';
+      lines.push('    ' + item.table + ' (' + whatOf(item) + ') - ' + how);
     }
     lines.push('');
   }
