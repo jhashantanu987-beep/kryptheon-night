@@ -72,6 +72,35 @@ async function main() {
       return problems;
     })());
 
+    check('1b. the command keeps what the nightly run says for the dashboard - here, that it is not installed', (() => {
+      // Found by reading the store as the dashboard does, not by asking the
+      // command: the dashboard only ever sees the file.
+      const file = require('./store.js').pathsFor(WORK, { KRYPTHEON_HOME: HOME }).nightNightly;
+      let kept = null;
+      try { kept = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) { return ['nothing kept at ' + file + ': ' + err.message]; }
+      return kept.installed === false && kept.readAt ? [] : ['kept ' + JSON.stringify(kept)];
+    })());
+
+    // `night` reads the nightly answer back; with nothing installed it says so
+    // and keeps that too, over whatever was kept before.
+    const HOME2 = fs.mkdtempSync(path.join(os.tmpdir(), 'kryptheon-home-'));
+    const readBack = spawnSync(process.execPath, [BIN, 'night', '--yes'], {
+      cwd: WORK, encoding: 'utf8', timeout: 120000,
+      env: Object.assign({}, process.env, { KN_DATABASE_URL: CONNECTION, KRYPTHEON_HOME: HOME2 }),
+    });
+    check('1c. "night" with nothing installed says so, exits 2, and keeps it for the dashboard', (() => {
+      const problems = [];
+      const out = String(readBack.stdout || '') + String(readBack.stderr || '');
+      if (readBack.status !== 2) problems.push('exit ' + readBack.status);
+      if (!/not installed in this database/.test(out)) problems.push('output:\n' + out.slice(-800));
+      const file = require('./store.js').pathsFor(WORK, { KRYPTHEON_HOME: HOME2 }).nightNightly;
+      let kept = null;
+      try { kept = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) { problems.push('nothing kept: ' + err.message); }
+      if (kept && kept.installed !== false) problems.push('kept ' + JSON.stringify(kept));
+      return problems;
+    })());
+    fs.rmSync(HOME2, { recursive: true, force: true });
+
     // The owner decides it should not be public and revokes it.
     await client.query('REVOKE EXECUTE ON FUNCTION ' + q(APP) + '.peek() FROM anon, PUBLIC');
     const second = run();

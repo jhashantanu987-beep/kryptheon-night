@@ -229,8 +229,24 @@ async function uninstall(client, options) {
   return removed;
 }
 
+/**
+ * What the nightly run last said, read out of the database: whether it is
+ * installed at all, how it is scheduled, and its newest row in runs - or null
+ * for a run that has not happened yet. Read only.
+ */
+async function latestRun(client, options) {
+  const where = await status(client, options);
+  if (!where) return { installed: false, where: null, run: null };
+  const { rows } = await client.query(
+    'SELECT ran_at, source, stopped, attacks_run, findings, not_checked FROM ' +
+      quote(where.schema) + '.runs ORDER BY ran_at DESC, id DESC LIMIT 1',
+  );
+  return { installed: true, where: where, run: rows[0] || null };
+}
+
 module.exports = {
   SCHEMA: SCHEMA,
+  latestRun: latestRun,
   AT: AT,
   install: install,
   uninstall: uninstall,

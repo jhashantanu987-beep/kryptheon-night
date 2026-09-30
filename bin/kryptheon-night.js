@@ -119,6 +119,30 @@ function readArgs(argv) {
 }
 
 /**
+ * Keeps what the nightly run last said where the kryptheon dashboard reads
+ * it, so the answer waiting in the database is also on the page - not only
+ * what was last run from this terminal. Never fails anything: the person has
+ * their answer already, and a folder that cannot be written is not theirs to
+ * debug here.
+ */
+function keepTheNight(latest) {
+  try {
+    scanner.saveNightly(scanner.nightlyFile(), scanner.nightlyRecord(latest, new Date().toISOString()));
+  } catch (err) {
+    /* the dashboard keeps its older copy, which carries its own date */
+  }
+}
+
+/** Reads and keeps it, for the doors that do not already hold the answer. */
+async function readAndKeepTheNight(client) {
+  try {
+    keepTheNight(await installer.latestRun(client, {}));
+  } catch (err) {
+    /* as above */
+  }
+}
+
+/**
  * The three doors that are not a scan.
  *
  * Each returns the exit code, because anything automating this reads those
@@ -127,6 +151,7 @@ function readArgs(argv) {
  */
 async function runVerb(command, client, target) {
   if (command === 'status') {
+    await readAndKeepTheNight(client);
     const where = await installer.status(client, {});
     if (!where) {
       line('  The nightly run is not installed in this database.');
@@ -183,6 +208,7 @@ async function runVerb(command, client, target) {
       return 0;
     }
     const removed = await installer.uninstall(client, {});
+    await readAndKeepTheNight(client);
     line('  Removed.');
     line('');
     line('    the nightly job   ' + (removed.job ? 'gone' : 'there was none'));
@@ -195,7 +221,9 @@ async function runVerb(command, client, target) {
   }
 
   if (command === 'night') {
-    const where = await installer.status(client, {});
+    const latest = await installer.latestRun(client, {});
+    keepTheNight(latest);
+    const where = latest.where;
     if (!where) {
       line('  The nightly run is not installed in this database, so there is');
       line('  nothing to read back.');
@@ -205,12 +233,7 @@ async function runVerb(command, client, target) {
       line('');
       return 2;
     }
-    const quoted = '"' + String(where.schema).split('"').join('""') + '"';
-    const { rows } = await client.query(
-      'SELECT ran_at, source, stopped, attacks_run, findings, not_checked ' +
-        'FROM ' + quoted + '.runs ORDER BY ran_at DESC LIMIT 1',
-    );
-    if (!rows.length) {
+    if (!latest.run) {
       // Installed and never run is not the same as run and found nothing, and
       // saying "nothing got through" here would be the worst sentence in the
       // product printed about a night that never happened.
@@ -220,7 +243,7 @@ async function runVerb(command, client, target) {
       line('');
       return 0;
     }
-    const run = rows[0];
+    const run = latest.run;
     line('  From the night of ' + new Date(run.ran_at).toISOString().slice(0, 16).replace('T', ' ') +
       ', on "' + run.source + '":');
     scanner.report({
@@ -583,6 +606,9 @@ async function main() {
     // think about it again, which is exactly the app that is unprotected
     // three months later. The tool already knows whether the nightly run is
     // there. So it asks.
+    // Whatever the nightly run last said is kept for the dashboard too, so
+    // the page shows both answers and says which is which.
+    await readAndKeepTheNight(client);
     if (!result.stopped) await offerTheNight(client, target, canAsk);
   } catch (err) {
     // Anything that went wrong mid-scan. The copy has already been dropped by

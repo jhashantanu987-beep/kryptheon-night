@@ -442,6 +442,51 @@ function exitCodeFor(result) {
   return (result.findings || []).some((f) => f.status !== 'verification required') ? 1 : 0;
 }
 
+/** Where the nightly run's last answer is kept for the dashboard. */
+function nightlyFile() {
+  return store.open(process.cwd()).nightNightly;
+}
+
+/**
+ * The nightly run's last answer, in the shape the dashboard reads: the same
+ * described findings a scan saves, and the three states that are not the same
+ * as "nothing found" - not installed, installed and never run, and stopped -
+ * said as themselves. `latest` is installer.latestRun's answer.
+ */
+function nightlyRecord(latest, readAt) {
+  const at = (value) => (value ? new Date(value).toISOString() : null);
+  if (!latest || !latest.installed) return { readAt: readAt, installed: false };
+  const where = latest.where || {};
+  const record = {
+    readAt: readAt,
+    installed: true,
+    scheduled: where.job ? where.job.schedule : null,
+    active: Boolean(where.job && where.job.active),
+    source: where.source || null,
+    ranAt: null,
+  };
+  const run = latest.run;
+  if (!run) return record;
+  return Object.assign(record, {
+    ranAt: at(run.ran_at),
+    source: run.source,
+    stopped: run.stopped || null,
+    attacksRun: run.attacks_run || 0,
+    notChecked: run.not_checked || [],
+    findings: run.stopped ? [] : finding.describeAll(run.findings || []),
+  });
+}
+
+/** Kept for the dashboard. A failure here never touches the run itself. */
+function saveNightly(file, record) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(record, null, 2));
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
 /** The last run, or null if there has not been one worth keeping. */
 function loadLastRun(file) {
   try {
@@ -734,6 +779,9 @@ module.exports = {
   wrap: wrap,
   loadLastRun: loadLastRun,
   saveRun: saveRun,
+  nightlyFile: nightlyFile,
+  nightlyRecord: nightlyRecord,
+  saveNightly: saveNightly,
   sweepOldCopies: sweepOldCopies,
   notTestedLines: notTestedLines,
   lastRunFile: lastRunFile,
