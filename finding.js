@@ -588,6 +588,18 @@ function serverOnlyLines(finding) {
 }
 
 /**
+ * The opening of a rules fix. "Switch row level security on" is said only
+ * when it is off: told it about a table where it was already on, the person
+ * looks for a switch that is already flipped and misses the rule that is the
+ * real problem.
+ */
+function switchOn(finding) {
+  return finding.rlsEnabled
+    ? 'Row level security is already on for this table, so the rules on it are the problem: '
+    : 'Switch row level security on for this table, then ';
+}
+
+/**
  * One prompt for everything wrong with one table's rules - read and write,
  * strangers and customers - because it is one rule to replace, not four.
  */
@@ -621,9 +633,8 @@ function groupPromptFor(members) {
     '',
   ].concat(
     serverOnlyLines(lead) || [
-        'Switch row level security on for this table, remove the rule that lets everyone in, and ' +
-          'write separate rules for reading, inserting, updating and deleting. A rule written FOR ALL ' +
-          'covers far more than reading.',
+        switchOn(lead) + 'remove the rule that lets everyone in, and write separate rules for reading, ' +
+          'inserting, updating and deleting. A rule written FOR ALL covers far more than reading.',
         '',
         'Each of them should compare ' + ownerWords + ' to the id of the signed-in user (auth.uid()): ' +
           'USING for reading, updating and deleting, WITH CHECK for inserting and updating, so nobody ' +
@@ -730,9 +741,9 @@ function fixPromptFor(finding) {
       '',
     ].concat(
       serverOnlyLines(finding) || [
-          'Switch row level security on for this table, then write separate rules for ' +
-            'reading, inserting, updating and deleting. A rule written FOR SELECT does ' +
-            'not cover writes, and a rule written FOR ALL covers far more than reading.',
+          switchOn(finding) + 'write separate rules for reading, inserting, updating and deleting. ' +
+            'A rule written FOR SELECT does not cover writes, and a rule written FOR ALL covers ' +
+            'far more than reading.',
           '',
           'For insert and update, use WITH CHECK comparing ' + owner +
             ' to the id of the signed-in user, so nobody can write a row under somebody ' +

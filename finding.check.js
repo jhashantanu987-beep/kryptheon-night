@@ -317,6 +317,28 @@ const cases = [
     },
   },
   {
+    // Told to switch on something already on, the person hunts for a switch
+    // and misses the rule that is the actual problem.
+    name: '10f. "switch row level security on" is said only when it is off',
+    run: () => {
+      const problems = [];
+      const flat = (s) => s.replace(/\s+/g, ' ');
+      const write = (on) => flat(finding.fixPromptFor({ kind: 'writable', who: 'anyone', can: ['add'], changed: {}, table: 'orders',
+        owner: 'user_id', rlsEnabled: on, rules: ['INSERT'], authTied: true, owned: true, columns: ['id', 'user_id'] }));
+      if (/Switch row level security on/.test(write(true))) problems.push('a writable table with it on was told to switch it on');
+      if (!/already on for this table, so the rules on it are the problem/.test(write(true))) problems.push('a writable table with it on was not told the rules are the problem');
+      if (!/Switch row level security on/.test(write(false))) problems.push('a writable table with it off was not told to switch it on');
+      const group = (on) => flat(finding.describeAll([
+        { kind: 'exposed', table: 'orders', readable: 2, rlsEnabled: on, authTied: true, owned: true, ownedBy: 'user_id', columns: ['id', 'user_id'] },
+        { kind: 'writable', table: 'orders', who: 'anyone', can: ['add'], changed: {}, owner: 'user_id', rlsEnabled: on, authTied: true, owned: true, columns: ['id', 'user_id'] },
+      ])[0].fixPrompt);
+      if (/Switch row level security on/.test(group(true))) problems.push('a grouped finding with it on was told to switch it on');
+      if (!/already on for this table/.test(group(true))) problems.push('a grouped finding with it on was not told the rules are the problem');
+      if (!/Switch row level security on/.test(group(false))) problems.push('a grouped finding with it off was not told to switch it on');
+      return problems;
+    },
+  },
+  {
     name: '11. a table open to everyone is reported once, not twice',
     run: () => {
       // The attack legitimately returns both: anyone can read it, and one
