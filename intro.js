@@ -28,15 +28,23 @@ const trouble = require('./trouble.js');
  * their users end up on the same page by a different door.
  */
 function whereToFindIt() {
+  // The session pooler, and said as such: the direct connection answers only
+  // over IPv6, which many home networks do not have, and the transaction
+  // pooler on 6543 cannot hold these attacks together. The kryptheon
+  // dashboard shows these same steps; kryptheon-night words hands them over.
   return [
     'Where to find it:',
     '',
-    '  Supabase   supabase.com/dashboard -> your project -> the gear icon',
-    '             (Project Settings) at the bottom left -> Database ->',
-    '             scroll to "Connection string" -> the URI tab -> Copy.',
+    '  Supabase   1. supabase.com/dashboard -> open your project.',
+    '             2. Press "Connect" at the top of the page.',
+    '             3. Choose "Session pooler" - the one on port 5432.',
+    '             4. Copy the URI. It starts postgresql://',
+    '             5. Replace [YOUR-PASSWORD] in it with your database password.',
+    '                Forgotten it? Project Settings -> Database -> Reset',
+    '                database password.',
     '',
-    '             Replace [YOUR-PASSWORD] in it with your database password.',
-    '             It is on that same page under "Database password".',
+    '             Not port 6543 (the transaction pooler), and not the direct',
+    '             db.<project>.supabase.co address - both are warned about.',
     '',
     '  Lovable    your app uses Supabase underneath. Open the Supabase',
     '  and Bolt   project it made for you and follow the lines above.',

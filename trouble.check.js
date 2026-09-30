@@ -121,7 +121,7 @@ async function main() {
     return problems;
   })());
 
-  check('7. the transaction pooler is warned about, and 5432 is not', (() => {
+  check('7. the transaction pooler and the direct db.* address are warned about, the session pooler is not', (() => {
     // Port 6543 gives every statement a different backend. The attack has to
     // change role and read inside one transaction, so it cannot survive that
     // - and the failure it produces looks like the app defending itself.
@@ -133,7 +133,14 @@ async function main() {
     if (trouble.poolerWarning('postgresql://postgres.abc:pw@aws-0-ap-south-1.pooler.supabase.com:5432/postgres')) {
       problems.push('the session pooler was warned about, and it is the one that works');
     }
-    if (trouble.poolerWarning(GOOD)) problems.push('a direct connection was warned about');
+    // The direct connection is IPv6-only: warned about, pointing at the
+    // session pooler - and only Supabase's, never any host called db.*.
+    const direct = trouble.poolerWarning(GOOD);
+    if (!direct) problems.push('the direct db.* connection was not warned about');
+    else if (!/IPv6/.test(direct.join(' ')) || !/Session pooler/.test(direct.join(' '))) problems.push('the direct warning: ' + direct.join(' '));
+    if (direct && direct.join(' ').includes(SECRET)) problems.push('the warning printed the password');
+    if (trouble.poolerWarning('postgresql://u:pw@db.example.com:5432/app')) problems.push('a non-Supabase db.* host was warned about');
+    if (trouble.poolerWarning('postgresql://u:pw@ep-thing.us-east-2.aws.neon.tech:5432/neondb')) problems.push('a Neon host was warned about');
     return problems;
   })());
 

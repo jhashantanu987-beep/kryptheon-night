@@ -189,8 +189,22 @@ function poolerWarning(raw) {
       'That is the transaction pooler (port 6543). It gives every statement a',
       'different connection, and these attacks have to stay on one.',
       '',
-      'Use the session pooler or the direct connection instead - same page in',
-      'Supabase, the one whose port is 5432.',
+      'Use the session pooler instead: Supabase -> Connect -> Session pooler,',
+      'the one whose port is 5432.',
+    ];
+  }
+
+  // The direct connection answers only over IPv6 now. On a network without
+  // it the name does not resolve, and the failure reads like a typo. It works
+  // where IPv6 does, so this warns rather than refuses.
+  if (/^db\.[a-z0-9]+\.supabase\.(co|com)$/i.test(url.hostname)) {
+    return [
+      'That is Supabase\'s direct connection (db.' + url.hostname.split('.')[1] + '.supabase.co). It',
+      'answers only over IPv6, and many home and office networks have none - it',
+      'then fails as if the address were wrong.',
+      '',
+      'If it does, use the session pooler: Supabase -> Connect -> Session pooler,',
+      'port 5432.',
     ];
   }
 

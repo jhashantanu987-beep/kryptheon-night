@@ -105,12 +105,15 @@ function main() {
     const text = intro.whereToFindIt().join(' ');
     const problems = [];
     for (const [needle, what] of [
-      [/Project Settings/i, 'the Project Settings screen'],
-      [/Database/i, 'the Database tab'],
-      [/Connection string/i, 'the section it is in'],
-      [/URI/i, 'which of the tabs'],
+      [/"Connect"/, 'the Connect button'],
+      [/"Session pooler"/, 'which connection to choose'],
+      [/5432/, 'the port that works'],
+      [/Copy the URI/i, 'what to copy'],
       [/\[YOUR-PASSWORD\]/, 'that the password has to be filled in'],
+      [/Reset\s+database password/, 'where to get a forgotten password'],
       [/postgresql:\/\//, 'what it looks like'],
+      [/6543/, 'the port that does not work'],
+      [/db\.<project>\.supabase\.co/, 'the direct address that may not work'],
     ]) {
       if (!needle.test(text)) problems.push('it does not name ' + what);
     }
