@@ -79,6 +79,12 @@ async function buildShop(client) {
   await client.query('ALTER TABLE ' + q('order_items') + ' ENABLE ROW LEVEL SECURITY');
   await client.query('CREATE POLICY items_of_mine ON ' + q('order_items') + ' FOR SELECT USING (EXISTS (SELECT 1 FROM ' + q('orders') + ' o WHERE o.id = order_id AND o.user_id = auth.uid()))');
 
+  // A team's documents, each saying who wrote it. Readable by anyone; its fix
+  // must read by membership, not by who wrote the row.
+  await client.query('CREATE TABLE ' + q('team_docs') + ' (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, workspace_id uuid NOT NULL, created_by uuid REFERENCES auth.users (id), title text)');
+  await client.query('ALTER TABLE ' + q('team_docs') + ' ENABLE ROW LEVEL SECURITY');
+  await client.query('CREATE POLICY everyone ON ' + q('team_docs') + ' FOR SELECT USING (true)');
+
   // Two accounts, one email.
   await client.query('CREATE TABLE ' + q('accounts') + ' (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, user_id uuid NOT NULL REFERENCES auth.users (id), email text NOT NULL)');
   await client.query('ALTER TABLE ' + q('accounts') + ' ENABLE ROW LEVEL SECURITY');
@@ -253,6 +259,14 @@ async function main() {
         if (/ notes: /.test(found)) problems.push('the safe notes table was reported: ' + found.split('\n').filter((l) => / notes: /.test(l)).join(' / '));
         if (problems.length) problems.push('it found:\n        ' + found.split('\n').join('\n        '));
         return problems;
+      })());
+
+      check('3' + (which === 'node' ? 'e' : 'f') + '. ' + which + ': a team\'s documents are fixed by membership, not by who wrote them', (() => {
+        const docs = ((r.result && r.result.findings) || []).find((f) => f.table === 'team_docs');
+        if (!docs) return ['team_docs was not reported'];
+        const prompt = docs.fixPrompt.replace(/\s+/g, ' ');
+        return /member of that row's "workspace_id"/.test(prompt) && /Do not compare "created_by"/.test(prompt)
+          ? [] : ['the team_docs prompt: ' + prompt.slice(0, 400)];
       })());
 
       check('3' + (which === 'node' ? 'c' : 'd') + '. ' + which + ': with auth.users here, a duplicate email is not called a shared login', (() => {

@@ -403,10 +403,14 @@ async function scan(client, sourceSchema, options) {
     const ties = finding.authTiesOf(plan);
     // And whether a row says whose it is: with no such column, no rule can
     // tie it to the person asking. Read from the copy, the way seeding did.
-    const owned = new Map(theirs.map((table) => [table.name, Boolean(attack.ownerColumn(table))]));
+    // The column's name travels too: a team's table that also says who made
+    // each row needs it for its prompt, even on a finding that is not about
+    // owners at all.
+    const owned = new Map(theirs.map((table) => [table.name, attack.ownerColumn(table)]));
     const tagged = (f) => Object.assign({}, f,
       ties.has(f.table) ? { authTied: ties.get(f.table) } : {},
-      owned.has(f.table) ? { owned: owned.get(f.table) } : {});
+      owned.has(f.table) ? { owned: Boolean(owned.get(f.table)) } : {},
+      owned.get(f.table) ? { ownedBy: owned.get(f.table) } : {});
 
     return {
       stopped: null,

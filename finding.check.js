@@ -285,6 +285,38 @@ const cases = [
     },
   },
   {
+    // A team's table that also records who made each row. Comparing the
+    // maker to auth.uid() for reading hides teammates' rows from each other.
+    name: '10e. a team\'s table with a maker column is read by membership, written under your own name',
+    run: () => {
+      const problems = [];
+      const flat = (f) => finding.fixPromptFor(f).replace(/\s+/g, ' ');
+      const read = flat({ kind: 'exposed', table: 'docs', readable: 2, rlsEnabled: true, authTied: true, owned: true,
+        ownedBy: 'created_by', columns: ['id', 'workspace_id', 'created_by', 'title'] });
+      if (!/belong to a team \("workspace_id"\)/.test(read)) problems.push('the team column is not named: ' + read.slice(0, 300));
+      if (!/member of that row's "workspace_id"/.test(read)) problems.push('reading is not decided by membership');
+      if (!/Do not compare "created_by" to auth.uid\(\) for reading: that hides teammates' rows from each other and breaks the feature/.test(read)) problems.push('it does not warn off the maker comparison for reading, with the reason');
+      if (/only read their own rows/.test(read)) problems.push('it still says to read only your own rows');
+      if (!/"created_by" = auth.uid\(\)/.test(read)) problems.push('inserting is not tied to the maker');
+      // The owner arrives on the finding itself for writes and crossed reads.
+      const write = flat({ kind: 'writable', who: 'any customer', can: ['change'], changed: { change: 1 }, table: 'requests',
+        owner: 'requested_by', rlsEnabled: true, authTied: true, owned: true, columns: ['id', 'org_id', 'requested_by'] });
+      if (!/belong to a team \("org_id"\), and "requested_by" only records/.test(write)) problems.push('a writable team table: ' + write.slice(0, 300));
+      const group = finding.describeAll([
+        { kind: 'exposed', table: 'docs', readable: 2, rlsEnabled: true, authTied: true, owned: true, ownedBy: 'created_by', columns: ['id', 'workspace_id', 'created_by'] },
+        { kind: 'writable', table: 'docs', who: 'anyone', can: ['add'], changed: {}, owner: 'created_by', rlsEnabled: true, authTied: true, owned: true, columns: ['id', 'workspace_id', 'created_by'] },
+      ])[0].fixPrompt.replace(/\s+/g, ' ');
+      if (!/member of that row's "workspace_id"/.test(group) || /Each of them should compare "created_by"/.test(group)) problems.push('the grouped prompt: ' + group.slice(0, 400));
+      // Without a team column the owner comparison is still the right fix.
+      const solo = flat({ kind: 'crossed', table: 'notes', readable: 1, owner: 'created_by', rlsEnabled: true, authTied: true, owned: true, ownedBy: 'created_by', columns: ['id', 'created_by'] });
+      if (!/compare "created_by" against the id of the signed-in user/.test(solo)) problems.push('a table with no team lost its owner rule: ' + solo.slice(0, 300));
+      // An app with its own login gets neither.
+      const own = flat({ kind: 'exposed', table: 'docs', readable: 1, rlsEnabled: true, authTied: false, owned: true, ownedBy: 'created_by', columns: ['id', 'workspace_id', 'created_by'] });
+      if (/belong to a team/.test(own)) problems.push('an app with its own login got the Supabase membership rule');
+      return problems;
+    },
+  },
+  {
     name: '11. a table open to everyone is reported once, not twice',
     run: () => {
       // The attack legitimately returns both: anyone can read it, and one

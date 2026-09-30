@@ -523,8 +523,32 @@ function serverOnlyLines(finding) {
   // column saying whose row it is. The assistant applying it had to correct
   // the prompt; a less careful one would have locked the table away from the
   // members who use it.
-  const tenant = finding.authTied !== false && finding.owned === false &&
-    (finding.columns || []).find((c) => TENANT_COLUMN.test(String(c)));
+  const team = finding.authTied !== false && (finding.columns || []).find((c) => TENANT_COLUMN.test(String(c)));
+  const maker = finding.owner || finding.ownedBy;
+  // A team's row that also says who made it - created_by beside workspace_id.
+  // Found on a benchmark: the prompt said to compare created_by to auth.uid()
+  // for reading, which hides every teammate's rows and breaks the shared
+  // view the table exists for. Who made a row decides who may write it
+  // under their name, not who may see it.
+  if (team && finding.owned !== false && maker) {
+    return [
+      'Rows in "' + table + '" belong to a team ("' + team + '"), and "' + maker + '" only records who ' +
+        'made each one. So reading should be decided by team membership: let a signed-in user read a ' +
+        'row when they are a member of that row\'s "' + team + '" - checked through your membership ' +
+        'table, or a helper function that asks it - and give logged-out visitors nothing. Do not ' +
+        'compare "' + maker + '" to auth.uid() for reading: that hides teammates\' rows from each other ' +
+        'and breaks the feature.',
+      '',
+      'Write separate rules for reading, inserting, updating and deleting. Inserting: WITH CHECK that ' +
+        'the user is a member of the row\'s "' + team + '" AND "' + maker + '" = auth.uid(), so nobody ' +
+        'writes a row under somebody else\'s name or into a team they are not in. Updating and ' +
+        'deleting: the membership check in USING (and WITH CHECK for updating), and decide whether any ' +
+        'member may do it or only the row\'s "' + maker + '" or an admin. If only your server writes ' +
+        'this table, add no write rules at all.',
+      '',
+    ];
+  }
+  const tenant = finding.owned === false && team;
   if (tenant) {
     return [
       'Rows in "' + table + '" belong to an organization ("' + tenant + '"), not to one person. So the ' +
