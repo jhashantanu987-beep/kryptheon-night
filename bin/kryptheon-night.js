@@ -88,7 +88,7 @@ function usage() {
 // names a schema: `public` is the schema almost everybody has, and a bare
 // word that is not one of these is still read as a schema so that
 // `kryptheon-night public` keeps working.
-const VERBS = ['install', 'uninstall', 'status', 'night'];
+const VERBS = ['install', 'uninstall', 'status', 'night', 'words'];
 
 /** What was asked for, and what was left to the default. */
 function readArgs(argv) {
@@ -396,6 +396,23 @@ async function runOutside(appUrl) {
   return result.findings.length ? 1 : 0;
 }
 
+/** Everything the dashboard needs to say what this command would say. */
+function wordsFor(target, connection) {
+  const given = String(connection || '').trim();
+  const unusable = given ? trouble.readConnectionString(given) : null;
+  return {
+    help: intro.whereToFindIt(),
+    consent: intro.consentLines(target),
+    installConsent: intro.installConsentLines(installer.SCHEMA, target, installer.AT),
+    // pg_cron reads this in the database's own time zone, which is UTC on
+    // Supabase; the dashboard turns it into the person's local time.
+    nightlyAt: installer.AT,
+    given: Boolean(given),
+    unusable: unusable,
+    warning: given && !unusable ? trouble.poolerWarning(given) : null,
+  };
+}
+
 /** Prints a block of plain lines with the indent the rest of the report uses. */
 function block(lines, write) {
   (write || line)('');
@@ -415,6 +432,17 @@ async function main() {
     fail('  I do not know the option ' + asked.unknown[0] + '.');
     usage().forEach(fail);
     process.exit(2);
+  }
+
+  // The words this command says, as JSON, for the kryptheon dashboard to show
+  // on its own buttons: the help for finding the string, both consent
+  // screens, and - when KN_DATABASE_URL is given - what is wrong with it or
+  // worth warning about. Never connects, and never prints the string: the
+  // warnings name the host at most, and a string that cannot be used is
+  // described, not repeated.
+  if (asked.command === 'words') {
+    process.stdout.write(JSON.stringify(wordsFor(asked.schema || 'public', process.env.KN_DATABASE_URL || '')) + '\n');
+    return;
   }
 
   // The outside attack. Needs no connection string, no copy and no yes: it

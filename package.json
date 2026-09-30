@@ -31,7 +31,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "check": "node package.check.js && node store.check.js && node trouble.check.js && node intro.check.js && node finding.check.js && node outside.check.js && node recheck.check.js && node untouched.check.js && node blocked.check.js && node orphans.check.js && node guests.check.js && node usable.check.js && node twin.check.js && node engines.check.js && node external.check.js && node schema.check.js && node collision.check.js && node tamper.check.js && node orphan.check.js && node shapes.check.js && node verdicts.check.js && node shop.check.js && node privileged.check.js && node recursion.check.js && node guarded.check.js && node nightly.check.js && node cli.check.js && node loop.check.js",
+    "check": "node package.check.js && node store.check.js && node trouble.check.js && node intro.check.js && node finding.check.js && node outside.check.js && node recheck.check.js && node untouched.check.js && node blocked.check.js && node orphans.check.js && node guests.check.js && node usable.check.js && node twin.check.js && node engines.check.js && node external.check.js && node schema.check.js && node collision.check.js && node tamper.check.js && node orphan.check.js && node shapes.check.js && node verdicts.check.js && node shop.check.js && node privileged.check.js && node recursion.check.js && node guarded.check.js && node nightly.check.js && node words.check.js && node cli.check.js && node loop.check.js",
     "check:dry": "node package.check.js && node store.check.js && node trouble.check.js && node intro.check.js && node finding.check.js && node recheck.check.js && node outside.check.js",
     "check:package": "node package.check.js",
     "check:store": "node store.check.js",
@@ -56,6 +56,7 @@
     "check:recursion": "node recursion.check.js",
     "check:guarded": "node guarded.check.js",
     "check:nightly": "node nightly.check.js",
+    "check:words": "node words.check.js",
     "check:cli": "node cli.check.js",
     "check:writes": "node tamper.check.js",
     "check:orphans": "node orphans.check.js",
