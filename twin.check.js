@@ -671,6 +671,34 @@ async function main() {
           }
         }
 
+        // Owners found by what a column points at rather than what it is
+        // called: auth.users as written and as the copy's stand-in, the id of
+        // a table of people, two people on one row (no owner), a key to a
+        // table that holds no people, and a key to itself.
+        const fk = (col, target) => ({ kind: 'f', definition: 'FOREIGN KEY (' + col + ') REFERENCES ' + target });
+        const uuid = (name) => ({ name: name, type: 'uuid' });
+        const shapes = [
+          { name: 'visits', columns: [{ name: 'id', type: 'integer' }, uuid('provider_id')], constraints: [fk('provider_id', 'profiles(id)')] },
+          { name: 'notes', columns: [uuid('id'), uuid('writer')], constraints: [fk('writer', 'auth.users(id) ON DELETE CASCADE')] },
+          { name: 'notes2', columns: [uuid('id'), uuid('writer')], constraints: [fk('writer', 'kn_copy_x.kn_ext__auth__users__2(id)')] },
+          { name: 'users', columns: [{ name: 'id', type: 'integer' }, uuid('login')], constraints: [fk('login', 'auth.users(id)')] },
+          { name: 'user_accounts', columns: [uuid('id'), uuid('invited_by')], constraints: [fk('invited_by', 'user_accounts(id)')] },
+          { name: 'doctors', columns: [uuid('id'), uuid('invited_by')], constraints: [fk('invited_by', 'auth.users(id)'), fk('id', '"public"."users"(id)')] },
+          { name: 'messages', columns: [uuid('id'), uuid('sender_id'), uuid('recipient_id')], constraints: [fk('sender_id', 'profiles(id)'), fk('recipient_id', 'profiles(id)')] },
+          { name: 'tasks', columns: [uuid('id'), uuid('team_id')], constraints: [fk('team_id', 'teams(id)')] },
+          { name: 'staff', columns: [{ name: 'id', type: 'integer' }, uuid('boss')], constraints: [fk('boss', 'staff(id)')] },
+          { name: 'grants', columns: [uuid('id'), uuid('holder')], constraints: [fk('holder', 'user_accounts(email)')] },
+        ];
+        const expected = { visits: 'provider_id', notes: 'writer', notes2: 'writer', users: 'login', user_accounts: 'id', doctors: 'id', messages: null, tasks: null, staff: null, grants: null };
+        for (const shape of shapes) {
+          const mine = attack.ownerColumn(shape);
+          const theirs = await ask('owner_column', [JSON.stringify(shape)]);
+          if (mine !== expected[shape.name] || theirs !== expected[shape.name]) {
+            found.push('owner of ' + shape.name + ': node ' + JSON.stringify(mine) + ', sql ' +
+              JSON.stringify(theirs) + ', expected ' + JSON.stringify(expected[shape.name]));
+          }
+        }
+
         // Widths, including the shapes that declare none and the ones whose
         // brackets hold something that is not a width at all.
         for (const [text, kind] of [

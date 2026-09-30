@@ -89,6 +89,19 @@ async function buildShop(client) {
   await client.query('ALTER TABLE ' + q('notes') + ' ENABLE ROW LEVEL SECURITY');
   await client.query('CREATE POLICY my_notes ON ' + q('notes') + ' FOR ALL USING (auth.uid() = owner) WITH CHECK (auth.uid() = owner)');
 
+  // One provider reads every other provider's patients. The owner is not
+  // named like one - provider_id -> profiles.id -> auth.users - and the blind
+  // test that found this had it reported as nothing at all.
+  await client.query('CREATE TABLE ' + q('visits') + ' (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, provider_id uuid NOT NULL REFERENCES ' + q('profiles') + ' (id), patient_name text NOT NULL)');
+  await client.query('ALTER TABLE ' + q('visits') + ' ENABLE ROW LEVEL SECURITY');
+  await client.query('CREATE POLICY every_visit ON ' + q('visits') + ' FOR SELECT TO authenticated USING (true)');
+
+  // Safe, and two people on every row: whose row it is cannot be told, so
+  // reading a message sent to you must not be reported as a break.
+  await client.query('CREATE TABLE ' + q('messages') + ' (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, sender_id uuid NOT NULL REFERENCES ' + q('profiles') + ' (id), recipient_id uuid NOT NULL REFERENCES ' + q('profiles') + ' (id), body text NOT NULL)');
+  await client.query('ALTER TABLE ' + q('messages') + ' ENABLE ROW LEVEL SECURITY');
+  await client.query('CREATE POLICY mine ON ' + q('messages') + ' FOR SELECT USING (auth.uid() IN (sender_id, recipient_id))');
+
   // What Supabase grants every table in public.
   await client.query('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ' + schema.quote(SHOP) + ' TO anon, authenticated');
   await client.query('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ' + schema.quote(SHOP) + ' TO anon, authenticated');
@@ -196,6 +209,7 @@ async function main() {
           [/orders: .*(add rows|can add)/i, 'orders: anyone can add'],
           [/order_items: .*point at/i, 'order_items can point at nothing'],
           [/accounts: .*same email/i, 'accounts: the same email twice'],
+          [/visits: .*one customer read another/i, "visits: one provider reads another's"],
         ];
         for (const [pattern, what] of want) if (!pattern.test(found)) problems.push('missing: ' + what);
         // One mistake, one finding: the waitlist's rule opens it to reading and
@@ -212,6 +226,7 @@ async function main() {
         }
         const orders = ((r.result && r.result.findings) || []).filter((f) => f.table === 'orders');
         if (!orders.length || orders.some((f) => /service_role/.test(f.fixPrompt))) problems.push('the orders fix, tied to Supabase sign-in, was told to use service_role');
+        if (/ messages: /.test(found)) problems.push('the safe messages table was reported: ' + found.split('\n').filter((l) => / messages: /.test(l)).join(' / '));
         if (/ notes: /.test(found)) problems.push('the safe notes table was reported: ' + found.split('\n').filter((l) => / notes: /.test(l)).join(' / '));
         if (problems.length) problems.push('it found:\n        ' + found.split('\n').join('\n        '));
         return problems;

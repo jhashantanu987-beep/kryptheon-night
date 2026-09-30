@@ -411,35 +411,47 @@ function wrapTo(text, width) {
 }
 
 /**
- * Which tables are tied to Supabase's own sign-in: a foreign key to
- * auth.users, or a rule that asks auth.uid() or auth.jwt(). Read from the
- * original schema, not the copy - the copy points those keys at a stand-in.
- * A table missing from the map is unknown, which the prompts treat as tied.
+ * Whether the app signs people in through Supabase: any foreign key to
+ * auth.users, or any rule that asks auth.uid() or auth.jwt(). Decided for the
+ * whole app, not table by table. Found on a blind test: appointments points
+ * at profiles, which points at auth.users - no key of its own and no rule
+ * asking auth.uid(), so it was told the app "signs people in its own way"
+ * when it plainly used Supabase's. Read from the original schema, not the
+ * copy - the copy points those keys at a stand-in. A table missing from the
+ * map is unknown, which the prompts treat as tied.
  */
 function authTiesOf(plan) {
-  const ties = new Map();
-  for (const table of (plan && plan.tables) || []) {
-    ties.set(table.name, (table.constraints || []).some((c) =>
-      c.kind === 'f' && /references\s+"?auth"?\s*\.\s*"?users"?\s*\(/i.test(String(c.definition || ''))));
-  }
-  for (const policy of (plan && plan.policies) || []) {
-    const text = String(policy.qual || '') + ' ' + String(policy.with_check || '');
-    if (/\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(text)) ties.set(policy.table_name, true);
-  }
-  return ties;
+  const tables = (plan && plan.tables) || [];
+  const keyed = tables.some((table) => (table.constraints || []).some((c) =>
+    c.kind === 'f' && /references\s+"?auth"?\s*\.\s*"?users"?\s*\(/i.test(String(c.definition || ''))));
+  const asked = ((plan && plan.policies) || []).some((policy) =>
+    /\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(String(policy.qual || '') + ' ' + String(policy.with_check || '')));
+  return new Map(tables.map((table) => [table.name, keyed || asked]));
 }
 
 /**
- * The fix for a table that is not tied to Supabase's sign-in. Found on an app
- * with its own login: "compare the owner to the id of the signed-in user"
- * cannot be done there - auth.uid() is empty for everybody - and an assistant
- * that writes it anyway locks the app out of its own table.
+ * The fix for a table no rule can tie to the signed-in user, or null when one
+ * can. Two ways that happens. The app has its own login: found on a real app,
+ * "compare the owner to the id of the signed-in user" cannot be done there -
+ * auth.uid() is empty for everybody - and an assistant that writes it anyway
+ * locks the app out of its own table. Or the table has no column saying whose
+ * row it is - a waitlist, a contact form - so there is nothing to compare.
  */
-function ownSignInLines(table) {
-  return [
-    'Nothing in "' + table + '" points at auth.users and no rule on it uses auth.uid(), so your ' +
+function serverOnlyLines(finding) {
+  const table = finding.table;
+  let why;
+  if (finding.authTied === false) {
+    why = 'Nothing in "' + table + '" points at auth.users and no rule on it uses auth.uid(), so your ' +
       'app signs people in its own way. A rule comparing a column to the signed-in user cannot ' +
-      'work here - auth.uid() is empty for everyone - and adding one would lock your own app out.',
+      'work here - auth.uid() is empty for everyone - and adding one would lock your own app out.';
+  } else if (finding.owned === false) {
+    why = '"' + table + '" has no column that says whose row it is, so a rule tying rows to the ' +
+      'signed-in user has nothing to compare against.';
+  } else {
+    return null;
+  }
+  return [
+    why,
     '',
     'If only your server reads and writes this table: keep row level security on, drop the rules ' +
       'that let everyone in, and add none for anon or authenticated. Have your server use the ' +
@@ -485,9 +497,7 @@ function groupPromptFor(members) {
       (anyoneWrites && customersWrite ? ' Signed-in users can do the same.' : ''),
     '',
   ].concat(
-    lead.authTied === false
-      ? ownSignInLines(table)
-      : [
+    serverOnlyLines(lead) || [
         'Switch row level security on for this table, remove the rule that lets everyone in, and ' +
           'write separate rules for reading, inserting, updating and deleting. A rule written FOR ALL ' +
           'covers far more than reading.',
@@ -571,9 +581,7 @@ function fixPromptFor(finding) {
           .join(', ') + '.',
       '',
     ].concat(
-      finding.authTied === false
-        ? ownSignInLines(finding.table)
-        : [
+      serverOnlyLines(finding) || [
           'Switch row level security on for this table, then write separate rules for ' +
             'reading, inserting, updating and deleting. A rule written FOR SELECT does ' +
             'not cover writes, and a rule written FOR ALL covers far more than reading.',
@@ -663,9 +671,7 @@ function fixPromptFor(finding) {
             : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
         '',
       ].concat(
-        finding.authTied === false
-          ? ownSignInLines(finding.table)
-          : [
+        serverOnlyLines(finding) || [
             'Fix it so a person can only read their own rows: compare ' + owner +
               ' against the id of the signed-in user, and make sure logged-out visitors get nothing.',
             '',

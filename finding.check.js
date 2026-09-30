@@ -518,23 +518,33 @@ const cases = [
     },
   },
   {
-    name: 'which tables are tied to Supabase sign-in: a key to auth.users, or a rule asking auth.uid()',
+    name: 'an app uses Supabase sign-in if any table keys to auth.users or any rule asks auth.uid() - and then every table does',
     run: () => {
-      const ties = finding.authTiesOf({
+      const problems = [];
+      const expect = (label, plan, want) => {
+        const ties = finding.authTiesOf(plan);
+        for (const t of Object.keys(want)) if (ties.get(t) !== want[t]) problems.push(label + ': ' + t + ' is ' + ties.get(t) + ', expected ' + want[t]);
+      };
+      // The blind test's shape: appointments -> profiles -> auth.users.
+      expect('keyed', {
         tables: [
-          { name: 'notes', constraints: [{ kind: 'f', definition: 'FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE' }] },
-          { name: 'posts', constraints: [] },
+          { name: 'profiles', constraints: [{ kind: 'f', definition: 'FOREIGN KEY (id) REFERENCES auth.users(id) ON DELETE CASCADE' }] },
+          { name: 'appointments', constraints: [{ kind: 'f', definition: 'FOREIGN KEY (provider_id) REFERENCES profiles(id)' }] },
+        ],
+        policies: [{ table_name: 'appointments', qual: 'true', with_check: null }],
+      }, { profiles: true, appointments: true });
+      expect('asked', {
+        tables: [{ name: 'posts', constraints: [] }, { name: 'tags', constraints: [] }],
+        policies: [{ table_name: 'posts', qual: '(author = auth.uid())', with_check: null }],
+      }, { posts: true, tags: true });
+      // Its own login: users.id bigint, and a key to public.users is not auth.users.
+      expect('own', {
+        tables: [
           { name: 'bookings', constraints: [{ kind: 'f', definition: 'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL' }] },
           { name: 'users', constraints: [{ kind: 'p', definition: 'PRIMARY KEY (id)' }] },
         ],
-        policies: [
-          { table_name: 'posts', qual: '(author = auth.uid())', with_check: null },
-          { table_name: 'users', qual: 'true', with_check: 'true' },
-        ],
-      });
-      const want = { notes: true, posts: true, bookings: false, users: false };
-      const problems = [];
-      for (const t of Object.keys(want)) if (ties.get(t) !== want[t]) problems.push(t + ': ' + ties.get(t) + ', expected ' + want[t]);
+        policies: [{ table_name: 'users', qual: 'true', with_check: 'true' }],
+      }, { bookings: false, users: false });
       return problems;
     },
   },
@@ -565,6 +575,11 @@ const cases = [
       const tied = finding.fixPromptFor(Object.assign({ kind: 'writable', who: 'anyone', can: ['add'], changed: {}, owner: 'user_id', authTied: true }, base)).replace(/\s+/g, ' ');
       if (!/WITH CHECK comparing "user_id"/.test(tied)) problems.push('a tied table lost its owner rule');
       if (/service_role/.test(tied)) problems.push('a tied table was told to use service_role');
+      // Supabase sign-in, but no column saying whose row it is (a waitlist):
+      // there is nothing for an owner rule to compare, so the same way out.
+      const ownerless = finding.fixPromptFor(Object.assign({ kind: 'writable', who: 'anyone', can: ['add'], changed: {}, authTied: true, owned: false }, base)).replace(/\s+/g, ' ');
+      if (!/no column that says whose row it is/.test(ownerless) || !/service_role/.test(ownerless)) problems.push('an ownerless table was not given the server-only fix');
+      if (/signs people in its own way/.test(ownerless)) problems.push('an ownerless table in a Supabase app was told it has its own login');
       const unknown = finding.fixPromptFor(Object.assign({ kind: 'writable', who: 'anyone', can: ['add'], changed: {} }, base)).replace(/\s+/g, ' ');
       if (/service_role/.test(unknown)) problems.push('a table of unknown ties was told to use service_role');
       return problems;

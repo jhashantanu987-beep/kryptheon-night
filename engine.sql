@@ -1006,6 +1006,7 @@ RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE
   wanted text;
   found text;
+  people text[];
 BEGIN
   FOREACH wanted IN ARRAY ARRAY['user_id', 'owner_id', 'owner', 'profile_id',
                                 'account_id', 'created_by', 'author_id'] LOOP
@@ -1015,6 +1016,28 @@ BEGIN
      LIMIT 1;
     IF found IS NOT NULL THEN RETURN found; END IF;
   END LOOP;
+
+  -- Not named like an owner, but a single-column key from a uuid column to a
+  -- person: auth.users (or the copy's stand-in for it), or the id of a table
+  -- that holds people. Found on a blind test: appointments.provider_id ->
+  -- profiles.id was never tried. `id` first; two such columns (sender_id and
+  -- recipient_id) cannot say whose row it is, so they name no owner.
+  SELECT array_agg(DISTINCT k.col) INTO people
+    FROM (
+      SELECT __KN__.unquoted(p[1]) AS col,
+             (con->>'definition') ~* 'REFERENCES\s+"?auth"?\s*\.\s*"?users"?\s*\(' AS to_auth,
+             __KN__.unquoted(split_part(p[2], '.', greatest(array_length(string_to_array(p[2], '.'), 1), 1))) AS ref_table,
+             __KN__.unquoted(p[3]) AS ref_column
+        FROM jsonb_array_elements(coalesce(tab->'constraints', '[]'::jsonb)) con,
+             regexp_match(con->>'definition', 'FOREIGN KEY \(([^),]+)\) REFERENCES ([^(]+)\(([^),]+)\)', 'i') p
+       WHERE con->>'kind' = 'f' AND p IS NOT NULL
+    ) k
+   WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(tab->'columns') c
+                  WHERE c->>'type' = 'uuid' AND c->>'name' = k.col)
+     AND (k.to_auth OR (k.ref_column = 'id' AND k.ref_table <> tab->>'name'
+                        AND k.ref_table ~* '(profile|user|account|member)'));
+  IF 'id' = ANY (coalesce(people, '{}')) THEN RETURN 'id'; END IF;
+  IF array_length(people, 1) = 1 THEN RETURN people[1]; END IF;
 
   -- A profiles table keyed by the person themselves.
   IF (tab->>'name') ~* '(profile|user|account|member)' THEN

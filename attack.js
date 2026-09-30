@@ -31,6 +31,39 @@ const USER_D = '66666666-6666-4666-8666-666666666666';
 // where the row id IS the person.
 const OWNER_NAMES = ['user_id', 'owner_id', 'owner', 'profile_id', 'account_id', 'created_by', 'author_id'];
 
+// A key to Supabase's auth.users as the app wrote it. In the copy it points
+// at a stand-in named kn_ext__auth__users, which the table-of-people rule
+// below already recognises; this one is for a table itself called users.
+const TO_AUTH_USERS = /REFERENCES\s+"?auth"?\s*\.\s*"?users"?\s*\(/i;
+// A table that looks like it holds people, keyed by the person.
+const PERSON_TABLE = /(profile|user|account|member)/i;
+
+/**
+ * The single-column keys from a uuid column, with what they point at. Read
+ * from the constraint wording itself, because a key to auth.users and a key
+ * to public.users are different things and the schema is part of the words.
+ */
+function personKeys(table, uuids) {
+  const byName = new Set(uuids.map((c) => c.name));
+  const keys = [];
+  for (const constraint of table.constraints || []) {
+    if (constraint.kind !== 'f') continue;
+    const definition = String(constraint.definition || '');
+    const match = /FOREIGN KEY \(([^)]+)\) REFERENCES ([^(]+)\(([^)]+)\)/i.exec(definition);
+    if (!match) continue;
+    const columns = match[1].split(',').map((t) => t.trim().split('"').join(''));
+    const refColumns = match[3].split(',').map((t) => t.trim().split('"').join(''));
+    if (columns.length !== 1 || !byName.has(columns[0])) continue;
+    keys.push({
+      column: columns[0],
+      toAuth: TO_AUTH_USERS.test(definition),
+      refTable: match[2].split('.').pop().trim().split('"').join(''),
+      refColumn: refColumns[0],
+    });
+  }
+  return keys;
+}
+
 /** The column that says who a row belongs to, or null if nothing does. */
 function ownerColumn(table) {
   const uuids = table.columns.filter((c) => c.type === 'uuid');
@@ -38,6 +71,19 @@ function ownerColumn(table) {
     const found = uuids.find((c) => c.name === name);
     if (found) return found.name;
   }
+  // Not named like an owner, but pointing at a person. Found on a blind test:
+  // appointments.provider_id -> profiles.id -> auth.users. Judged by name
+  // alone it had no owner, so "one provider reads another's patients" - a
+  // rule written USING (true) - was never tried, and the worst hole in the
+  // app went unreported. `id` first: a table keyed by the person is theirs.
+  // Two people on one row - sender_id and recipient_id - and neither is
+  // named: whose row it is cannot be told, and guessing would report one
+  // person reading a message sent to them as a break. So only one, or none.
+  const people = personKeys(table, uuids).filter((k) => k.toAuth ||
+    (k.refColumn === 'id' && k.refTable !== table.name && PERSON_TABLE.test(k.refTable)));
+  const columns = Array.from(new Set(people.map((k) => k.column)));
+  if (columns.includes('id')) return 'id';
+  if (columns.length === 1) return columns[0];
   // A profiles table keyed by the person themselves.
   if (/profile|user|account|member/i.test(table.name)) {
     const id = uuids.find((c) => c.name === 'id');
