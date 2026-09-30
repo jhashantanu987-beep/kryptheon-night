@@ -74,6 +74,33 @@ async function build(client) {
       '$$ SELECT * FROM ' + q(APP) + '.secrets $$',
   );
   await client.query('GRANT EXECUTE ON FUNCTION ' + q(APP) + '.peek() TO anon');
+
+  // 7. A yes/no about the caller alone - the helper row level security uses
+  //    to avoid checking a table against itself. anon can call it and gets
+  //    "no". Callable, but NOT a finding (blind test: OpsForge's is_org_member).
+  //    plpgsql, so auth.uid() need not exist when it is created.
+  await client.query(
+    'CREATE FUNCTION ' + q(APP) + '.is_member(org int) RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS ' +
+      '$$ BEGIN RETURN EXISTS (SELECT 1 FROM ' + q(APP) + '.secrets s WHERE s.id = org AND s.body = auth.uid()::text); END $$',
+  );
+  // 8. A yes/no about somebody else: it answers for any user id it is given.
+  //    A finding.
+  await client.query(
+    'CREATE FUNCTION ' + q(APP) + '.is_admin_of(who text) RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS ' +
+      '$$ BEGIN RETURN EXISTS (SELECT 1 FROM ' + q(APP) + '.secrets s WHERE s.body = who); END $$',
+  );
+  // 10. Asks auth.uid(), reads, but hands back rows, not a yes/no: what comes
+  //     out is data, and whether it is only the caller's is the logic's
+  //     business. A finding.
+  await client.query(
+    'CREATE FUNCTION ' + q(APP) + '.my_rows() RETURNS SETOF text LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS ' +
+      '$$ BEGIN RETURN QUERY SELECT s.body FROM ' + q(APP) + '.secrets s WHERE s.body = auth.uid()::text OR true; END $$',
+  );
+  // 9. Asks auth.uid(), but writes. A finding.
+  await client.query(
+    'CREATE FUNCTION ' + q(APP) + '.flip() RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS ' +
+      '$$ BEGIN UPDATE ' + q(APP) + '.secrets SET body = auth.uid()::text; RETURN true; END $$',
+  );
 }
 
 async function main() {
@@ -144,16 +171,19 @@ async function main() {
       return callable.length ? ['it called ' + callable.length + ' functions callable by a role that does not exist'] : [];
     })());
 
-    check('exactly the three risky functions are flagged, no more', (() => {
-      const want = ['claim', 'peek', 'viapublic'];
-      const got = names;
-      return JSON.stringify(got) === JSON.stringify(want) ? [] : ['expected ' + JSON.stringify(want) + ', got ' + JSON.stringify(got)];
+    check('exactly the risky functions are flagged, no more - a yes/no about the caller is not one', (() => {
+      // is_member is callable by anon but only answers about the caller.
+      const want = ['claim', 'flip', 'is_admin_of', 'my_rows', 'peek', 'viapublic'];
+      const got = flagged.filter((f) => !f.aboutCaller).map((f) => f.name).sort();
+      const problems = JSON.stringify(got) === JSON.stringify(want) ? [] : ['expected ' + JSON.stringify(want) + ', got ' + JSON.stringify(got)];
+      if (!names.includes('is_member')) problems.push('is_member should still be callable - it is quiet because of what it answers, not because anon cannot reach it');
+      return problems;
     })());
 
     check('every definer function is examined, including the ones anon cannot call', (() => {
       // mine is definer but authenticated-only: examined, not flagged. The
       // trigger and the invoker function are not definer-callables at all.
-      const want = ['claim', 'mine', 'peek', 'viapublic'];
+      const want = ['claim', 'flip', 'is_admin_of', 'is_member', 'mine', 'my_rows', 'peek', 'viapublic'];
       return JSON.stringify(examined) === JSON.stringify(want) ? [] : ['expected ' + JSON.stringify(want) + ', got ' + JSON.stringify(examined)];
     })());
 
@@ -162,7 +192,7 @@ async function main() {
     const asAuthed = (await schema.readAnonDefinerFunctions(client, APP, 'authenticated'))
       .filter((f) => f.callable).map((f) => f.name).sort();
     check('the reader answers for the role it is asked about', (() => {
-      const want = ['claim', 'mine', 'peek', 'viapublic'];
+      const want = ['claim', 'flip', 'is_admin_of', 'is_member', 'mine', 'my_rows', 'peek', 'viapublic'];
       return JSON.stringify(asAuthed) === JSON.stringify(want) ? [] : ['as authenticated expected ' + JSON.stringify(want) + ', got ' + JSON.stringify(asAuthed)];
     })());
 
@@ -181,6 +211,12 @@ async function main() {
       // It was read again this run, so a later run where the grant is gone can
       // call it fixed rather than "could not confirm".
       if (!(result.attempted || []).includes('privileged:claim')) problems.push('the re-check has no record that this was looked at');
+      // The caller-only helper is examined but not reported; the yes/no about
+      // somebody else and the one that writes are.
+      const tables = priv.map((f) => f.table);
+      if (tables.includes('is_member')) problems.push('is_member, a yes/no about the caller, was reported');
+      for (const name of ['is_admin_of', 'flip', 'my_rows']) if (!tables.includes(name)) problems.push(name + ' was not reported');
+      if (!(result.attempted || []).includes('privileged:is_member')) problems.push('is_member was not recorded as examined');
       return problems;
     })());
 

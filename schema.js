@@ -218,6 +218,7 @@ async function readAnonDefinerFunctions(client, schema, role) {
             pg_get_function_identity_arguments(p.oid) AS args,
             p.proconfig::text AS config,
             pg_get_functiondef(p.oid) AS def,
+            p.prorettype = 'pg_catalog.bool'::regtype AS returns_bool,
             ${exists.rows.length ? "has_function_privilege($2, p.oid, 'EXECUTE')" : 'false'} AS callable
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -238,11 +239,24 @@ async function readAnonDefinerFunctions(client, schema, role) {
     // could fool this, and that is acceptable: it never turns a non-finding
     // into a finding, only "can read" into "can change".
     const body = String(row.def || '').replace(/--[^\n]*/g, ' ');
-    const writes = /\b(insert\s+into|update\s+\w|delete\s+from|truncate|merge\s+into)\b/i.test(body);
+    // `update\s+\w` followed by \b matched only a one-letter table name, so
+    // UPDATE was never seen - archive_notebook was worded as reading. The
+    // whole name, quoted or not, is matched now.
+    const writes = /\b(insert\s+into|update\s+(only\s+)?["\w]+|delete\s+from|truncate|merge\s+into)\b/i.test(body);
+    // A yes/no about the caller alone - is_org_member(org) asking whether
+    // auth.uid() belongs to it. Found on a blind test, where two such helpers
+    // were reported as "anyone can call it, with full rights": they are how
+    // row level security avoids checking a table against itself, and to a
+    // visitor with no account they answer no. Reading nothing about anybody
+    // else and writing nothing, they are not a reach. A yes/no that does not
+    // ask auth.uid() - is_admin(user_id) - answers about other people, and
+    // stays a finding.
+    const aboutCaller = row.returns_bool === true && !writes && /\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(body);
     return {
       name: row.name,
       args: row.args || '',
       writes: writes,
+      aboutCaller: aboutCaller,
       hasFixedSearchPath: hasFixedSearchPath,
       callable: row.callable === true,
     };

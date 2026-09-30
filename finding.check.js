@@ -256,7 +256,7 @@ const cases = [
     run: () => {
       const problems = [];
       const secret = ['integration_token', 'access_token', 'refresh_token', 'signing_secret', 'client_secret', 'stripe_api_key', 'secret_key', 'hashed_password', 'encrypted_password'];
-      const about = ['token_expires_at', 'tokenised_flag', 'secret_question', 'key', 'monkey', 'primary_key_id', 'api_key_last_used', 'password_changed_at', 'tokens_used_count', 'keyboard'];
+      const about = ['token_expires_at', 'tokenised_flag', 'secret_question', 'key', 'monkey', 'primary_key_id', 'api_key_last_used', 'password_changed_at', 'tokens_used_count', 'keyboard', 'tokens', 'input_tokens', 'output_tokens'];
       const missed = secret.filter((c) => !finding.readContents([c]).secrets.length);
       const wrong = about.filter((c) => finding.readContents([c]).secrets.length);
       if (missed.length) problems.push('secrets missed: ' + missed.join(', '));

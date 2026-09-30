@@ -362,7 +362,7 @@ async function scan(client, sourceSchema, options) {
     // version recorded only the flagged ones, so a revoke made the function
     // vanish from both lists and the fix came back as "could not confirm".
     for (const fn of plan.anonFunctions || []) attempted.push('privileged:' + fn.name);
-    const privileged = (plan.anonFunctions || []).filter((fn) => fn.callable).map((fn) => ({
+    const privileged = (plan.anonFunctions || []).filter((fn) => fn.callable && !fn.aboutCaller).map((fn) => ({
       kind: 'privileged',
       fn: fn.name,
       table: fn.name,

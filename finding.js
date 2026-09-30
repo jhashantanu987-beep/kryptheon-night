@@ -35,8 +35,11 @@ const SECRETS = [
   // on a blind test: integration_token, access_token and signing_secret, all
   // readable by anyone, and the report named none of them. A name that ENDS
   // in the secret word is the secret; token_expires_at is only about one.
+  // Singular only: `tokens` and `input_tokens` count what an AI call used -
+  // found on the next blind test, where api_usage.tokens (an integer) was
+  // named as a secret.
   [/\b(password|passwd|pass_hash|password_hash)\b|(^|_)(password|passwd|pwd|password_hash)$/i, 'passwords'],
-  [/\b(token|api_key|apikey|secret|private_key|access_key)\b|(^|_)(tokens?|secret|(api|private|access|secret|signing|service|encryption)_?key)$/i, 'access tokens and secrets'],
+  [/\b(token|api_key|apikey|secret|private_key|access_key)\b|(^|_)(token|secret|(api|private|access|secret|signing|service|encryption)_?key)$/i, 'access tokens and secrets'],
   [/\b(card|card_number|cvv|iban|account_number|upi)\b/i, 'payment details'],
   // A code that grants something: whoever reads a moderator_code can become a
   // moderator. Found on a blind test, added straight in production and readable
