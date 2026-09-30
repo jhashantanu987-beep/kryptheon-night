@@ -100,6 +100,11 @@ function listOf(items) {
  * should be fixed - there is no such thing as a low finding here.
  */
 function severityOf(finding, contents) {
+  if (finding.kind === 'recursive') {
+    // Nothing leaks and nothing is written: the request fails. Serious,
+    // because the app is broken for whoever it fails for, but not a break-in.
+    return 'HIGH';
+  }
   if (finding.kind === 'privileged') {
     // Not proven, so never CRITICAL: this is a reach that exists, not a break
     // that was demonstrated. A function anon can call that also writes is worth
@@ -153,6 +158,18 @@ function severityOf(finding, contents) {
  * one it is saves them looking in the wrong place.
  */
 function causeOf(finding) {
+  if (finding.kind === 'recursive') {
+    return {
+      short: 'a rule on it looks the same table up again',
+      long:
+        'A row level security rule on this table checks something by reading ' +
+        'this same table - usually "is this person a member?" asked of the ' +
+        'members table itself. Reading the table means applying the rule, and ' +
+        'applying the rule means reading the table, so Postgres stops the ' +
+        'request with an error instead of going round forever. Any other ' +
+        'table whose rule asks this one fails the same way.',
+    };
+  }
   if (finding.kind === 'orphaned') {
     return {
       short: 'nothing in the database ties the two tables together',
@@ -274,7 +291,19 @@ function causeOf(finding) {
 /** What a caller could do, written the way a person would say it. */
 const WRITE_WORDS = { add: 'add rows to', change: 'change rows in', delete: 'delete rows from' };
 
+/** Who a looping rule fails for, said the way the headline and body need it. */
+function loopVictims(finding) {
+  const callers = finding.callers || [];
+  if (callers.includes('anyone') && callers.includes('signed-in')) return 'everyone, signed in or not,';
+  if (callers.includes('anyone')) return 'visitors who are not logged in';
+  return 'signed-in users';
+}
+
 function headlineFor(finding) {
+  if (finding.kind === 'recursive') {
+    return 'A rule on your ' + finding.table + ' table refers to itself, so ' + loopVictims(finding) +
+      ' get an error instead of data.';
+  }
   if (finding.kind === 'orphaned') {
     return 'Your ' + finding.table + ' table can point at a ' +
       finding.parent.replace(/s$/, '') + ' that does not exist.';
@@ -322,6 +351,24 @@ function costOf(finding) {
 function bodyFor(finding, contents) {
   const holds = listOf(heldIn(contents));
   const rowWord = finding.readable === 1 ? 'row' : 'rows';
+
+  if (finding.kind === 'recursive') {
+    // Said as what happened to the requests, and then what it cost this
+    // report: the tables behind the error could not be tested for leaks.
+    const reads = finding.reads || [];
+    const callers = finding.callers || [];
+    const as = [];
+    if (callers.includes('anyone')) as.push('a visitor who is not logged in');
+    if (callers.includes('signed-in')) as.push('a signed-in user');
+    const one = reads.length === 1;
+    return (
+      'Using ' + listOf(reads) + ' on a copy of your app as ' + as.join(' and as ') +
+      ', every request was refused with "infinite recursion detected in policy for relation ' +
+      finding.table + '". Every page in your app that uses ' + (one ? 'that table' : 'those tables') +
+      ' fails the same way for ' + loopVictims(finding).replace(/,$/, '') + '. It also means I could ' +
+      'not test ' + (one ? 'it' : 'them') + ' for leaks - those attacks are listed at the end.'
+    );
+  }
 
   if (finding.kind === 'orphaned') {
     // Said as the thing a person will actually meet: a customer asks to be
@@ -572,7 +619,32 @@ function fixPromptFor(finding) {
   const cause = causeOf(finding);
   const owner = finding.owner ? '"' + finding.owner + '"' : 'the column that says who each row belongs to';
 
-  const lines = finding.kind === 'privileged'
+  const lines = finding.kind === 'recursive'
+    ? [
+      'My app has a broken database rule.',
+      '',
+      'A row level security policy on the "' + finding.table + '" table reads "' + finding.table +
+        '" itself, so Postgres stops every request that touches it with "infinite recursion ' +
+        'detected in policy for relation ' + finding.table + '". I saw it when using ' +
+        listOf((finding.reads || []).map((t) => '"' + t + '"')) + '.',
+      '',
+      'Show me the policies on "' + finding.table + '" and on every table whose policy reads "' +
+        finding.table + '", and find the lookup that goes back into "' + finding.table + '".',
+      '',
+      'Move that lookup into a SECURITY DEFINER function that answers only about the signed-in ' +
+        'user - for example is_member_of(org uuid) returning whether auth.uid() is in that ' +
+        'organization - with SET search_path fixed, owned by the table\'s owner so it reads the ' +
+        'table without the rule applying again. Grant EXECUTE on it to authenticated only. Then ' +
+        'make the policies call that function instead of reading "' + finding.table + '" directly.',
+      '',
+      'Keep each policy exactly as strict as it was meant to be: members see only their own ' +
+        'organization\'s rows, and logged-out visitors get nothing. Do not replace it with USING ' +
+        '(true) to make the error go away.',
+      '',
+      'Then sign in as an ordinary user and open the pages that use these tables, and run this ' +
+        'check again - the tables it could not test will be tested this time.',
+    ]
+    : finding.kind === 'privileged'
     ? [
       'My app may have a security problem - please check it rather than assume it.',
       '',
@@ -773,7 +845,10 @@ function describe(finding) {
     cause: finding.kind === 'privileged' ? '' : cause.long,
     who: finding.who,
     can: finding.can,
-    proof: finding.kind === 'privileged'
+    proof: finding.kind === 'recursive'
+      ? 'Using ' + listOf((finding.reads || []).map((t) => '"' + t + '"')) + ' stopped with ' +
+        '"infinite recursion detected in policy for relation ' + finding.table + '".'
+      : finding.kind === 'privileged'
       ? 'I did not call "' + finding.fn + '". This is a reach that exists in the grants, not a break I ran.'
       : finding.kind === 'duplicated'
       ? 'I created ' + finding.copies + ' rows in "' + finding.table + '" holding the same ' +
@@ -877,7 +952,9 @@ function describeAll(findings) {
   // ones that need an account, and those before the ones that need two requests
   // to arrive together.
   // Writes above reads: a table somebody emptied is worse than one they read.
-  const byKind = { writable: 0, exposed: 1, crossed: 2, duplicated: 3, orphaned: 4, privileged: 5 };
+  // A looping rule sits with the reads: it breaks the app for everyone it
+  // fails for, which matters more than a duplicate or a stray row.
+  const byKind = { writable: 0, exposed: 1, crossed: 2, recursive: 2.5, duplicated: 3, orphaned: 4, privileged: 5 };
   const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (byKind[d.kind] === undefined ? 9 : byKind[d.kind]);
   return described.sort((a, b) => rank(a) - rank(b));
 }

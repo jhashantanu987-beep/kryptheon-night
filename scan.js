@@ -269,6 +269,10 @@ async function scan(client, sourceSchema, options) {
     const viewNames = new Set(views.map((view) => view.name));
     const attempted = impersonation.completed.filter((key) => {
       const name = key.split(':')[1];
+      // Whether a rule loops needs no rows: Postgres finds the loop while
+      // planning the read, before it looks at a single row. A table nothing
+      // could be seeded into has still been checked for that.
+      if (key.startsWith('recursive:')) return true;
       return sownTables.has(name) || (viewNames.has(name) && sown.seeded.length > 0);
     });
 
@@ -309,6 +313,25 @@ async function scan(client, sourceSchema, options) {
         why: missed.why,
       });
     }
+
+    // A rule that looks itself up. The attacks it stopped stay in the list of
+    // what was not tested - they did not run - but the loop is also a finding
+    // of its own: every signed-in request that touches the table fails, so the
+    // app is broken for the people using it. One finding per table at fault,
+    // named from Postgres's own message, however many reads ran into it.
+    const loops = new Map();
+    const loopedInto = (relation, table, who) => {
+      if (!loops.has(relation)) loops.set(relation, { kind: 'recursive', table: relation, reads: [], callers: [], columns: [] });
+      const entry = loops.get(relation);
+      if (!entry.reads.includes(table)) entry.reads.push(table);
+      if (!entry.callers.includes(who)) entry.callers.push(who);
+    };
+    for (const hit of impersonation.looped || []) loopedInto(hit.relation, hit.table, hit.who);
+    for (const stuck of writes.blocked) {
+      const relation = attack.recursionIn(stuck.why);
+      if (relation) loopedInto(relation, stuck.table, /^as anyone:/.test(stuck.why) ? 'anyone' : 'signed-in');
+    }
+    const recursive = Array.from(loops.values());
 
     let collisions = { findings: [], notTried: [], raced: [] };
     if (opts.openSession) {
@@ -389,7 +412,7 @@ async function scan(client, sourceSchema, options) {
       notChecked: notChecked,
       attempted: attempted,
       findings: finding.describeAll(
-        impersonation.findings.concat(writes.findings, stranded.findings, raced, privileged).map(tagged),
+        impersonation.findings.concat(writes.findings, stranded.findings, raced, privileged, recursive).map(tagged),
       ),
     };
   } finally {

@@ -458,6 +458,10 @@ async function main() {
         // table one engine tested and the other could not is the difference
         // between a hole examined and a hole written off as unknown.
         blocked: (r.blocked || []).map((b) => b.key).sort(),
+        // Rules that looped, and who ran into them. A loop one engine reports
+        // and the other files only as "not tested" is a broken app one of
+        // them never mentions.
+        looped: (r.looped || []).map((l) => l.relation + '<-' + l.table + ':' + l.who).sort(),
       });
       if (verdict(mineSaid) !== verdict(theirsSaid)) {
         verdictDifferences.push('the two engines said different things:' +

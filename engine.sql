@@ -1614,6 +1614,17 @@ RETURNS text LANGUAGE sql IMMUTABLE AS $$
 $$;
 
 /*
+ * The table whose rule looks itself up, or null. The twin of recursionIn in
+ * attack.js: Postgres stops such a request rather than loop, and names the
+ * table at fault - often not the one that was being read.
+ */
+CREATE OR REPLACE FUNCTION __KN__.recursion_in(message text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT (regexp_match(coalesce(message, ''),
+    'infinite recursion detected in policy for relation "([^"]+)"', 'i'))[1];
+$$;
+
+/*
  * Reads a table the way a request would, as whoever is asking.
  *
  * Counted rather than fetched. The Node side pulls the rows back and counts
@@ -1697,6 +1708,8 @@ DECLARE
   findings jsonb := '[]'::jsonb;
   completed jsonb := '[]'::jsonb;
   blocked jsonb := '[]'::jsonb;
+  -- Rules that looked themselves up, and which read ran into each one.
+  looped jsonb := '[]'::jsonb;
   tab jsonb;
   owner text;
   anon jsonb;
@@ -1712,6 +1725,22 @@ BEGIN
 
     anon := __KN__.read_as(source, tab->>'name', 'anon', NULL, NULL);
     as_a := __KN__.read_as(source, tab->>'name', 'authenticated', __KN__.user_a(), owner);
+
+    -- Looked for on every table, owner or not. Only a read of the table itself
+    -- that came back with a verdict, for both callers, shows its rules no
+    -- longer loop; a read that failed for some other reason shows nothing.
+    IF NOT (anon->>'ok')::boolean AND __KN__.recursion_in(anon->>'why') IS NOT NULL THEN
+      looped := looped || jsonb_build_array(jsonb_build_object(
+        'relation', __KN__.recursion_in(anon->>'why'), 'table', tab->>'name', 'who', 'anyone'));
+    END IF;
+    IF NOT (as_a->>'ok')::boolean AND __KN__.recursion_in(as_a->>'why') IS NOT NULL THEN
+      looped := looped || jsonb_build_array(jsonb_build_object(
+        'relation', __KN__.recursion_in(as_a->>'why'), 'table', tab->>'name', 'who', 'signed-in'));
+    END IF;
+    IF ((anon->>'ok')::boolean OR __KN__.refusal_means(anon->>'why') = 'unreachable')
+       AND ((as_a->>'ok')::boolean OR __KN__.refusal_means(as_a->>'why') = 'unreachable') THEN
+      completed := completed || to_jsonb('recursive:' || (tab->>'name'));
+    END IF;
 
     -- Did this read produce a verdict, and if not, why not?
     key := 'exposed:' || (tab->>'name');
@@ -1765,7 +1794,8 @@ BEGIN
     END IF;
   END LOOP;
 
-  RETURN jsonb_build_object('findings', findings, 'completed', completed, 'blocked', blocked);
+  RETURN jsonb_build_object('findings', findings, 'completed', completed, 'blocked', blocked,
+                            'looped', looped);
 END $$;
 
 -- --------------------------------------------------------------------------
@@ -2548,6 +2578,19 @@ BEGIN
     raced    := __KN__.collide(copy_name, theirs, copy_plan->'indexes');
 
     findings := (seen->'findings') || (wrote->'findings') || (stranded->'findings');
+
+    -- A rule that looks itself up breaks the app for whoever it fails for.
+    -- One finding per table at fault, however many reads ran into it; the
+    -- attacks it stopped stay in not_checked, because they did not run.
+    findings := findings || coalesce((
+      SELECT jsonb_agg(jsonb_build_object(
+               'kind', 'recursive', 'table', g.relation, 'reads', g.reads,
+               'callers', g.callers, 'columns', '[]'::jsonb))
+        FROM (SELECT l->>'relation' AS relation,
+                     jsonb_agg(DISTINCT l->>'table') AS reads,
+                     jsonb_agg(DISTINCT l->>'who') AS callers
+                FROM jsonb_array_elements(coalesce(seen->'looped', '[]'::jsonb)) l
+               GROUP BY l->>'relation') g), '[]'::jsonb);
 
     -- Everything genuinely attacked, so a re-check can tell a finding that was
     -- fixed from one whose attack simply did not run this time.

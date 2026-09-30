@@ -172,6 +172,7 @@ function whatOf(item) {
   if (item.kind === 'duplicated') return 'the same ' + (item.column || 'value') + ' twice';
   if (item.kind === 'orphaned') return 'rows left pointing at nothing';
   if (item.kind === 'privileged') return 'a function anyone can call';
+  if (item.kind === 'recursive') return 'a rule that refers to itself';
   return item.kind;
 }
 
@@ -195,6 +196,8 @@ function describe(result) {
       // was seen, not as an attack that was refused. Found on a fix test.
       const how = item.kind === 'privileged'
         ? 'I looked again, and a visitor with no account can no longer call it.'
+        : item.kind === 'recursive'
+        ? 'I read it again, and its rules answered instead of stopping with an error.'
         : 'I ran the same attack again and it was refused.';
       lines.push('    ' + item.table + ' (' + whatOf(item) + ') - ' + how);
     }

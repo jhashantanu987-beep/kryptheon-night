@@ -503,6 +503,22 @@ function refusalMeans(message) {
 }
 
 /**
+ * The table whose rule looks itself up, or null.
+ *
+ * A rule on organization_members that asks organization_members who is a
+ * member has to be checked to be checked, and Postgres stops the request
+ * rather than loop. Found on a blind test: every signed-in read touching that
+ * table failed, the app was broken for everyone with an account, and the
+ * report listed it only as a reason something was not tested. It is a finding
+ * in its own right - and it names the table at fault, which is often not the
+ * one that was being read.
+ */
+function recursionIn(message) {
+  const found = /infinite recursion detected in policy for relation "([^"]+)"/i.exec(String(message || ''));
+  return found ? found[1] : null;
+}
+
+/**
  * What each table gives away, and to whom.
  *
  * Two separate findings, because they are two different conversations with the
@@ -517,6 +533,8 @@ async function impersonate(client, schema, tables) {
   const findings = [];
   const completed = [];
   const blocked = [];
+  // Rules that looked themselves up, and which read ran into each one.
+  const looped = [];
 
   /** Did this read produce a verdict, and if not, why not? */
   const settle = (key, table, answer, as) => {
@@ -538,6 +556,19 @@ async function impersonate(client, schema, tables) {
     const owner = ownerColumn(table);
     const anon = await readAs(client, schema, table.name, 'anon', null);
     const asA = await readAs(client, schema, table.name, 'authenticated', USER_A);
+
+    // Looked for on every table, owner or not: a signed-in read of a table
+    // with nobody's name on it fails just the same, and it is the same
+    // broken page.
+    for (const [answer, who] of [[anon, 'anyone'], [asA, 'signed-in']]) {
+      const relation = !Array.isArray(answer) && recursionIn(answer.blocked);
+      if (relation) looped.push({ relation: relation, table: table.name, who: who });
+    }
+    // Only a read of the table itself that came back with a verdict, for both
+    // callers, shows its rules no longer loop. A read that failed for some
+    // other reason shows nothing either way.
+    const answered = (answer) => Array.isArray(answer) || refusalMeans(answer.blocked) === 'unreachable';
+    if (answered(anon) && answered(asA)) completed.push('recursive:' + table.name);
 
     if (settle('exposed:' + table.name, table.name, anon, 'as a logged-out visitor') && anon.length > 0) {
       findings.push({
@@ -567,7 +598,7 @@ async function impersonate(client, schema, tables) {
     }
   }
 
-  return { findings: findings, completed: completed, blocked: blocked };
+  return { findings: findings, completed: completed, blocked: blocked, looped: looped };
 }
 
 /** A stable shape for comparing one run against another. */
@@ -585,6 +616,7 @@ module.exports = {
   USER_C: USER_C,
   USER_D: USER_D,
   refusalMeans: refusalMeans,
+  recursionIn: recursionIn,
   ownerColumn: ownerColumn,
   fitTo: fitTo,
   foreignKeys: foreignKeys,
