@@ -510,6 +510,34 @@ function notTestedLines(result) {
   return lines;
 }
 
+/**
+ * The warning above the verdict: how much went untested, counted honestly.
+ *
+ * Every entry used to be counted as a table. Found on a benchmark: one
+ * column's duplicate test did not run, and the top line said "1 table was
+ * NOT checked" about a table every other attack had covered - and a table
+ * with two attacks stuck was counted as two tables. An entry with no attack
+ * named is a whole table nothing could be put into; one with an attack named
+ * is part of a table.
+ */
+function missedLines(notChecked) {
+  const tableOf = (entry) => String(entry.table).split('.')[0];
+  const whole = new Set(notChecked.filter((entry) => !entry.key).map(tableOf));
+  const parts = notChecked.filter((entry) => entry.key && !whole.has(tableOf(entry)));
+  const partly = new Set(parts.map(tableOf));
+  const tables = (n) => n + (n === 1 ? ' table' : ' tables');
+  const said = [];
+  if (whole.size) said.push(tables(whole.size) + (whole.size === 1 ? ' was' : ' were') + ' NOT checked');
+  if (parts.length) {
+    said.push(parts.length + (parts.length === 1 ? ' check' : ' checks') + ' on ' +
+      (whole.size ? tables(partly.size).replace(/ table/, ' other table') : tables(partly.size)) +
+      (parts.length === 1 ? ' was' : ' were') + ' NOT run');
+  }
+  const it = notChecked.length === 1 ? 'it' : 'them';
+  return wrap(said.join(', and ') + '. Whatever this report says next is not about ' + it + '. Treat ' +
+    it + ' as unknown, not as clear - the list, and why, is at the end.', 68).map((l) => '  ' + l);
+}
+
 /** The report, as the person reads it in the morning. */
 function report(result) {
   if (result.stopped) {
@@ -534,11 +562,7 @@ function report(result) {
   const sayWhatWasMissed = () => {
     if (!notChecked.length) return;
     line('');
-    line('  ' + notChecked.length + (notChecked.length === 1 ? ' table was' : ' tables were') +
-      ' NOT checked. Whatever this report says next is not');
-    line('  about ' + (notChecked.length === 1 ? 'it' : 'them') + '. Treat ' +
-      (notChecked.length === 1 ? 'it' : 'them') + ' as unknown, not as clear - the list, and why, is');
-    line('  at the end.');
+    missedLines(notChecked).forEach(line);
   };
 
   if (!result.findings.length) {
@@ -706,6 +730,7 @@ if (require.main === module) {
 module.exports = {
   scan: scan,
   report: report,
+  missedLines: missedLines,
   wrap: wrap,
   loadLastRun: loadLastRun,
   saveRun: saveRun,

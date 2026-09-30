@@ -146,9 +146,30 @@ async function main() {
         process.stdout.write = originalWrite;
       }
       const text = said.join('');
-      if (!/NOT checked/.test(text)) problems.push('the report does not mention it at all');
+      if (!/NOT (checked|run)/.test(text)) problems.push('the report does not mention it at all');
       if (/Nothing got through/.test(text)) problems.push('it printed the all-clear over a table it could not test');
       if (!/unknown, not as clear/.test(text)) problems.push('it does not say unknown is not the same as clear');
+      return problems;
+    })());
+
+    check('2b. the warning counts tables and checks as what they are', (() => {
+      // Found on a benchmark: one column's duplicate test did not run, and the
+      // top line said "1 table was NOT checked" about a table otherwise tested.
+      const problems = [];
+      const say = (entries) => require('./scan.js').missedLines(entries).join(' ').replace(/\s+/g, ' ').trim();
+      const column = say([{ table: 'users.email', key: 'duplicated:users:email', why: 'x' }]);
+      if (!/^1 check on 1 table was NOT run\./.test(column)) problems.push('one column: ' + column);
+      const twice = say([{ table: 'customers', key: 'crossed:customers' }, { table: 'customers', key: 'exposed:customers' }]);
+      if (!/^2 checks on 1 table were NOT run\./.test(twice)) problems.push('two checks on one table: ' + twice);
+      const seeded = say([{ table: 'blobs', why: 'no row could be added' }]);
+      if (!/^1 table was NOT checked\./.test(seeded)) problems.push('a table nothing went into: ' + seeded);
+      const mixed = say([{ table: 'blobs', why: 'seed' }, { table: 'blobs', key: 'exposed:blobs' },
+        { table: 'users.email', key: 'duplicated:users:email' }, { table: 'orders', key: 'crossed:orders' }]);
+      if (!/^1 table was NOT checked, and 2 checks on 2 other tables were NOT run\./.test(mixed)) problems.push('mixed: ' + mixed);
+      // A column's check on a table nothing went into is part of that table.
+      const same = say([{ table: 'users', why: 'seed' }, { table: 'users.email', key: 'duplicated:users:email' }]);
+      if (!/^1 table was NOT checked\. /.test(same)) problems.push('a column of an unchecked table counted apart: ' + same);
+      if (!/about them\. Treat them as unknown/.test(mixed) || !/about it\. Treat it as unknown/.test(column)) problems.push('it/them does not follow the count');
       return problems;
     })());
 
