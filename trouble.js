@@ -359,14 +359,19 @@ function explain(err, raw) {
   const ref = code === 'ENOTFOUND' ? supabaseDirectRef(raw) : null;
   if (ref) {
     return [
-      'I could not find that server - and I think I know why.',
+      'I could not find that server. There are two likely reasons.',
       '',
-      'That address is Supabase’s direct connection, and it now answers only',
-      'over IPv6. Plenty of home and office networks have no IPv6 at all, and on',
-      'those the name does not resolve to anything - which is what just',
-      'happened here.',
+      'Most likely: that address is Supabase’s direct connection, and it now',
+      'answers only over IPv6. Plenty of home and office networks have no IPv6',
+      'at all, and on those the name does not resolve to anything.',
       '',
-      'There is nothing wrong with your project or your password. Use the',
+      // A ref with one letter wrong fails exactly the same way, and blaming
+      // only IPv6 would send somebody to change networks over a typo.
+      'Or the address is mistyped. Check that "' + ref + '" matches the project',
+      'ref in Supabase -> Project Settings -> General; one wrong letter fails',
+      'exactly the same way.',
+      '',
+      'Your password has not been tried yet, so it is not the problem. Use the',
       'session pooler instead, which answers over the ordinary internet:',
       '',
       '  Supabase dashboard -> Project Settings -> Database ->',

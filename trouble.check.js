@@ -221,7 +221,13 @@ async function main() {
 
     if (!/IPv6/.test(said)) problems.push('it does not say why the name did not resolve: ' + said);
     if (!/session pooler/i.test(said)) problems.push('it does not say what to use instead');
-    if (/typo/i.test(said)) problems.push('it still offers a typo as the cause');
+    // IPv6 first, because it is the likelier cause; but a mistyped ref fails
+    // the same way, and blaming only IPv6 sends someone to change networks
+    // over a typo.
+    if (!/mistyped/i.test(said) || !said.includes('"kcfsflcleldwefkusowf" matches the project')) {
+      problems.push('it does not say the address may be mistyped, naming their ref: ' + said);
+    }
+    if (said.search(/IPv6/) > said.search(/mistyped/i)) problems.push('the typo is put before IPv6, the likelier cause');
     if (/paused or deleted/i.test(said)) problems.push('it still suggests the project may be gone');
     // Their own project, spelled out, rather than a shape to fill in.
     if (!said.includes('postgres.kcfsflcleldwefkusowf')) {
