@@ -1372,6 +1372,61 @@ RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
 $$;
 
 /*
+ * The keys a table would have if it had been given them: a `<thing>_id`
+ * column naming a table that is here, with no foreign key on it.
+ *
+ * Found on a blind test. A production snapshot had no foreign keys at all, so
+ * workspace_members.workspace_id was seeded with an invented value that named
+ * no workspace. A view joining members to their workspaces then showed
+ * nothing, and "anyone can list every workspace and who is in it" - a view
+ * granted to logged-out visitors - read as an empty room.
+ *
+ * Only ever used to pick a value. Nothing is refused for lack of one: the
+ * database never promised the parent would be there.
+ */
+CREATE OR REPLACE FUNCTION __KN__.implied_keys(tab jsonb, tables jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  tied jsonb := '[]'::jsonb;
+  keys jsonb := '[]'::jsonb;
+  key jsonb;
+  col jsonb;
+  parent jsonb;
+BEGIN
+  FOR key IN SELECT * FROM jsonb_array_elements(__KN__.foreign_keys(tab)) LOOP
+    tied := tied || (key->'columns');
+  END LOOP;
+  FOR col IN SELECT * FROM jsonb_array_elements(coalesce(tab->'columns', '[]'::jsonb)) LOOP
+    CONTINUE WHEN tied ? (col->>'name');
+    parent := __KN__.parent_for(col, tables);
+    CONTINUE WHEN parent IS NULL OR parent->>'table' = tab->>'name';
+    keys := keys || jsonb_build_array(jsonb_build_object(
+      'columns', jsonb_build_array(col->>'name'),
+      'refTable', parent->>'table',
+      'refColumns', jsonb_build_array(parent->>'keyColumn')));
+  END LOOP;
+  RETURN keys;
+END $$;
+
+/* Every table some other table points at, by a key it declared or one it implies. */
+CREATE OR REPLACE FUNCTION __KN__.parent_tables(tables jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  parents jsonb := '[]'::jsonb;
+  tab jsonb;
+  key jsonb;
+BEGIN
+  FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
+    FOR key IN SELECT * FROM jsonb_array_elements(
+        __KN__.foreign_keys(tab) || __KN__.implied_keys(tab, tables)) LOOP
+      CONTINUE WHEN key->>'refTable' = tab->>'name' OR parents ? (key->>'refTable');
+      parents := parents || to_jsonb(key->>'refTable');
+    END LOOP;
+  END LOOP;
+  RETURN parents;
+END $$;
+
+/*
  * One step of the walk: everything this table points at, before the table.
  *
  * The three sets are carried in and out rather than held in a closure, which
@@ -1392,7 +1447,10 @@ BEGIN
 
   state := jsonb_set(state, '{visiting}', (state->'visiting') || to_jsonb(name));
 
-  FOR key IN SELECT * FROM jsonb_array_elements(__KN__.foreign_keys(tab)) LOOP
+  -- A key the app never declared counts too. A member row seeded before the
+  -- workspace it names has nothing real to point at.
+  FOR key IN SELECT * FROM jsonb_array_elements(
+      __KN__.foreign_keys(tab) || __KN__.implied_keys(tab, tables)) LOOP
     parent := key->>'refTable';
     CONTINUE WHEN parent = name;
     CONTINUE WHEN NOT EXISTS (
@@ -1469,13 +1527,24 @@ $$;
  * The whole row, not one column of it. A composite key has to point at a pair
  * that exists together: borrowing each column from a separate row would build
  * a combination the parent never had.
+ *
+ * `mine` is the row seeded for the same person, when there is one. Without it
+ * both fake people were put in the first workspace - the same team, both as
+ * its owner - and every rule written "members of this workspace may read it"
+ * let each read the other's rows. Six tables of one blind test were reported
+ * as one customer reading another's data, when they were teammates.
  */
-CREATE OR REPLACE FUNCTION __KN__.existing_row(source text, key jsonb)
+CREATE OR REPLACE FUNCTION __KN__.existing_row(source text, key jsonb, mine jsonb DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
   picked text[];
   names text;
 BEGIN
+  IF mine IS NOT NULL THEN
+    RETURN (SELECT coalesce(jsonb_agg(mine->>name ORDER BY at), '[]'::jsonb)
+              FROM jsonb_array_elements_text(key->'refColumns') WITH ORDINALITY AS c(name, at));
+  END IF;
+
   SELECT string_agg(__KN__.always_quote(name), ', ' ORDER BY at) INTO names
     FROM jsonb_array_elements_text(key->'refColumns') WITH ORDINALITY AS c(name, at);
   IF names IS NULL THEN RETURN NULL; END IF;
@@ -1504,9 +1573,15 @@ END $$;
  * they collide on that column and on nothing else. Without it a second unique
  * column elsewhere in the table would refuse the insert, and the refusal would
  * be read as the app defending itself.
+ *
+ * `seeding` is only passed by the seeder: `rows`, the rows already seeded for
+ * each person, table by table, so a row points at its own person's parent;
+ * and `implied`, the keys the app never declared, so a `workspace_id` with no
+ * foreign key still names a workspace that is there.
  */
 CREATE OR REPLACE FUNCTION __KN__.row_for(
-  source text, tab jsonb, person text, distinct_ text, overrides jsonb, attempt integer)
+  source text, tab jsonb, person text, distinct_ text, overrides jsonb, attempt integer,
+  seeding jsonb DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
   forced jsonb := coalesce(overrides, '{}'::jsonb);
@@ -1525,9 +1600,11 @@ DECLARE
 BEGIN
   -- Every column that takes part in a foreign key, and the value it has to
   -- hold. Resolved one key at a time so that all of a composite key's columns
-  -- come from the same parent row.
-  FOR key IN SELECT * FROM jsonb_array_elements(__KN__.foreign_keys(tab)) LOOP
-    row_ := __KN__.existing_row(source, key);
+  -- come from the same parent row. Declared keys first, so a key the app wrote
+  -- always wins over one guessed from a name.
+  FOR key IN SELECT * FROM jsonb_array_elements(
+      __KN__.foreign_keys(tab) || coalesce(seeding->'implied', '[]'::jsonb)) LOOP
+    row_ := __KN__.existing_row(source, key, seeding->'rows'->(key->>'refTable')->person);
     CONTINUE WHEN row_ IS NULL;
     at := 0;
     FOR name IN SELECT jsonb_array_elements_text(key->'columns') LOOP
@@ -1581,6 +1658,14 @@ BEGIN
     -- fact about how readColumns fills the shape, not about Postgres, and the
     -- day it changes this is the only thing standing in the way.
     CONTINUE WHEN col->>'generated' IS NOT NULL OR (col->>'identity')::boolean;
+    -- A key nobody declared, pointing at a parent that is there. Filled even
+    -- where a default or a null would do, because a row that names no real
+    -- parent is invisible to every rule and view that joins through it.
+    IF borrowed ? name THEN
+      columns := columns || to_jsonb(name);
+      values_ := values_ || jsonb_build_array(borrowed->name);
+      CONTINUE;
+    END IF;
     -- Anything with a default can supply its own value.
     CONTINUE WHEN col->>'default_expr' IS NOT NULL;
     CONTINUE WHEN NOT (col->>'not_null')::boolean;
@@ -1652,9 +1737,17 @@ RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
   seeded jsonb := '[]'::jsonb;
   skipped jsonb := '[]'::jsonb;
+  -- Each person's own rows, table by table, so that what they own points at
+  -- their own workspace rather than the first one that went in.
+  rows_ jsonb := '{}'::jsonb;
+  parents jsonb := __KN__.parent_tables(tables);
+  seeding jsonb;
+  theirs jsonb;
+  got jsonb;
   tab jsonb;
   owner text;
-  people text[];
+  casts jsonb;
+  people jsonb;
   person text;
   refused text;
   landed boolean;
@@ -1671,35 +1764,54 @@ BEGIN
     -- rows either way, and the tool reports the app as safe. Settings tables,
     -- waitlists and contact forms are exactly this shape, and exactly the ones
     -- that get left open.
-    IF owner IS NULL THEN
-      people := ARRAY[__KN__.user_a()];
+    --
+    -- One that other tables point at - a workspace, a team, an organisation -
+    -- gets one for each person, so the two of them are in different teams
+    -- and a team rule is tested across teams rather than inside one. Some
+    -- tables only ever hold one row, so a pair that will not go in falls back
+    -- to the single row it always had.
+    IF owner IS NOT NULL THEN
+      casts := jsonb_build_array(jsonb_build_array(__KN__.user_a(), __KN__.user_b()));
+    ELSIF parents ? (tab->>'name') THEN
+      casts := jsonb_build_array(jsonb_build_array(__KN__.user_a(), __KN__.user_b()),
+                                 jsonb_build_array(__KN__.user_a()));
     ELSE
-      people := ARRAY[__KN__.user_a(), __KN__.user_b()];
+      casts := jsonb_build_array(jsonb_build_array(__KN__.user_a()));
     END IF;
 
     refused := NULL;
     landed := false;
     worked := 0;
 
-    attempt := 0;
-    WHILE attempt < shapes_to_try AND NOT landed LOOP
-      BEGIN
-        nth := 0;
-        FOREACH person IN ARRAY people LOOP
-          nth := nth + 1;
-          PERFORM __KN__.insert_row(source, tab->>'name',
-            __KN__.row_for(source, tab, person, nth::text, NULL, attempt));
-        END LOOP;
-        landed := true;
-        worked := attempt;
-      EXCEPTION WHEN OTHERS THEN
-        refused := SQLERRM;
-        -- The block is a subtransaction, so anything that did go in on this
-        -- attempt is already gone. The other engine has to delete it by hand;
-        -- what matters is that the next attempt does not collide with a row
-        -- this one left behind.
-      END;
-      attempt := attempt + 1;
+    seeding := jsonb_build_object('rows', rows_, 'implied', __KN__.implied_keys(tab, tables));
+    FOR people IN SELECT * FROM jsonb_array_elements(casts) LOOP
+      attempt := 0;
+      WHILE attempt < shapes_to_try AND NOT landed LOOP
+        BEGIN
+          theirs := '{}'::jsonb;
+          nth := 0;
+          FOR person IN SELECT jsonb_array_elements_text(people) LOOP
+            nth := nth + 1;
+            -- Kept as it landed, defaults and all, for the rows that point at it.
+            EXECUTE 'WITH landed AS (' || __KN__.insert_statement(source, tab->>'name',
+                __KN__.row_for(source, tab, person, nth::text, NULL, attempt, seeding))
+              || ' RETURNING *) SELECT to_jsonb(landed) FROM landed'
+              INTO got;
+            theirs := theirs || jsonb_build_object(person, got);
+          END LOOP;
+          landed := true;
+          worked := attempt;
+          rows_ := rows_ || jsonb_build_object(tab->>'name', theirs);
+        EXCEPTION WHEN OTHERS THEN
+          refused := SQLERRM;
+          -- The block is a subtransaction, so anything that did go in on this
+          -- attempt is already gone. The other engine has to delete it by hand;
+          -- what matters is that the next attempt does not collide with a row
+          -- this one left behind.
+        END;
+        attempt := attempt + 1;
+      END LOOP;
+      EXIT WHEN landed;
     END LOOP;
 
     IF landed THEN

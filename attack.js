@@ -228,6 +228,70 @@ function foreignKeys(table) {
   return keys;
 }
 
+/** The single-column primary key of a table, or null if it has none. */
+function primaryKeyOf(table) {
+  for (const constraint of table.constraints || []) {
+    if (constraint.kind !== 'p') continue;
+    const match = /PRIMARY KEY \(([^)]+)\)/i.exec(constraint.definition);
+    if (!match) continue;
+    const columns = match[1].split(',').map((name) => name.trim().split('"').join(''));
+    // A composite key is not something a single `<thing>_id` column points at.
+    return columns.length === 1 ? columns[0] : null;
+  }
+  return null;
+}
+
+/**
+ * The table a column named `<thing>_id` is pointing at, if there is one.
+ *
+ * The name has to match a table that is really here, and the types have to
+ * agree. Both, because `stripe_id` matches nothing and `org_id integer` does
+ * not point at an `orgs.id` that is a uuid.
+ */
+function parentFor(column, tables) {
+  const stem = /^(.+)_id$/i.exec(column.name);
+  if (!stem) return null;
+  const wanted = stem[1].toLowerCase();
+  const parent = (tables || []).find((table) => {
+    const name = table.name.toLowerCase();
+    return name === wanted || name === wanted + 's' || name === wanted + 'es';
+  });
+  if (!parent) return null;
+
+  const key = primaryKeyOf(parent);
+  if (!key) return null;
+  const keyColumn = (parent.columns || []).find((c) => c.name === key);
+  if (!keyColumn || keyColumn.type !== column.type) return null;
+
+  return { table: parent, keyColumn: key, type: keyColumn.type };
+}
+
+/**
+ * The keys a table would have if it had been given them: a `<thing>_id`
+ * column naming a table that is here, with no foreign key on it.
+ *
+ * Found on a blind test. A production snapshot had no foreign keys at all, so
+ * workspace_members.workspace_id was seeded with an invented value that named
+ * no workspace. A view joining members to their workspaces then showed
+ * nothing, and "anyone can list every workspace and who is in it" - a view
+ * granted to logged-out visitors - read as an empty room.
+ *
+ * Only ever used to pick a value. Nothing is refused for lack of one: the
+ * database never promised the parent would be there.
+ */
+function impliedKeys(table, tables) {
+  const tied = new Set();
+  for (const key of foreignKeys(table)) key.columns.forEach((name) => tied.add(name));
+  const keys = [];
+  for (const column of table.columns || []) {
+    if (tied.has(column.name)) continue;
+    const parent = parentFor(column, tables);
+    if (!parent || parent.table.name === table.name) continue;
+    keys.push({ columns: [column.name], refTable: parent.table.name, refColumns: [parent.keyColumn] });
+  }
+  return keys;
+}
+
 /**
  * Parents before children.
  *
@@ -236,6 +300,9 @@ function foreignKeys(table) {
  * pointed at, because every app has one of these. A cycle is left in whatever
  * order it arrived: it cannot be satisfied anyway, and the table that fails is
  * reported rather than dropped.
+ *
+ * A key the app never declared counts too. A member row seeded before the
+ * workspace it names has nothing real to point at.
  */
 function dependencyOrder(tables) {
   const byName = new Map(tables.map((t) => [t.name, t]));
@@ -246,7 +313,7 @@ function dependencyOrder(tables) {
   const visit = (table) => {
     if (done.has(table.name) || visiting.has(table.name)) return;
     visiting.add(table.name);
-    for (const key of foreignKeys(table)) {
+    for (const key of foreignKeys(table).concat(impliedKeys(table, tables))) {
       const parent = byName.get(key.refTable);
       if (parent && parent.name !== table.name) visit(parent);
     }
@@ -265,8 +332,15 @@ function dependencyOrder(tables) {
  * The whole row, not one column of it. A composite key has to point at a pair
  * that exists together: borrowing each column from a separate row would build
  * a combination the parent never had.
+ *
+ * `mine` is the row seeded for the same person, when there is one. Without it
+ * both fake people were put in the first workspace - the same team, both as
+ * its owner - and every rule written "members of this workspace may read it"
+ * let each read the other's rows. Six tables of one blind test were reported
+ * as one customer reading another's data, when they were teammates.
  */
-async function existingRow(client, schema, key) {
+async function existingRow(client, schema, key, mine) {
+  if (mine) return key.refColumns.map((name) => mine[name]);
   try {
     const columns = key.refColumns.map((name, i) => quote(name) + ' AS v' + i).join(', ');
     const { rows } = await client.query(
@@ -291,19 +365,28 @@ async function existingRow(client, schema, key) {
  * they collide on that column and on nothing else. Without it a second unique
  * column elsewhere in the table would refuse the insert, and the refusal would
  * be read as the app defending itself.
+ *
+ * `seeding` is only passed by the seeder: `rows`, the rows already seeded for
+ * each person, table by table, so a row points at its own person's parent;
+ * and `implied`, the keys the app never declared, so a `workspace_id` with no
+ * foreign key still names a workspace that is there.
  */
-async function rowFor(client, schema, table, person, distinct, overrides, attempt) {
+async function rowFor(client, schema, table, person, distinct, overrides, attempt, seeding) {
   const forced = overrides || {};
   const owner = ownerColumn(table);
   const columns = [];
   const values = [];
+  const sown = (seeding && seeding.rows) || new Map();
+  const implied = (seeding && seeding.implied) || [];
 
   // Every column that takes part in a foreign key, and the value it has to
   // hold. Resolved one key at a time so that all of a composite key's columns
-  // come from the same parent row.
+  // come from the same parent row. Declared keys first, so a key the app wrote
+  // always wins over one guessed from a name.
   const borrowed = new Map();
-  for (const key of foreignKeys(table)) {
-    const row = await existingRow(client, schema, key);
+  for (const key of foreignKeys(table).concat(implied)) {
+    const theirs = sown.get(key.refTable);
+    const row = await existingRow(client, schema, key, theirs && theirs.get(person));
     if (!row) continue;
     key.columns.forEach((name, i) => {
       if (!borrowed.has(name)) borrowed.set(name, row[i]);
@@ -345,6 +428,14 @@ async function rowFor(client, schema, table, person, distinct, overrides, attemp
     // fact about how readColumns fills the shape, not about Postgres, and the
     // day it changes this is the only thing standing in the way.
     if (column.generated || column.identity) continue;
+    // A key nobody declared, pointing at a parent that is there. Filled even
+    // where a default or a null would do, because a row that names no real
+    // parent is invisible to every rule and view that joins through it.
+    if (borrowed.has(column.name)) {
+      columns.push(column.name);
+      values.push(borrowed.get(column.name));
+      continue;
+    }
     // Anything with a default can supply its own value.
     if (column.default_expr) continue;
     if (!column.not_null) continue;
@@ -361,19 +452,34 @@ async function rowFor(client, schema, table, person, distinct, overrides, attemp
   return { columns: columns, values: values };
 }
 
-/** Puts a built row in. Separate so the same row can be raced against itself. */
-function insertRow(client, schema, table, row) {
+/**
+ * Puts a built row in. Separate so the same row can be raced against itself.
+ * `back` asks for the row as it landed, defaults and all.
+ */
+function insertRow(client, schema, table, row, back) {
   const where = 'INSERT INTO ' + quote(schema) + '.' + quote(table);
+  const tail = back ? ' RETURNING *' : '';
   // A table of nothing but an id and its defaults leaves no columns to name,
   // and "INSERT INTO t () VALUES ()" is a syntax error. Postgres has a spelling
   // for exactly this, and without it every settings and flags table in the
   // world came back as one that could not be checked.
-  if (!row.columns.length) return client.query(where + ' DEFAULT VALUES');
+  if (!row.columns.length) return client.query(where + ' DEFAULT VALUES' + tail);
   const placeholders = row.values.map((_, i) => '$' + (i + 1));
   return client.query(
-    where + ' (' + row.columns.map(quote).join(', ') + ') VALUES (' + placeholders.join(', ') + ')',
+    where + ' (' + row.columns.map(quote).join(', ') + ') VALUES (' + placeholders.join(', ') + ')' + tail,
     row.values,
   );
+}
+
+/** Every table some other table points at, by a key it declared or one it implies. */
+function parentTables(tables) {
+  const parents = new Set();
+  for (const table of tables) {
+    for (const key of foreignKeys(table).concat(impliedKeys(table, tables))) {
+      if (key.refTable !== table.name) parents.add(key.refTable);
+    }
+  }
+  return parents;
 }
 
 // How many differently-shaped values to try before giving up on a table. The
@@ -395,39 +501,57 @@ const SHAPES_TO_TRY = 5;
 async function seed(client, schema, tables) {
   const seeded = [];
   const skipped = [];
+  // Each person's own rows, table by table, so that what they own points at
+  // their own workspace rather than the first one that went in.
+  const rows = new Map();
+  const parents = parentTables(tables);
   for (const table of dependencyOrder(tables)) {
     const owner = ownerColumn(table);
+    const seeding = { rows: rows, implied: impliedKeys(table, tables) };
 
     // A table with nobody's name on it still gets a row. Without one, an open
     // door cannot be told from an empty room: a logged-out stranger reads zero
     // rows either way, and the tool reports the app as safe. Settings tables,
     // waitlists and contact forms are exactly this shape, and exactly the ones
     // that get left open.
-    const people = owner ? [USER_A, USER_B] : [USER_A];
+    //
+    // One that other tables point at - a workspace, a team, an organisation -
+    // gets one for each person, so the two of them are in different teams
+    // and a team rule is tested across teams rather than inside one. Some
+    // tables only ever hold one row, so a pair that will not go in falls back
+    // to the single row it always had.
+    const casts = owner ? [[USER_A, USER_B]]
+      : parents.has(table.name) ? [[USER_A, USER_B], [USER_A]] : [[USER_A]];
 
     // Each attempt offers a differently-shaped set of values. A table whose
     // rules reject all of them is reported, never quietly passed over.
     let refused = null;
     let landed = false;
     let worked = 0;
-    for (let attempt = 0; attempt < SHAPES_TO_TRY && !landed; attempt++) {
-      try {
-        let nth = 0;
-        for (const person of people) {
-          nth += 1;
-          const row = await rowFor(client, schema, table, person, nth, null, attempt);
-          await insertRow(client, schema, table.name, row);
+    for (const people of casts) {
+      for (let attempt = 0; attempt < SHAPES_TO_TRY && !landed; attempt++) {
+        const theirs = new Map();
+        try {
+          let nth = 0;
+          for (const person of people) {
+            nth += 1;
+            const row = await rowFor(client, schema, table, person, nth, null, attempt, seeding);
+            const result = await insertRow(client, schema, table.name, row, true);
+            theirs.set(person, result.rows[0]);
+          }
+          landed = true;
+          worked = attempt;
+          rows.set(table.name, theirs);
+        } catch (err) {
+          refused = err.message;
+          // A half-seeded table would make the next attempt collide with its own
+          // first row, so anything that did go in is taken back out.
+          await client
+            .query('DELETE FROM ' + quote(schema) + '.' + quote(table.name))
+            .catch(() => {});
         }
-        landed = true;
-        worked = attempt;
-      } catch (err) {
-        refused = err.message;
-        // A half-seeded table would make the next attempt collide with its own
-        // first row, so anything that did go in is taken back out.
-        await client
-          .query('DELETE FROM ' + quote(schema) + '.' + quote(table.name))
-          .catch(() => {});
       }
+      if (landed) break;
     }
 
     if (landed) {
@@ -635,6 +759,10 @@ module.exports = {
   ownerColumn: ownerColumn,
   fitTo: fitTo,
   foreignKeys: foreignKeys,
+  primaryKeyOf: primaryKeyOf,
+  parentFor: parentFor,
+  impliedKeys: impliedKeys,
+  parentTables: parentTables,
   dependencyOrder: dependencyOrder,
   valueFor: valueFor,
   allowedByCheck: allowedByCheck,

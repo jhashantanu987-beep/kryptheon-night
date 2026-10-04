@@ -32,6 +32,7 @@ every time a word of the product is edited:
 | `shapes.check.js` | yes | every shape a real app has can be tested at all |
 | `verdicts.check.js` | yes | the answer is right, not merely produced |
 | `shop.check.js` | yes | a Supabase-shaped shop is attacked whole, by both engines |
+| `teams.check.js` | yes | the two fake people are in different teams, by both engines |
 | `loop.check.js` | yes | the whole thing, through the real command |
 
 And one that is deliberately **not** in `npm run check`:
@@ -231,6 +232,18 @@ the customer's table - the word-for-word comparison had passed it, since both
 sides printed the same words. Now the rule guard asks `pg_depend`, and a rule
 reading a table in another schema is refused out loud. Both engines, every
 hole, the safe table left alone. Seven mutations, each caught.
+
+**teams.check.js** - a team rule is tested across teams, not inside one. Found
+on a blind test (AtlasPay): both fake people were seeded into the first
+workspace, as its owner, so six team tables were reported as one customer
+reading or changing another's data when the two were teammates. Now a table
+other tables point at gets a row per person, and each person's rows point at
+their own parent. And a `<thing>_id` with no foreign key still names a real
+parent: the production snapshot had no keys at all, members named no
+workspace, and a view open to logged-out visitors listing every workspace and
+who is in it came back empty. Both engines; the open invoice rule is still
+caught; a parent that only takes one row keeps the one it had. Sixteen
+mutations, each caught.
 
 **loop.check.js** - nothing stubbed. Build an app with real holes, shell out to
 `scan.js` the way a person would, apply the fixes the report asked for,

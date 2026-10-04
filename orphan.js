@@ -40,43 +40,11 @@ const attack = require('./attack.js');
 // an audit row is the feature.
 const KEEPS_HISTORY = /(^|_)(log|logs|audit|audits|event|events|history|archive|archives|snapshot|snapshots|activity|activities)(_|$)/i;
 
-/** The single-column primary key of a table, or null if it has none. */
-function primaryKeyOf(table) {
-  for (const constraint of table.constraints || []) {
-    if (constraint.kind !== 'p') continue;
-    const match = /PRIMARY KEY \(([^)]+)\)/i.exec(constraint.definition);
-    if (!match) continue;
-    const columns = match[1].split(',').map((name) => name.trim().split('"').join(''));
-    // A composite key is not something a single `<thing>_id` column points at.
-    return columns.length === 1 ? columns[0] : null;
-  }
-  return null;
-}
-
-/**
- * The table a column named `<thing>_id` is pointing at, if there is one.
- *
- * The name has to match a table that is really here, and the types have to
- * agree. Both, because `stripe_id` matches nothing and `org_id integer` does
- * not point at an `orgs.id` that is a uuid.
- */
-function parentFor(column, tables) {
-  const stem = /^(.+)_id$/i.exec(column.name);
-  if (!stem) return null;
-  const wanted = stem[1].toLowerCase();
-  const parent = (tables || []).find((table) => {
-    const name = table.name.toLowerCase();
-    return name === wanted || name === wanted + 's' || name === wanted + 'es';
-  });
-  if (!parent) return null;
-
-  const key = primaryKeyOf(parent);
-  if (!key) return null;
-  const keyColumn = (parent.columns || []).find((c) => c.name === key);
-  if (!keyColumn || keyColumn.type !== column.type) return null;
-
-  return { table: parent, keyColumn: key, type: keyColumn.type };
-}
+// Which table a `<thing>_id` column points at is decided in attack.js, because
+// the seeder needs the same answer: a row has to point at a parent that is
+// really there, whether or not a key says so.
+const primaryKeyOf = attack.primaryKeyOf;
+const parentFor = attack.parentFor;
 
 /** Is this column already held down by a foreign key? */
 function alreadyTied(table, columnName) {
