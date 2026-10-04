@@ -385,32 +385,12 @@ async function scan(client, sourceSchema, options) {
     // version recorded only the flagged ones, so a revoke made the function
     // vanish from both lists and the fix came back as "could not confirm".
     for (const fn of plan.anonFunctions || []) attempted.push('privileged:' + fn.name);
-    // Quiet: a yes/no about the caller, and a function that turns the caller
-    // away before it does anything (schema.guardedAtTheDoor).
-    const privileged = (plan.anonFunctions || []).filter((fn) => fn.callable && !fn.aboutCaller && !fn.guarded).map((fn) => ({
-      kind: 'privileged',
-      fn: fn.name,
-      table: fn.name,
-      args: fn.args,
-      writes: fn.writes,
-      hasFixedSearchPath: fn.hasFixedSearchPath,
-      columns: [],
-    }));
+    const privileged = privilegedOf(plan);
 
-    // Whether each table is tied to Supabase's sign-in decides what its fix
-    // can be. Read from the original schema: the copy points auth.users keys
-    // at a stand-in, and would call every table untied.
-    const ties = finding.authTiesOf(plan);
-    // And whether a row says whose it is: with no such column, no rule can
-    // tie it to the person asking. Read from the copy, the way seeding did.
-    // The column's name travels too: a team's table that also says who made
-    // each row needs it for its prompt, even on a finding that is not about
-    // owners at all.
-    const owned = new Map(theirs.map((table) => [table.name, attack.ownerColumn(table)]));
-    const tagged = (f) => Object.assign({}, f,
-      ties.has(f.table) ? { authTied: ties.get(f.table) } : {},
-      owned.has(f.table) ? { owned: Boolean(owned.get(f.table)) } : {},
-      owned.get(f.table) ? { ownedBy: owned.get(f.table) } : {});
+    // Ties read from the original schema: the copy points auth.users keys at
+    // a stand-in, and would call every table untied. Owners read from the
+    // copy, the way seeding did.
+    const tagged = taggerFor(plan, theirs);
 
     return {
       stopped: null,
@@ -442,6 +422,75 @@ function exitCodeFor(result) {
   return (result.findings || []).some((f) => f.status !== 'verification required') ? 1 : 0;
 }
 
+/**
+ * Functions an anonymous visitor can call that run past the rules. Read from
+ * the shape, not attacked. Quiet: a yes/no about the caller, and a function
+ * that turns the caller away before it does anything (schema.guardedAtTheDoor).
+ */
+function privilegedOf(plan) {
+  return ((plan && plan.anonFunctions) || []).filter((fn) => fn.callable && !fn.aboutCaller && !fn.guarded).map((fn) => ({
+    kind: 'privileged',
+    fn: fn.name,
+    table: fn.name,
+    args: fn.args,
+    writes: fn.writes,
+    hasFixedSearchPath: fn.hasFixedSearchPath,
+    columns: [],
+  }));
+}
+
+/**
+ * What each finding needs to know about its table for its fix to be right:
+ * whether the app signs people in through Supabase, whether a row says whose
+ * it is, and which column that is. Without these a prompt falls back to "the
+ * column that says who each row belongs to" - found on a nightly read-back,
+ * whose findings came from the database without them.
+ */
+function taggerFor(plan, tables) {
+  const ties = finding.authTiesOf(plan);
+  const owned = new Map((tables || []).map((table) => [table.name, attack.ownerColumn(table)]));
+  return (f) => Object.assign({}, f,
+    ties.has(f.table) ? { authTied: ties.get(f.table) } : {},
+    owned.has(f.table) ? { owned: Boolean(owned.get(f.table)) } : {},
+    owned.get(f.table) ? { ownedBy: owned.get(f.table) } : {});
+}
+
+/**
+ * What the nightly engine wrote down as not tried, in the shape a scan uses.
+ * It names a column's check as table and column apart, with no attack named,
+ * so "export_jobs.access_token could not be raced" was counted as a whole
+ * table not checked - and listed without its column.
+ */
+function notCheckedFromNight(entries) {
+  return (entries || []).map((e) => {
+    if (!e || e.key || !e.column) return e;
+    const kind = /two requests at the same instant/.test(String(e.why)) ? 'duplicated' : 'orphaned';
+    return { table: e.table + '.' + e.column, key: kind + ':' + e.table + ':' + e.column, why: e.why };
+  });
+}
+
+/**
+ * A moment of the night, said in UTC - which is what the database runs on -
+ * and in this computer's own time, so 03:00 is not read as three at night
+ * here. Found on a real read-back: "the night of 2026-10-01 03:00" was 08:30
+ * in India, and nothing said so.
+ */
+function bothTimes(iso) {
+  const at = new Date(iso);
+  return at.toISOString().slice(0, 16).replace('T', ' ') + ' UTC (' +
+    at.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' your time)';
+}
+
+/** "0 3 * * *" as a time of day in both, or the schedule as written. */
+function scheduleTimes(cron) {
+  const m = /^(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+\*$/.exec(String(cron || '').trim());
+  if (!m) return String(cron || 'whenever it is scheduled');
+  const now = new Date();
+  const at = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), Number(m[2]), Number(m[1])));
+  return 'every night at ' + at.toISOString().slice(11, 16) + ' UTC (' +
+    at.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) + ' your time)';
+}
+
 /** Where the nightly run's last answer is kept for the dashboard. */
 function nightlyFile() {
   return store.open(process.cwd()).nightNightly;
@@ -453,7 +502,7 @@ function nightlyFile() {
  * as "nothing found" - not installed, installed and never run, and stopped -
  * said as themselves. `latest` is installer.latestRun's answer.
  */
-function nightlyRecord(latest, readAt) {
+function nightlyRecord(latest, readAt, plan) {
   const at = (value) => (value ? new Date(value).toISOString() : null);
   if (!latest || !latest.installed) return { readAt: readAt, installed: false };
   const where = latest.where || {};
@@ -467,13 +516,21 @@ function nightlyRecord(latest, readAt) {
   };
   const run = latest.run;
   if (!run) return record;
+  // The night's findings, told as the night's: tagged with what their table
+  // needs for a right fix when the schema could be read, and joined by the
+  // functions anyone can call - read now, when this is asked, because the
+  // engine inside the database does not look at them.
+  const tag = plan ? taggerFor(plan, plan.tables) : (f) => f;
+  const night = (run.findings || []).map((f) => tag(Object.assign({}, f, { fromNight: true })));
+  const now = plan ? privilegedOf(plan).map(tag) : [];
   return Object.assign(record, {
     ranAt: at(run.ran_at),
     source: run.source,
     stopped: run.stopped || null,
     attacksRun: run.attacks_run || 0,
-    notChecked: run.not_checked || [],
-    findings: run.stopped ? [] : finding.describeAll(run.findings || []),
+    notChecked: notCheckedFromNight(run.not_checked),
+    findings: run.stopped ? [] : finding.describeAll(night.concat(now)),
+    functionsReadAt: plan ? readAt : null,
   });
 }
 
@@ -781,6 +838,11 @@ module.exports = {
   saveRun: saveRun,
   nightlyFile: nightlyFile,
   nightlyRecord: nightlyRecord,
+  bothTimes: bothTimes,
+  scheduleTimes: scheduleTimes,
+  notCheckedFromNight: notCheckedFromNight,
+  privilegedOf: privilegedOf,
+  taggerFor: taggerFor,
   saveNightly: saveNightly,
   sweepOldCopies: sweepOldCopies,
   notTestedLines: notTestedLines,

@@ -32,8 +32,8 @@ const intro = require('../intro.js');
 const trouble = require('../trouble.js');
 const { howToConnect } = require('../connect.js');
 const installer = require('../installer.js');
-const finding = require('../finding.js');
 const outside = require('../outside.js');
+const schema = require('../schema.js');
 
 const line = (text) => process.stdout.write(text + '\n');
 const fail = (text) => process.stderr.write(text + '\n');
@@ -125,22 +125,42 @@ function readArgs(argv) {
  * their answer already, and a folder that cannot be written is not theirs to
  * debug here.
  */
-function keepTheNight(latest) {
+function keepTheNight(record) {
   try {
-    scanner.saveNightly(scanner.nightlyFile(), scanner.nightlyRecord(latest, new Date().toISOString()));
+    scanner.saveNightly(scanner.nightlyFile(), record);
   } catch (err) {
     /* the dashboard keeps its older copy, which carries its own date */
   }
 }
 
+/**
+ * The night's answer, made whole: its findings told with what their tables
+ * need for a right fix, plus the functions anyone can call - both read from
+ * the shape now, read only. Without the shape it is still the night's answer,
+ * just less exact.
+ */
+async function nightRecordFrom(client, latest) {
+  let plan = null;
+  const run = latest && latest.run;
+  if (run && !run.stopped) {
+    try {
+      plan = await schema.readSchema(client, run.source);
+    } catch (err) {
+      plan = null;
+    }
+  }
+  return scanner.nightlyRecord(latest, new Date().toISOString(), plan);
+}
+
 /** Reads and keeps it, for the doors that do not already hold the answer. */
 async function readAndKeepTheNight(client) {
   try {
-    keepTheNight(await installer.latestRun(client, {}));
+    keepTheNight(await nightRecordFrom(client, await installer.latestRun(client, {})));
   } catch (err) {
     /* as above */
   }
 }
+
 
 /**
  * The three doors that are not a scan.
@@ -222,7 +242,8 @@ async function runVerb(command, client, target) {
 
   if (command === 'night') {
     const latest = await installer.latestRun(client, {});
-    keepTheNight(latest);
+    const record = await nightRecordFrom(client, latest);
+    keepTheNight(record);
     const where = latest.where;
     if (!where) {
       line('  The nightly run is not installed in this database, so there is');
@@ -239,20 +260,25 @@ async function runVerb(command, client, target) {
       // product printed about a night that never happened.
       line('  It is installed, and it has not run yet.');
       line('');
-      line('  The first run is at ' + (where.job ? where.job.schedule : 'whenever it is scheduled') + '.');
+      line('  It runs ' + scanner.scheduleTimes(where.job ? where.job.schedule : null) + '.');
       line('');
       return 0;
     }
     const run = latest.run;
-    line('  From the night of ' + new Date(run.ran_at).toISOString().slice(0, 16).replace('T', ' ') +
-      ', on "' + run.source + '":');
+    line('  From the night of ' + scanner.bothTimes(run.ran_at) + ', on "' + run.source + '".');
+    if (where.job) line('  It runs ' + scanner.scheduleTimes(where.job.schedule) + '.');
+    // The one part not from the night: the engine inside the database does
+    // not look at functions, so they are read now and said to be.
+    if (record.functionsReadAt) {
+      line('  Functions anyone can call were looked at just now, not overnight.');
+    }
     scanner.report({
-      stopped: run.stopped,
-      attacksRun: run.attacks_run,
-      notChecked: run.not_checked || [],
-      findings: finding.describeAll(run.findings || []),
+      stopped: record.stopped,
+      attacksRun: record.attacksRun,
+      notChecked: record.notChecked || [],
+      findings: record.findings || [],
     });
-    return run.stopped ? 2 : (run.findings || []).length ? 1 : 0;
+    return run.stopped ? 2 : scanner.exitCodeFor(record);
   }
 
   throw new Error('there is no command called ' + command);

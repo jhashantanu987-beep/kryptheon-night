@@ -448,7 +448,10 @@ function bodyFor(finding, contents) {
     }
     return (
       'Anyone on the internet, without logging in and without an account, can read ' +
-      'this table. I did it myself just now and got back ' + finding.readable + ' ' + rowWord +
+      // Read back the next morning, "just now" would be untrue: it was the
+      // nightly run, hours earlier.
+      'this table. ' + (finding.fromNight ? 'The nightly run did it on a copy and got back ' : 'I did it myself just now and got back ') +
+      finding.readable + ' ' + rowWord +
       (holds ? ', including ' + holds : '') + '.'
     );
   }
