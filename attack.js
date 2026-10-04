@@ -513,6 +513,17 @@ function refusalMeans(message) {
  * in its own right - and it names the table at fault, which is often not the
  * one that was being read.
  */
+/**
+ * The other shape the same loop takes. When the rule reaches its own table
+ * through a helper function rather than directly, Postgres does not see a
+ * policy recursing - it runs out of stack - and the message names no table.
+ * Found on a blind test: every signed-in read failed with "stack depth limit
+ * exceeded", and the report filed each one only as untested.
+ */
+function tooDeep(message) {
+  return /stack depth limit exceeded/i.test(String(message || ''));
+}
+
 function recursionIn(message) {
   const found = /infinite recursion detected in policy for relation "([^"]+)"/i.exec(String(message || ''));
   return found ? found[1] : null;
@@ -561,8 +572,11 @@ async function impersonate(client, schema, tables) {
     // with nobody's name on it fails just the same, and it is the same
     // broken page.
     for (const [answer, who] of [[anon, 'anyone'], [asA, 'signed-in']]) {
-      const relation = !Array.isArray(answer) && recursionIn(answer.blocked);
-      if (relation) looped.push({ relation: relation, table: table.name, who: who });
+      if (Array.isArray(answer)) continue;
+      const relation = recursionIn(answer.blocked);
+      // A loop with no table named is recorded with none; the scan works out
+      // which table's rule it is from the rules and helpers it has read.
+      if (relation || tooDeep(answer.blocked)) looped.push({ relation: relation || null, table: table.name, who: who });
     }
     // Only a read of the table itself that came back with a verdict, for both
     // callers, shows its rules no longer loop. A read that failed for some
@@ -617,6 +631,7 @@ module.exports = {
   USER_D: USER_D,
   refusalMeans: refusalMeans,
   recursionIn: recursionIn,
+  tooDeep: tooDeep,
   ownerColumn: ownerColumn,
   fitTo: fitTo,
   foreignKeys: foreignKeys,

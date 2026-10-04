@@ -365,7 +365,7 @@ function supabaseDirectRef(raw) {
  * survives is the stack: the person cannot use it and it makes the tool look
  * like it broke rather than like it has something to tell them.
  */
-function explain(err, raw) {
+function explain(err, raw, options) {
   const code = err && err.code ? String(err.code) : '';
 
   // Checked before the general ENOTFOUND, because for this one address the
@@ -448,6 +448,18 @@ function explain(err, raw) {
 
   // Nothing matched. Say what happened and where, without pretending to know
   // why, and without the stack.
+  //
+  // After the connection was made, "I could not connect" is untrue - found on
+  // a blind test, where it was printed over a copy that could not be built.
+  if (options && options.connected) {
+    return [
+      'I connected, but the check stopped part-way.',
+      '',
+      'The server said: ' + message,
+      '',
+      'Nothing was left behind: the temporary copy is deleted whenever a check stops.',
+    ];
+  }
   const lines = [
     'I could not connect to the database.',
     '',

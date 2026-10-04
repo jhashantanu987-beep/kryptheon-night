@@ -614,7 +614,7 @@ async function main() {
     try {
       process.exitCode = await runVerb(asked.command, client, target);
     } catch (err) {
-      block(trouble.explain(err, connection), fail);
+      block(trouble.explain(err, connection, { connected: true }), fail);
       process.exitCode = 2;
     } finally {
       await client.end().catch(() => {});
@@ -668,7 +668,7 @@ async function main() {
     // Anything that went wrong mid-scan. The copy has already been dropped by
     // the `finally` inside the scan itself, so there is nothing to clean up
     // here - only something to say.
-    block(trouble.explain(err, connection), fail);
+    block(trouble.explain(err, connection, { connected: true }), fail);
     process.exitCode = 2;
   } finally {
     await client.end().catch(() => {});

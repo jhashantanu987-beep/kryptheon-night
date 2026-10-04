@@ -291,6 +291,17 @@ function causeOf(finding) {
 /** What a caller could do, written the way a person would say it. */
 const WRITE_WORDS = { add: 'add rows to', change: 'change rows in', delete: 'delete rows from' };
 
+/**
+ * The error a looping rule produces, as Postgres words it. A rule that reads
+ * its own table directly is caught as recursion and named; one that reaches
+ * it through a helper function runs out of stack, and Postgres names nothing.
+ */
+function loopError(finding) {
+  return finding.deep
+    ? '"stack depth limit exceeded"'
+    : '"infinite recursion detected in policy for relation ' + finding.table + '"';
+}
+
 /** Who a looping rule fails for, said the way the headline and body need it. */
 function loopVictims(finding) {
   const callers = finding.callers || [];
@@ -363,8 +374,9 @@ function bodyFor(finding, contents) {
     const one = reads.length === 1;
     return (
       'Using ' + listOf(reads) + ' on a copy of your app as ' + as.join(' and as ') +
-      ', every request was refused with "infinite recursion detected in policy for relation ' +
-      finding.table + '". Every page in your app that uses ' + (one ? 'that table' : 'those tables') +
+      ', every request was refused with ' + loopError(finding) +
+      (finding.deep ? ' - a rule on ' + finding.table + ' calls a helper that reads ' + finding.table + ' again, which runs the rule again' : '') +
+      '. Every page in your app that uses ' + (one ? 'that table' : 'those tables') +
       ' fails the same way for ' + loopVictims(finding).replace(/,$/, '') + '. It also means I could ' +
       'not test ' + (one ? 'it' : 'them') + ' for leaks - those attacks are listed at the end.'
     );
@@ -662,8 +674,8 @@ function fixPromptFor(finding) {
       'My app has a broken database rule.',
       '',
       'A row level security policy on the "' + finding.table + '" table reads "' + finding.table +
-        '" itself, so Postgres stops every request that touches it with "infinite recursion ' +
-        'detected in policy for relation ' + finding.table + '". I saw it when using ' +
+        '" itself' + (finding.deep ? ', through a helper function it calls,' : '') +
+        ' so Postgres stops every request that touches it with ' + loopError(finding) + '. I saw it when using ' +
         listOf((finding.reads || []).map((t) => '"' + t + '"')) + '.',
       '',
       'Show me the policies on "' + finding.table + '" and on every table whose policy reads "' +
@@ -885,7 +897,7 @@ function describe(finding) {
     can: finding.can,
     proof: finding.kind === 'recursive'
       ? 'Using ' + listOf((finding.reads || []).map((t) => '"' + t + '"')) + ' stopped with ' +
-        '"infinite recursion detected in policy for relation ' + finding.table + '".'
+        loopError(finding) + '.'
       : finding.kind === 'privileged'
       ? 'I did not call "' + finding.fn + '". This is a reach that exists in the grants, not a break I ran.'
       : finding.kind === 'duplicated'

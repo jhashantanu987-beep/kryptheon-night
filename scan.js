@@ -320,16 +320,24 @@ async function scan(client, sourceSchema, options) {
     // app is broken for the people using it. One finding per table at fault,
     // named from Postgres's own message, however many reads ran into it.
     const loops = new Map();
+    // A loop that named no table ("stack depth limit exceeded") is put on the
+    // tables whose own rule calls a helper that reads that same table; if
+    // none can be found, on the table that was being read.
+    const culprits = loopingTables(copyPlan);
     const loopedInto = (relation, table, who) => {
-      if (!loops.has(relation)) loops.set(relation, { kind: 'recursive', table: relation, reads: [], callers: [], columns: [] });
-      const entry = loops.get(relation);
-      if (!entry.reads.includes(table)) entry.reads.push(table);
-      if (!entry.callers.includes(who)) entry.callers.push(who);
+      const deep = !relation;
+      for (const at of relation ? [relation] : culprits.length ? culprits : [table]) {
+        if (!loops.has(at)) loops.set(at, { kind: 'recursive', table: at, reads: [], callers: [], columns: [], deep: false });
+        const entry = loops.get(at);
+        if (deep) entry.deep = true;
+        if (!entry.reads.includes(table)) entry.reads.push(table);
+        if (!entry.callers.includes(who)) entry.callers.push(who);
+      }
     };
     for (const hit of impersonation.looped || []) loopedInto(hit.relation, hit.table, hit.who);
     for (const stuck of writes.blocked) {
       const relation = attack.recursionIn(stuck.why);
-      if (relation) loopedInto(relation, stuck.table, /^as anyone:/.test(stuck.why) ? 'anyone' : 'signed-in');
+      if (relation || attack.tooDeep(stuck.why)) loopedInto(relation || null, stuck.table, /^as anyone:/.test(stuck.why) ? 'anyone' : 'signed-in');
     }
     const recursive = Array.from(loops.values());
 
@@ -420,6 +428,36 @@ async function scan(client, sourceSchema, options) {
 function exitCodeFor(result) {
   if (result.stopped) return 2;
   return (result.findings || []).some((f) => f.status !== 'verification required') ? 1 : 0;
+}
+
+/**
+ * The tables whose own rule reaches back into the same table through the
+ * helpers it calls - directly or through helpers those call. Such a rule has
+ * to be evaluated to be evaluated, which is how "stack depth limit exceeded"
+ * happens; the message itself does not say which table.
+ */
+function loopingTables(plan) {
+  const escape = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const calls = (text, name) => new RegExp('(^|[^A-Za-z0-9_$])"?' + escape(name) + '"?\\s*\\(').test(String(text || ''));
+  const mentions = (text, name) => new RegExp('(^|[^A-Za-z0-9_$])"?' + escape(name) + '"?([^A-Za-z0-9_$]|$)').test(String(text || ''));
+  const fns = (plan && plan.functions) || [];
+  const reached = (text) => {
+    const found = new Set(fns.filter((f) => calls(text, f.name)).map((f) => f.name));
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const f of fns) {
+        if (found.has(f.name)) continue;
+        if (fns.some((g) => found.has(g.name) && calls(g.src, f.name))) { found.add(f.name); grew = true; }
+      }
+    }
+    return fns.filter((f) => found.has(f.name));
+  };
+  return ((plan && plan.tables) || []).map((t) => t.name).filter((name) => {
+    const rules = ((plan && plan.policies) || []).filter((p) => p.table_name === name)
+      .map((p) => String(p.qual || '') + ' ' + String(p.with_check || '')).join(' ');
+    return rules.trim() && reached(rules).some((f) => mentions(f.src, name));
+  });
 }
 
 /**
@@ -521,7 +559,14 @@ function nightlyRecord(latest, readAt, plan) {
   // functions anyone can call - read now, when this is asked, because the
   // engine inside the database does not look at them.
   const tag = plan ? taggerFor(plan, plan.tables) : (f) => f;
-  const night = (run.findings || []).map((f) => tag(Object.assign({}, f, { fromNight: true })));
+  // A loop the engine could not name ("stack depth limit exceeded") is put
+  // on the tables whose own rule reads back into them, read from the shape.
+  const loops = plan ? loopingTables(plan) : [];
+  const night = [];
+  for (const f of run.findings || []) {
+    const at = f.kind === 'recursive' && !f.table ? (loops.length ? loops : ['one of your tables']) : [f.table];
+    for (const table of at) night.push(tag(Object.assign({}, f, { table: table, fromNight: true })));
+  }
   const now = plan ? privilegedOf(plan).map(tag) : [];
   return Object.assign(record, {
     ranAt: at(run.ran_at),
@@ -842,6 +887,7 @@ module.exports = {
   scheduleTimes: scheduleTimes,
   notCheckedFromNight: notCheckedFromNight,
   privilegedOf: privilegedOf,
+  loopingTables: loopingTables,
   taggerFor: taggerFor,
   saveNightly: saveNightly,
   sweepOldCopies: sweepOldCopies,

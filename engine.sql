@@ -1870,11 +1870,13 @@ BEGIN
     -- Looked for on every table, owner or not. Only a read of the table itself
     -- that came back with a verdict, for both callers, shows its rules no
     -- longer loop; a read that failed for some other reason shows nothing.
-    IF NOT (anon->>'ok')::boolean AND __KN__.recursion_in(anon->>'why') IS NOT NULL THEN
+    IF NOT (anon->>'ok')::boolean AND (__KN__.recursion_in(anon->>'why') IS NOT NULL
+                                       OR coalesce(anon->>'why', '') ~* 'stack depth limit exceeded') THEN
       looped := looped || jsonb_build_array(jsonb_build_object(
         'relation', __KN__.recursion_in(anon->>'why'), 'table', tab->>'name', 'who', 'anyone'));
     END IF;
-    IF NOT (as_a->>'ok')::boolean AND __KN__.recursion_in(as_a->>'why') IS NOT NULL THEN
+    IF NOT (as_a->>'ok')::boolean AND (__KN__.recursion_in(as_a->>'why') IS NOT NULL
+                                       OR coalesce(as_a->>'why', '') ~* 'stack depth limit exceeded') THEN
       looped := looped || jsonb_build_array(jsonb_build_object(
         'relation', __KN__.recursion_in(as_a->>'why'), 'table', tab->>'name', 'who', 'signed-in'));
     END IF;
@@ -2725,7 +2727,7 @@ BEGIN
     -- attacks it stopped stay in not_checked, because they did not run.
     findings := findings || coalesce((
       SELECT jsonb_agg(jsonb_build_object(
-               'kind', 'recursive', 'table', g.relation, 'reads', g.reads,
+               'kind', 'recursive', 'table', g.relation, 'deep', g.relation IS NULL, 'reads', g.reads,
                'callers', g.callers, 'columns', '[]'::jsonb))
         FROM (SELECT l->>'relation' AS relation,
                      jsonb_agg(DISTINCT l->>'table') AS reads,

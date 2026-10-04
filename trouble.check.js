@@ -216,6 +216,19 @@ async function main() {
     return problems;
   })());
 
+  check('14b. a failure after connecting is not called a failure to connect', (() => {
+    // Found on a blind test: "I could not connect to the database" was
+    // printed over a copy that could not be built, after "Connected.".
+    const after = trouble.explain({ message: 'function has_org_role(uuid, org_role[]) does not exist' }, GOOD, { connected: true }).join(' ');
+    const problems = [];
+    if (/could not connect/i.test(after)) problems.push('it still says it could not connect: ' + after);
+    if (!/I connected, but the check stopped part-way/.test(after) || !/has_org_role/.test(after)) problems.push('it does not say what happened: ' + after);
+    if (after.includes(SECRET)) problems.push('it printed the password');
+    const before = trouble.explain({ message: 'the flux capacitor is misaligned' }, GOOD).join(' ');
+    if (!/could not connect/i.test(before)) problems.push('a failure before connecting lost its wording');
+    return problems;
+  })());
+
   check('15. Supabase’s IPv6-only direct connection is named, not called a typo', (() => {
     // Measured against a real project on 2026-09-21: the direct connection
     // has an AAAA record and no A record, this machine has no global IPv6, so
