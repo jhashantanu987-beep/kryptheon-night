@@ -322,6 +322,40 @@ async function readAnonDefinerFunctions(client, schema, role) {
   });
 }
 
+/**
+ * The app's own SQL and PL/pgSQL functions, with their full definitions.
+ *
+ * Read so the helpers a rule calls can be built inside the copy. Found on a
+ * blind test: a rule called has_org_role(org_id, ARRAY[...]::org_role[]). The
+ * copy has its own org_role, the helper stayed in the original schema taking
+ * the original's, and no rule could be created - the scan stopped before it
+ * began. Left in the original, a helper also answers from the original's
+ * tables rather than from the copy's.
+ */
+async function readFunctions(client, schema) {
+  const { rows } = await client.query(
+    `SELECT p.proname AS name,
+            l.lanname AS language,
+            p.prosrc AS src,
+            pg_get_functiondef(p.oid) AS def,
+            pg_get_function_identity_arguments(p.oid) AS args,
+            p.proacl IS NULL AS default_acl,
+            (SELECT coalesce(array_agg(g ORDER BY g), '{}'::text[])
+               FROM (SELECT DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee)::text END AS g
+                       FROM aclexplode(p.proacl) a
+                      WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner) x) AS executors
+       FROM pg_proc p
+       JOIN pg_namespace n ON n.oid = p.pronamespace
+       JOIN pg_language l ON l.oid = p.prolang
+      WHERE n.nspname = $1
+        AND p.prokind = 'f'
+        AND p.prorettype <> 'pg_catalog.trigger'::regtype
+      ORDER BY p.proname, p.oid`,
+    [schema],
+  );
+  return rows;
+}
+
 async function readPolicies(client, schema) {
   const { rows } = await client.query(
     `SELECT tablename AS table_name,
@@ -597,6 +631,7 @@ async function readSchema(client, schema) {
     viewGrants: await readViewGrants(client, schema),
     external: external,
     anonFunctions: await readAnonDefinerFunctions(client, schema),
+    functions: await readFunctions(client, schema),
     unsupported: unsupported,
   };
 }
@@ -656,18 +691,19 @@ function rewriteSchemaRefs(expr, fromSchema, toSchema) {
  * since source and copy printed the same words.
  *
  * Not rewriteSchemaRefs, which moves every "kn_app." it finds: a rule calling
- * one of the app's functions (kn_app.whoami()) has to keep calling it,
- * because functions are not copied, and pointing it at the copy makes the
- * CREATE POLICY fail. Only names that are tables or views of this app move.
- * A name followed by more identifier characters is a different name -
- * members_log is not members - so the match stops at a word boundary.
+ * one of the app's functions that is not copied (kn_app.whoami() in another
+ * language) has to keep calling it, and pointing it at the copy makes the
+ * CREATE POLICY fail. Only tables, views, and the functions the copy was
+ * given (copiedFunctions) move. A name followed by more identifier characters
+ * is a different name - members_log is not members - so the match stops at a
+ * word boundary.
  */
-function rewriteOwnTableRefs(expr, plan, target) {
+function rewriteOwnTableRefs(expr, plan, target, copiedFunctions) {
   if (expr === null || expr === undefined) return expr;
   const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const simple = (s) => /^[a-z_][a-z0-9_$]*$/.test(s);
   const schemaForms = [quote(plan.schema)].concat(simple(plan.schema) ? [plan.schema] : []);
-  const own = (plan.tables || []).map((t) => t.name).concat((plan.views || []).map((v) => v.name));
+  const own = (plan.tables || []).map((t) => t.name).concat((plan.views || []).map((v) => v.name), copiedFunctions || []);
   let out = String(expr);
   for (const name of own) {
     const nameForms = [quote(name)].concat(simple(name) ? [name] : []);
@@ -679,6 +715,61 @@ function rewriteOwnTableRefs(expr, plan, target) {
     }
   }
   return out;
+}
+
+/**
+ * Which of the app's functions the copy needs: every SQL or PL/pgSQL function
+ * a rule or a view calls, and every one those call in turn. Matched by name
+ * followed by "(", bare or schema-qualified; every overload of a name comes
+ * along. Functions in other languages stay where they are.
+ */
+function functionsToCopy(plan) {
+  const copyable = (plan.functions || []).filter((f) => f.language === 'sql' || f.language === 'plpgsql');
+  const names = Array.from(new Set(copyable.map((f) => f.name)));
+  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const calls = (text, name) => new RegExp('(^|[^A-Za-z0-9_$])"?' + escape(name) + '"?\\s*\\(').test(String(text || ''));
+  const seeds = []
+    .concat((plan.policies || []).map((p) => String(p.qual || '') + ' ' + String(p.with_check || '')))
+    .concat((plan.views || []).map((v) => v.definition));
+  const wanted = new Set(names.filter((name) => seeds.some((text) => calls(text, name))));
+  // And whatever those call, until nothing new turns up.
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const f of copyable) {
+      if (!wanted.has(f.name)) continue;
+      for (const name of names) {
+        if (!wanted.has(name) && calls(f.src, name)) {
+          wanted.add(name);
+          grew = true;
+        }
+      }
+    }
+  }
+  return copyable.filter((f) => wanted.has(f.name));
+}
+
+/**
+ * One of the app's functions, rebuilt in the copy: the same body and settings,
+ * its name in the copy, its references to the app's own tables, views and
+ * copied functions pointed at the copy, and a pinned search_path that looks in
+ * the copy first and the original second (for what the copy does not have,
+ * such as an extension's functions).
+ */
+function copyFunctionStatement(fn, plan, target, copiedNames) {
+  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const schemaForms = [quote(plan.schema), plan.schema].map(escape).join('|');
+  let def = String(fn.def).replace(
+    new RegExp('^CREATE OR REPLACE FUNCTION\\s+(?:' + schemaForms + ')\\.'),
+    () => 'CREATE FUNCTION ' + quote(target) + '.',
+  );
+  // The settings line, e.g.  SET search_path TO 'public', 'storage'
+  def = def.replace(/^(\s*SET search_path (?:TO|=) )(.*)$/m, (all, head, list) =>
+    head + list.split(',').map((part) => {
+      const bare = part.trim().replace(/^'(.*)'$/, '$1').replace(/^"(.*)"$/, '$1');
+      return bare === plan.schema ? "'" + target + "', " + part.trim() : part.trim();
+    }).join(', '));
+  return rewriteOwnTableRefs(def, plan, target, copiedNames);
 }
 
 /**
@@ -940,6 +1031,29 @@ async function writeSchema(client, plan, target) {
     statements.push(rewriteSchemaRefs(index.definition, plan.schema, target));
   }
 
+  // The helpers the rules and views call, after the tables their bodies read
+  // and before anything that calls them.
+  const copied = functionsToCopy(plan);
+  const copiedNames = Array.from(new Set(copied.map((f) => f.name)));
+  // The app's own types move with them: a copied helper taking app.role_t[]
+  // has to take the copy's role_t, or the copy's columns cannot be compared
+  // with its arguments.
+  const movedNames = copiedNames.concat((plan.types || []).map((t) => t.name));
+  for (const fn of copied) {
+    statements.push(copyFunctionStatement(fn, plan, target, movedNames));
+    // Who may call it, as in the original. Found by the blocked-read check: a
+    // helper the original had closed to anon and authenticated came out of
+    // the copy open to everyone, and a rule that cannot be evaluated was
+    // reported as evaluated.
+    if (!fn.default_acl) {
+      const signature = quote(target) + '.' + quote(fn.name) + '(' + rewriteOwnTableRefs(fn.args, plan, target, movedNames) + ')';
+      statements.push('REVOKE ALL ON FUNCTION ' + signature + ' FROM PUBLIC');
+      for (const who of fn.executors || []) {
+        statements.push('GRANT EXECUTE ON FUNCTION ' + signature + ' TO ' + (who === 'PUBLIC' ? 'PUBLIC' : quote(who)));
+      }
+    }
+  }
+
   // Views last, because they read from the tables above. Copied rather than
   // skipped because a view is a way into a table: it runs with its creator
   // rights unless it says security_invoker, so a view over a protected table
@@ -1011,8 +1125,8 @@ async function writeSchema(client, plan, target) {
       'FOR ' + policy.cmd,
       'TO ' + roles,
     ];
-    if (policy.qual) parts.push('USING (' + rewriteOwnTableRefs(policy.qual, plan, target) + ')');
-    if (policy.with_check) parts.push('WITH CHECK (' + rewriteOwnTableRefs(policy.with_check, plan, target) + ')');
+    if (policy.qual) parts.push('USING (' + rewriteOwnTableRefs(policy.qual, plan, target, movedNames) + ')');
+    if (policy.with_check) parts.push('WITH CHECK (' + rewriteOwnTableRefs(policy.with_check, plan, target, movedNames) + ')');
     statements.push(parts.join(' '));
   }
 
@@ -1277,6 +1391,8 @@ module.exports = {
   referenceIn: referenceIn,
   rewriteSchemaRefs: rewriteSchemaRefs,
   qualifyOwnRefs: qualifyOwnRefs,
+  functionsToCopy: functionsToCopy,
+  copyFunctionStatement: copyFunctionStatement,
   stubNameFor: stubNameFor,
   IDENTITIES: IDENTITIES,
   quote: quote,

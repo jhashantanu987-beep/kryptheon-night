@@ -246,6 +246,36 @@ RETURNS jsonb LANGUAGE sql STABLE AS $$
 $$;
 
 /* The grants on views. Separate, because views are created after the tables. */
+/* The app's own SQL and PL/pgSQL functions, with their definitions - the
+   twin of readFunctions in schema.js. The helpers a rule calls are built in
+   the copy from these. */
+CREATE OR REPLACE FUNCTION __KN__.read_functions(source text)
+RETURNS jsonb LANGUAGE sql STABLE AS $$
+  SELECT coalesce(jsonb_agg(f ORDER BY ord), '[]'::jsonb)
+    FROM (
+      SELECT row_number() OVER (ORDER BY p.proname, p.oid) AS ord,
+             jsonb_build_object(
+               'name', p.proname,
+               'language', l.lanname,
+               'src', p.prosrc,
+               'def', pg_get_functiondef(p.oid),
+               'args', pg_get_function_identity_arguments(p.oid),
+               'default_acl', p.proacl IS NULL,
+               'executors', (SELECT coalesce(jsonb_agg(g ORDER BY g), '[]'::jsonb)
+                               FROM (SELECT DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                                                          ELSE pg_get_userbyid(a.grantee)::text END AS g
+                                       FROM aclexplode(p.proacl) a
+                                      WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner) x)
+             ) AS f
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        JOIN pg_language l ON l.oid = p.prolang
+       WHERE n.nspname = source
+         AND p.prokind = 'f'
+         AND p.prorettype <> 'pg_catalog.trigger'::regtype
+    ) x;
+$$;
+
 CREATE OR REPLACE FUNCTION __KN__.read_view_grants(source text)
 RETURNS jsonb LANGUAGE sql STABLE AS $$
   SELECT coalesce(jsonb_agg(g ORDER BY g->>'table_name', g->>'grantee', g->>'privilege_type'), '[]'::jsonb)
@@ -331,6 +361,7 @@ BEGIN
     'indexes', __KN__.read_indexes(source),
     'views', __KN__.read_views(source),
     'viewGrants', __KN__.read_view_grants(source),
+    'functions', __KN__.read_functions(source),
     -- A foreign key pointing at something whose shape could not be read is
     -- not something to guess at. The caller stops rather than attacking a
     -- copy that is missing a piece.
@@ -493,7 +524,8 @@ $$;
    keep calling the original. The same as rewriteOwnTableRefs in schema.js:
    without it, a rule written "FROM kn_app.members" was replayed verbatim and
    the copy's rule read the customer's table. */
-CREATE OR REPLACE FUNCTION __KN__.rewrite_own_table_refs(expr text, plan jsonb, target text)
+CREATE OR REPLACE FUNCTION __KN__.rewrite_own_table_refs(expr text, plan jsonb, target text,
+                                                         copied text[] DEFAULT ARRAY[]::text[])
 RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE
   out text := expr;
@@ -510,6 +542,7 @@ BEGIN
     || CASE WHEN src ~ '^[a-z_][a-z0-9_$]*$' THEN ARRAY[src] ELSE ARRAY[]::text[] END;
   FOR name_ IN
     SELECT x->>'name' FROM jsonb_array_elements(coalesce(plan->'tables', '[]'::jsonb) || coalesce(plan->'views', '[]'::jsonb)) x
+    UNION ALL SELECT unnest(copied)
   LOOP
     name_forms := ARRAY[__KN__.always_quote(name_)]
       || CASE WHEN name_ ~ '^[a-z_][a-z0-9_$]*$' THEN ARRAY[name_] ELSE ARRAY[]::text[] END;
@@ -525,6 +558,92 @@ BEGIN
     END LOOP;
   END LOOP;
   RETURN out;
+END $$;
+
+/* Which of the app's functions the copy needs: every SQL or PL/pgSQL function
+   a rule or a view calls, and every one those call in turn - the twin of
+   functionsToCopy in schema.js, in the plan's own order. */
+CREATE OR REPLACE FUNCTION __KN__.calls_function(text_ text, name_ text)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+  SELECT coalesce(text_, '') ~ ('(^|[^A-Za-z0-9_$])"?'
+    || regexp_replace(name_, '([.*+?^${}()|\[\]\\])', '\\\1', 'g') || '"?\s*\(');
+$$;
+
+CREATE OR REPLACE FUNCTION __KN__.functions_to_copy(plan jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  copyable jsonb;
+  names text[];
+  seeds text;
+  wanted text[] := ARRAY[]::text[];
+  grew boolean := true;
+  f jsonb;
+  name_ text;
+BEGIN
+  SELECT coalesce(jsonb_agg(x), '[]'::jsonb) INTO copyable
+    FROM jsonb_array_elements(coalesce(plan->'functions', '[]'::jsonb)) x
+   WHERE x->>'language' IN ('sql', 'plpgsql');
+  SELECT coalesce(array_agg(DISTINCT x->>'name'), ARRAY[]::text[]) INTO names
+    FROM jsonb_array_elements(copyable) x;
+  SELECT coalesce(string_agg(coalesce(p->>'qual', '') || ' ' || coalesce(p->>'with_check', ''), ' '), '') INTO seeds
+    FROM jsonb_array_elements(coalesce(plan->'policies', '[]'::jsonb)) p;
+  SELECT seeds || ' ' || coalesce(string_agg(v->>'definition', ' '), '') INTO seeds
+    FROM jsonb_array_elements(coalesce(plan->'views', '[]'::jsonb)) v;
+  FOREACH name_ IN ARRAY names LOOP
+    IF __KN__.calls_function(seeds, name_) THEN
+      wanted := wanted || name_;
+    END IF;
+  END LOOP;
+  -- And whatever those call, until nothing new turns up.
+  WHILE grew LOOP
+    grew := false;
+    FOR f IN SELECT * FROM jsonb_array_elements(copyable) LOOP
+      CONTINUE WHEN NOT (f->>'name' = ANY (wanted));
+      FOREACH name_ IN ARRAY names LOOP
+        IF NOT (name_ = ANY (wanted)) AND __KN__.calls_function(f->>'src', name_) THEN
+          wanted := wanted || name_;
+          grew := true;
+        END IF;
+      END LOOP;
+    END LOOP;
+  END LOOP;
+  RETURN (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM jsonb_array_elements(copyable) x
+           WHERE x->>'name' = ANY (wanted));
+END $$;
+
+/* One of the app's functions, rebuilt in the copy - the twin of
+   copyFunctionStatement in schema.js: its name in the copy, its references to
+   the app's own tables, views and copied functions pointed at the copy, and a
+   pinned search_path that looks in the copy first and the original second. */
+CREATE OR REPLACE FUNCTION __KN__.copy_function_statement(fn jsonb, plan jsonb, target text, copied text[])
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  src text := plan->>'schema';
+  def text := fn->>'def';
+  head text;
+  m text[];
+  part text;
+  bare text;
+  parts text[] := ARRAY[]::text[];
+BEGIN
+  FOREACH head IN ARRAY ARRAY['CREATE OR REPLACE FUNCTION ' || __KN__.always_quote(src) || '.',
+                              'CREATE OR REPLACE FUNCTION ' || src || '.'] LOOP
+    IF left(def, length(head)) = head THEN
+      def := 'CREATE FUNCTION ' || __KN__.always_quote(target) || '.' || substr(def, length(head) + 1);
+      EXIT;
+    END IF;
+  END LOOP;
+  -- The settings line, e.g.  SET search_path TO 'public', 'storage'
+  m := regexp_match(def, '^(\s*SET search_path (?:TO|=) )(.*)$', 'n');
+  IF m IS NOT NULL THEN
+    FOREACH part IN ARRAY string_to_array(m[2], ',') LOOP
+      part := btrim(part);
+      bare := regexp_replace(regexp_replace(part, '^''(.*)''$', '\1'), '^"(.*)"$', '\1');
+      parts := parts || CASE WHEN bare = src THEN '''' || target || ''', ' || part ELSE part END;
+    END LOOP;
+    def := replace(def, m[1] || m[2], m[1] || array_to_string(parts, ', '));
+  END IF;
+  RETURN __KN__.rewrite_own_table_refs(def, plan, target, copied);
 END $$;
 
 CREATE OR REPLACE FUNCTION __KN__.rewrite_schema_refs(expr text, from_schema text, to_schema text)
@@ -712,6 +831,8 @@ DECLARE
   pol jsonb;
   stub jsonb;
   made jsonb;
+  copied_fns jsonb;
+  copied_names text[];
   cols text[];
   bare text;
   want_foreign boolean;
@@ -826,6 +947,26 @@ BEGIN
     out := out || __KN__.rewrite_schema_refs(idx->>'definition', source, target);
   END LOOP;
 
+  -- The helpers the rules and views call, after the tables their bodies read
+  -- and before anything that calls them.
+  copied_fns := __KN__.functions_to_copy(plan);
+  SELECT coalesce(array_agg(DISTINCT x->>'name'), ARRAY[]::text[]) INTO copied_names
+    FROM jsonb_array_elements(copied_fns) x;
+  copied_names := copied_names || coalesce((SELECT array_agg(t->>'name') FROM jsonb_array_elements(coalesce(plan->'types', '[]'::jsonb)) t), ARRAY[]::text[]);
+  FOR made IN SELECT * FROM jsonb_array_elements(copied_fns) LOOP
+    out := out || __KN__.copy_function_statement(made, plan, target, copied_names);
+    -- Who may call it, as in the original.
+    IF NOT (made->>'default_acl')::boolean THEN
+      bare := here || '.' || __KN__.always_quote(made->>'name') || '('
+              || __KN__.rewrite_own_table_refs(made->>'args', plan, target, copied_names) || ')';
+      out := out || ('REVOKE ALL ON FUNCTION ' || bare || ' FROM PUBLIC');
+      FOR role_ IN SELECT * FROM jsonb_array_elements_text(coalesce(made->'executors', '[]'::jsonb)) LOOP
+        out := out || ('GRANT EXECUTE ON FUNCTION ' || bare || ' TO '
+                       || CASE WHEN role_ = 'PUBLIC' THEN 'PUBLIC' ELSE __KN__.always_quote(role_) END);
+      END LOOP;
+    END IF;
+  END LOOP;
+
   -- Views last, because they read from the tables above.
   FOR view_ IN SELECT * FROM jsonb_array_elements(coalesce(plan->'views', '[]'::jsonb)) LOOP
     out := out || ('CREATE '
@@ -885,9 +1026,9 @@ BEGIN
       || ' TO ' || coalesce(nullif((SELECT string_agg(r, ', ')
                                       FROM jsonb_array_elements_text(pol->'roles') r), ''), 'PUBLIC')
       || CASE WHEN pol->>'qual' IS NOT NULL
-              THEN ' USING (' || __KN__.rewrite_own_table_refs(pol->>'qual', plan, target) || ')' ELSE '' END
+              THEN ' USING (' || __KN__.rewrite_own_table_refs(pol->>'qual', plan, target, copied_names) || ')' ELSE '' END
       || CASE WHEN pol->>'with_check' IS NOT NULL
-              THEN ' WITH CHECK (' || __KN__.rewrite_own_table_refs(pol->>'with_check', plan, target) || ')' ELSE '' END
+              THEN ' WITH CHECK (' || __KN__.rewrite_own_table_refs(pol->>'with_check', plan, target, copied_names) || ')' ELSE '' END
     );
   END LOOP;
 
