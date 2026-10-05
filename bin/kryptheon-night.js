@@ -648,7 +648,9 @@ async function main() {
       if (result.findings.length) scanner.report(result);
       else scanner.notTestedLines(result).forEach(line);
       scanner.saveRun(file, result);
-      process.exitCode = result.stopped ? 2 : verdict.allClear ? 0 : 1;
+      // Two different databases: the verdict is a comparison, so the exit
+      // code is this run's own answer, the same as a first run.
+      process.exitCode = result.stopped ? 2 : verdict.elsewhere ? scanner.exitCodeFor(result) : verdict.allClear ? 0 : 1;
     }
 
     // And then the only other thing worth doing, offered rather than

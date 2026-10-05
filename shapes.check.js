@@ -25,6 +25,11 @@ const { Client } = require('pg');
 const schema = require('./schema.js');
 const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
+const sqlengine = require('./sqlengine.js');
+
+// Every shape down both engines. It ran down the Node one only, and a shape
+// the SQL engine could not seed was found on a blind test instead.
+const ENGINES = ['node', 'sql'];
 
 const CONN = process.argv[2] || process.env.KN_DATABASE_URL;
 
@@ -252,6 +257,46 @@ const SHAPES = [
     },
   },
   {
+    // Found on a blind test (HelixOps): a document belongs to a work order or
+    // an inspection, never both. Seeded pointing at both, refused every time.
+    name: 'exactly one of two parents, as a sum of IS NOT NULL',
+    sql: (q) => [
+      'CREATE TABLE ' + q('work_orders') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), owner uuid NOT NULL)',
+      'CREATE TABLE ' + q('inspections') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), owner uuid NOT NULL)',
+      'CREATE TABLE ' + q('documents') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), owner uuid NOT NULL,' +
+        ' work_order_id uuid REFERENCES ' + q('work_orders') + '(id), inspection_id uuid REFERENCES ' + q('inspections') + '(id),' +
+        ' CONSTRAINT one_parent CHECK ((work_order_id IS NOT NULL)::int + (inspection_id IS NOT NULL)::int = 1))',
+    ],
+  },
+  {
+    // The same rule written with num_nonnulls, over a key, a column with a
+    // default that has to be written as nothing, and a plain column.
+    name: 'exactly one of three, as num_nonnulls, one with a default',
+    sql: (q) => [
+      'CREATE TABLE ' + q('cards') + ' (id serial PRIMARY KEY, owner uuid NOT NULL)',
+      'CREATE TABLE ' + q('payments') + ' (id serial PRIMARY KEY, owner uuid NOT NULL,' +
+        " card_id int REFERENCES " + q('cards') + "(id), bank_ref text DEFAULT 'bank', voucher text," +
+        ' CHECK (num_nonnulls(card_id, bank_ref, voucher) = 1))',
+    ],
+  },
+  {
+    // A sum that asks for both is not "exactly one": both are filled in, as
+    // before. Reading every sum as exactly one would refuse this table.
+    name: 'both of two, as a sum of IS NOT NULL = 2',
+    sql: (q) => [
+      'CREATE TABLE ' + q('pairs') + ' (id serial PRIMARY KEY, owner uuid NOT NULL, left_part text NOT NULL, right_part text NOT NULL,' +
+        ' CHECK ((left_part IS NOT NULL)::int + (right_part IS NOT NULL)::int = 2))',
+    ],
+  },
+  {
+    // And with no key at all: the plain column is the one filled in.
+    name: 'exactly one of two plain columns',
+    sql: (q) => [
+      'CREATE TABLE ' + q('contacts') + ' (id serial PRIMARY KEY, owner uuid NOT NULL, email text, phone text,' +
+        ' CHECK ((email IS NOT NULL)::int + (phone IS NOT NULL)::int = 1))',
+    ],
+  },
+  {
     name: 'a table that is only an id',
     sql: (q) => ['CREATE TABLE ' + q('flags') + ' (id serial PRIMARY KEY)'],
   },
@@ -293,7 +338,7 @@ async function groundwork(client, name) {
   const leads = [];
   let n = 0;
 
-  for (const shape of SHAPES) {
+  for (const shape of SHAPES) for (const engine of ENGINES) {
     n += 1;
     const name = 'kn_shape_' + n + '_' + Date.now().toString(36);
     const q = (t) => schema.quote(name) + '.' + schema.quote(t);
@@ -312,14 +357,18 @@ async function groundwork(client, name) {
         await client.query('GRANT SELECT ON ' + q(t.relname) + ' TO anon, authenticated');
       }
 
-      const result = await scan(client, name, {
+      const options = {
         quiet: true,
         openSession: async () => {
           const extra = new Client({ connectionString: CONN });
           await extra.connect();
           return extra;
         },
-      });
+      };
+      const result = engine === 'node'
+        ? await scan(client, name, options)
+        : await sqlengine.withEngine(client, (target) =>
+          scan(client, name, Object.assign({ engine: sqlengine.adapterFor(target) }, options)));
 
       if (result.stopped) {
         verdict = { level: 'STOPPED', detail: result.stopped.split('\n').slice(0, 3).join(' | ') };
@@ -339,10 +388,10 @@ async function groundwork(client, name) {
       } catch (err) { /* nothing to drop */ }
     }
 
-    console.log((verdict.level === 'ok' ? 'PASS  ' : 'FAIL  ') + shape.name);
+    console.log((verdict.level === 'ok' ? 'PASS  ' : 'FAIL  ') + shape.name + ' (' + engine + ')');
     if (verdict.level !== 'ok') {
       console.log('      - ' + verdict.level + ': ' + verdict.detail);
-      leads.push(shape.name + '  ->  ' + verdict.level);
+      leads.push(shape.name + ' (' + engine + ')  ->  ' + verdict.level);
     }
   }
 
@@ -352,7 +401,7 @@ async function groundwork(client, name) {
 
   console.log('');
   if (!leads.length) {
-    console.log('All ' + SHAPES.length + ' shape checks passed.');
+    console.log('All ' + SHAPES.length * ENGINES.length + ' shape checks passed.');
   } else {
     console.log(leads.length + ' check(s) failed:');
     leads.forEach((l) => console.log('    ' + l));

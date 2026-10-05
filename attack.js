@@ -205,6 +205,48 @@ function allowedByCheck(table, columnName) {
 }
 
 /**
+ * Sets of columns where exactly one may be filled in.
+ *
+ * Found on a blind test (HelixOps): documents belonged to a work order or to
+ * an inspection, never both, written
+ *   CHECK ((work_order_id IS NOT NULL)::int + (inspection_id IS NOT NULL)::int = 1)
+ * Both parents were there, so the seeder pointed the row at both, the CHECK
+ * refused every attempt, and the table was never tested at all.
+ *
+ * Two spellings are read - that sum, and num_nonnulls(a, b, ...) = 1 - and
+ * only when the constraint says nothing else. A CHECK with anything more in it
+ * is left alone rather than half understood.
+ */
+function exactlyOne(table) {
+  const groups = [];
+  const name = '("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)';
+  const unquote = (text) => (text.charAt(0) === '"' ? text.slice(1, -1).split('""').join('"') : text);
+  for (const constraint of table.constraints || []) {
+    if (constraint.kind !== 'c') continue;
+    const definition = String(constraint.definition || '');
+    let columns = [];
+    let rest = definition;
+    const summed = new RegExp('\\(\\(' + name + ' IS NOT NULL\\)\\)::integer', 'gi');
+    let match;
+    while ((match = summed.exec(definition)) !== null) columns.push(unquote(match[1]));
+    rest = rest.replace(summed, '').replace(/\+/g, '');
+    if (!columns.length) {
+      const counted = /num_nonnulls\(([^()]*)\)/i.exec(definition);
+      if (counted) {
+        const listed = new RegExp(name, 'g');
+        let one;
+        while ((one = listed.exec(counted[1])) !== null) columns.push(unquote(one[1]));
+        rest = rest.replace(counted[0], '');
+      }
+    }
+    // Nothing may be left but the CHECK itself, brackets and "= 1".
+    if (columns.length < 2 || rest.replace(/[()\s]/g, '').toUpperCase() !== 'CHECK=1') continue;
+    groups.push(columns);
+  }
+  return groups;
+}
+
+/**
  * The foreign keys on a table, read out of Postgres's own wording.
  *
  * Every column of the key, not just the first. A key over (org_id, cart_id)
@@ -395,12 +437,28 @@ async function rowFor(client, schema, table, person, distinct, overrides, attemp
   const partOfKey = new Set();
   for (const key of foreignKeys(table)) key.columns.forEach((name) => partOfKey.add(name));
 
+  // Where exactly one of a set may be filled in: the one already chosen, or
+  // else the first that can be - a key needs a parent row to point at. The
+  // rest are written as nothing, whatever their default.
+  const chosen = (name) => Object.prototype.hasOwnProperty.call(forced, name);
+  const onlyOne = new Map();
+  for (const group of exactlyOne(table)) {
+    const kept = group.find(chosen) || group.find((name) => !partOfKey.has(name) || borrowed.has(name));
+    for (const name of group) onlyOne.set(name, name === kept);
+  }
+
   for (const column of table.columns) {
     if (Object.prototype.hasOwnProperty.call(forced, column.name)) {
       columns.push(column.name);
       values.push(forced[column.name]);
       continue;
     }
+    if (onlyOne.get(column.name) === false) {
+      columns.push(column.name);
+      values.push(null);
+      continue;
+    }
+    const mustFill = onlyOne.get(column.name) === true;
     if (column.name === owner) {
       columns.push(column.name);
       values.push(person);
@@ -436,9 +494,11 @@ async function rowFor(client, schema, table, person, distinct, overrides, attemp
       values.push(borrowed.get(column.name));
       continue;
     }
-    // Anything with a default can supply its own value.
+    // Anything with a default can supply its own value. A column that may be
+    // empty is left empty - unless it is the one of a set that has to be
+    // filled in.
     if (column.default_expr) continue;
-    if (!column.not_null) continue;
+    if (!column.not_null && !mustFill) continue;
     columns.push(column.name);
     // A CHECK that lists what it will accept beats anything invented here.
     const allowed = allowedByCheck(table, column.name);
@@ -766,6 +826,7 @@ module.exports = {
   dependencyOrder: dependencyOrder,
   valueFor: valueFor,
   allowedByCheck: allowedByCheck,
+  exactlyOne: exactlyOne,
   rowFor: rowFor,
   existingRow: existingRow,
   insertRow: insertRow,

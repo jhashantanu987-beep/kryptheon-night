@@ -53,6 +53,53 @@ function proofsOf(list) {
   return (list || []).reduce((all, item) => all.concat(item.members && item.members.length ? item.members : [item]), []);
 }
 
+/*
+ * Whether the earlier run was on this database at all.
+ *
+ * Found on a blind test (HelixOps): the repository's database was scanned,
+ * then the production one from the same folder, and the re-check reported the
+ * six differences as "NEW problems" and said "A fix can open something else".
+ * Nothing had been fixed; it was another database. A run now says where it
+ * was; one saved before that is judged by the tables it attacked.
+ */
+
+// Attacks named for a table, as opposed to a function or a bucket.
+const ON_A_TABLE = /^(exposed|crossed|writable|recursive|orphaned|duplicated|role|teamread):/;
+
+/** The tables a run looked at: as it said, or else as its attacks name them. */
+function tablesOf(run, said) {
+  if (said) return run.where.tables;
+  return Array.from(new Set(((run && run.attempted) || []).filter((key) => ON_A_TABLE.test(String(key)))
+    .map((key) => String(key).split(':')[1])));
+}
+
+/** A database, said the way a person would recognise it. */
+function placeOf(where) {
+  if (!where) return null;
+  return '"' + where.database + '"' + (where.host ? ' on ' + where.host + (where.port ? ':' + where.port : '') : '') +
+    (where.schema && where.schema !== 'public' ? ', schema "' + where.schema + '"' : '');
+}
+
+function elsewhereOf(before, after) {
+  const was = before && before.where;
+  const now = after && after.where;
+  const said = Boolean(was && now && Array.isArray(was.tables) && Array.isArray(now.tables));
+  const a = new Set(tablesOf(before, said));
+  const b = new Set(tablesOf(after, said));
+  const onlyBefore = Array.from(a).filter((t) => !b.has(t)).sort();
+  const onlyNow = Array.from(b).filter((t) => !a.has(t)).sort();
+  const union = new Set(Array.from(a).concat(Array.from(b))).size;
+  const shared = union - onlyBefore.length - onlyNow.length;
+  const otherDatabase = Boolean(was && now) && (was.database !== now.database ||
+    (was.host || null) !== (now.host || null) || (was.port || null) !== (now.port || null) || was.schema !== now.schema);
+  // Fewer than half the tables in common: not the same app any more. Only
+  // said when both runs name tables: a run that names none says nothing.
+  const otherShape = a.size > 0 && b.size > 0 && shared * 2 < union;
+  if (!otherDatabase && !otherShape) return null;
+  return { otherDatabase: otherDatabase, otherShape: otherShape, was: placeOf(was), now: placeOf(now),
+    onlyBefore: onlyBefore, onlyNow: onlyNow };
+}
+
 function compare(before, after) {
   const was = proofsOf(before && before.findings);
   const now = proofsOf(after && after.findings);
@@ -120,9 +167,13 @@ function compare(before, after) {
 
   const wasByKey = new Set(was.map(keyOf));
   const newlyBroken = now.filter((item) => !wasByKey.has(keyOf(item)));
+  const elsewhere = elsewhereOf(before, after);
 
   return {
     stopped: null,
+    // Set when the earlier run was on another database, or on a very
+    // different set of tables: then this is a comparison, not a re-check.
+    elsewhere: elsewhere,
     fixed: fixed,
     stillOpen: stillOpen,
     unverifiable: unverifiable,
@@ -138,7 +189,9 @@ function compare(before, after) {
     // unverifiable, so "the other two are empty" already means "all of them
     // were fixed" - stating that a third time as a count only made each guard
     // able to cover for the others, which is how a broken guard stays hidden.
+    // And never from two different databases: nothing was fixed between them.
     allClear:
+      !elsewhere &&
       !stillOpen.length &&
       !unverifiable.length &&
       !newlyBroken.length &&
@@ -173,9 +226,56 @@ function whatOf(item) {
   if (item.kind === 'orphaned') return 'rows left pointing at nothing';
   if (item.kind === 'privileged') return 'a function anyone can call';
   if (item.kind === 'role') return 'changed by a "' + (item.who || 'viewer') + '"';
+  if (item.kind === 'teamread') return 'read by a "' + (item.who || 'viewer') + '"';
   if (item.kind === 'bucket') return 'a public storage bucket';
   if (item.kind === 'recursive') return 'a rule that refers to itself';
   return item.kind;
+}
+
+/** Wraps one paragraph for the screen, indented the way these lines are. */
+function wrapped(text) {
+  const out = [];
+  let current = '';
+  for (const word of String(text).split(/\s+/)) {
+    if ((current + ' ' + word).trim().length > 70) {
+      out.push('  ' + current.trim());
+      current = word;
+    } else {
+      current = (current + ' ' + word).trim();
+    }
+  }
+  if (current) out.push('  ' + current.trim());
+  return out;
+}
+
+/** Up to eight names, and how many more. */
+function someOf(names) {
+  const shown = names.slice(0, 8).join(', ');
+  return names.length > 8 ? shown + ' and ' + (names.length - 8) + ' more' : shown;
+}
+
+/**
+ * Said first when the earlier run was somewhere else: which two databases,
+ * and how their tables differ - so nothing after it reads as a fix.
+ */
+function elsewhereLines(elsewhere) {
+  const lines = [];
+  const tables = (n) => n + (n === 1 ? ' table' : ' tables');
+  lines.push('  This is not a re-check of the same database.');
+  lines.push('');
+  const where = elsewhere.otherDatabase
+    ? 'The earlier run kept for this folder was on ' + elsewhere.was + ', and this one is on ' + elsewhere.now + '.'
+    : 'The earlier run kept for this folder looked at a very different set of tables.';
+  wrapped(where + ' So what follows compares two databases: nothing in it means a fix worked, ' +
+    'and nothing in it means a fix broke something.').forEach((l) => lines.push(l));
+  lines.push('');
+  const shape = [];
+  if (elsewhere.onlyBefore.length) shape.push(tables(elsewhere.onlyBefore.length) + ' only in the earlier one (' + someOf(elsewhere.onlyBefore) + ')');
+  if (elsewhere.onlyNow.length) shape.push(tables(elsewhere.onlyNow.length) + ' only in this one (' + someOf(elsewhere.onlyNow) + ')');
+  wrapped(shape.length ? 'How their tables differ: ' + shape.join('; ') + '.' : 'Both have the same tables.')
+    .forEach((l) => lines.push(l));
+  lines.push('');
+  return lines;
 }
 
 /** What the re-check says, in the order it matters. */
@@ -190,26 +290,34 @@ function describe(result) {
     return lines;
   }
 
+  const elsewhere = result.elsewhere;
+  if (elsewhere) elsewhereLines(elsewhere).forEach((l) => lines.push(l));
+
   if (result.fixed.length) {
-    lines.push('  ' + result.fixed.length + (result.fixed.length === 1 ? ' problem is' : ' problems are') + ' fixed:');
+    const n = result.fixed.length;
+    lines.push(elsewhere
+      ? '  ' + n + ' found in the earlier run and not here:'
+      : '  ' + n + (n === 1 ? ' problem is' : ' problems are') + ' fixed:');
     lines.push('');
     for (const item of result.fixed) {
       // A function is never called, only read - so its fix is said as what
       // was seen, not as an attack that was refused. Found on a fix test.
       const how = item.kind === 'privileged'
-        ? 'I looked again, and a visitor with no account can no longer call it.'
+        ? (elsewhere ? 'I looked here, and a visitor with no account cannot call it.'
+          : 'I looked again, and a visitor with no account can no longer call it.')
         : item.kind === 'bucket'
-        ? 'I looked again, and the bucket is no longer public.'
+        ? (elsewhere ? 'I looked here, and the bucket is not public.' : 'I looked again, and the bucket is no longer public.')
         : item.kind === 'recursive'
-        ? 'I read it again, and its rules answered instead of stopping with an error.'
-        : 'I ran the same attack again and it was refused.';
+        ? (elsewhere ? 'I read it here, and its rules answered.'
+          : 'I read it again, and its rules answered instead of stopping with an error.')
+        : (elsewhere ? 'I ran the same attack here and it was refused.' : 'I ran the same attack again and it was refused.');
       lines.push('    ' + item.table + ' (' + whatOf(item) + ') - ' + how);
     }
     lines.push('');
   }
 
   if (result.stillOpen.length) {
-    lines.push('  ' + result.stillOpen.length + ' still open:');
+    lines.push('  ' + result.stillOpen.length + (elsewhere ? ' found in both:' : ' still open:'));
     lines.push('');
     for (const item of result.stillOpen) {
       lines.push('    ' + item.table + ' - ' + item.headline);
@@ -220,32 +328,44 @@ function describe(result) {
   // Deliberately not under "fixed", and deliberately not silent. This is the
   // one a person would otherwise read as good news.
   if (result.unverifiable.length) {
-    lines.push('  ' + result.unverifiable.length + ' I could NOT confirm:');
+    lines.push('  ' + result.unverifiable.length + (elsewhere ? ' I could NOT compare:' : ' I could NOT confirm:'));
     lines.push('');
     for (const item of result.unverifiable) {
       lines.push('    ' + item.table + ' (' + whatOf(item) + ') - ' + item.why);
     }
     lines.push('');
-    lines.push('  These are not fixed and not broken - they are unknown. The problem');
-    lines.push('  stopped showing up, but not because the attack was refused.');
+    if (elsewhere) {
+      lines.push('  These were found in the earlier run, and the same attack did not run');
+      lines.push('  here, so whether they are here too is unknown.');
+    } else {
+      lines.push('  These are not fixed and not broken - they are unknown. The problem');
+      lines.push('  stopped showing up, but not because the attack was refused.');
+    }
     lines.push('');
   }
 
   if (result.newlyBroken.length) {
-    lines.push('  ' + result.newlyBroken.length + ' NEW ' +
-      (result.newlyBroken.length === 1 ? 'problem' : 'problems') + ' that were not there before:');
+    const n = result.newlyBroken.length;
+    lines.push(elsewhere
+      ? '  ' + n + ' found here and not in the earlier run:'
+      : '  ' + n + ' NEW ' + (n === 1 ? 'problem' : 'problems') + ' that were not there before:');
     lines.push('');
     for (const item of result.newlyBroken) {
       lines.push('    ' + item.table + ' - ' + item.headline);
     }
     lines.push('');
-    lines.push('  A fix can open something else. This is why the re-check looks at the');
-    lines.push('  whole app again and not only at what it was asked about.');
+    if (elsewhere) {
+      lines.push('  These are differences between the two databases, not something a fix');
+      lines.push('  opened.');
+    } else {
+      lines.push('  A fix can open something else. This is why the re-check looks at the');
+      lines.push('  whole app again and not only at what it was asked about.');
+    }
     lines.push('');
   }
 
   if (!result.fixed.length && !result.stillOpen.length && !result.unverifiable.length && !result.newlyBroken.length) {
-    lines.push('  Nothing to re-check - there was nothing open.');
+    lines.push(elsewhere ? '  Neither run found anything open.' : '  Nothing to re-check - there was nothing open.');
     lines.push('');
   }
 
@@ -266,6 +386,7 @@ function describe(result) {
 
 module.exports = {
   keyOf: keyOf,
+  elsewhereOf: elsewhereOf,
   compare: compare,
   describe: describe,
   badgeLines: badgeLines,

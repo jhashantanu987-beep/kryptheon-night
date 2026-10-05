@@ -1625,6 +1625,54 @@ END $$;
  * and `implied`, the keys the app never declared, so a `workspace_id` with no
  * foreign key still names a workspace that is there.
  */
+/*
+ * Sets of columns where exactly one may be filled in. Mirrors exactlyOne in
+ * attack.js: (a IS NOT NULL)::int + (b IS NOT NULL)::int = 1, and
+ * num_nonnulls(a, b) = 1, read only when the constraint says nothing else.
+ * Found on a blind test (HelixOps), where documents pointed at a work order
+ * or an inspection, the seeder pointed it at both, and it was never tested.
+ */
+CREATE OR REPLACE FUNCTION __KN__.exactly_one(tab jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  name_ constant text := '("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)';
+  summed text := '\(\(' || name_ || ' IS NOT NULL\)\)::integer';
+  groups jsonb := '[]'::jsonb;
+  con jsonb;
+  definition text;
+  rest text;
+  counted text[];
+  columns jsonb;
+  found text;
+BEGIN
+  FOR con IN SELECT * FROM jsonb_array_elements(coalesce(tab->'constraints', '[]'::jsonb)) LOOP
+    CONTINUE WHEN con->>'kind' <> 'c';
+    definition := coalesce(con->>'definition', '');
+    columns := '[]'::jsonb;
+    FOR found IN SELECT (m)[1] FROM regexp_matches(definition, summed, 'gi') m LOOP
+      columns := columns || to_jsonb(found);
+    END LOOP;
+    rest := replace(regexp_replace(definition, summed, '', 'gi'), '+', '');
+    IF jsonb_array_length(columns) = 0 THEN
+      counted := regexp_match(definition, 'num_nonnulls\(([^()]*)\)', 'i');
+      IF counted IS NOT NULL THEN
+        FOR found IN SELECT (m)[1] FROM regexp_matches(counted[1], name_, 'g') m LOOP
+          columns := columns || to_jsonb(found);
+        END LOOP;
+        rest := regexp_replace(rest, 'num_nonnulls\([^()]*\)', '', 'i');
+      END IF;
+    END IF;
+    -- Nothing may be left but the CHECK itself, brackets and "= 1".
+    CONTINUE WHEN jsonb_array_length(columns) < 2
+               OR upper(regexp_replace(rest, '[()\s]', '', 'g')) <> 'CHECK=1';
+    groups := groups || jsonb_build_array((
+      SELECT jsonb_agg(CASE WHEN left(c, 1) = '"' THEN replace(substr(c, 2, length(c) - 2), '""', '"') ELSE c END
+                       ORDER BY at)
+        FROM jsonb_array_elements_text(columns) WITH ORDINALITY AS e(c, at)));
+  END LOOP;
+  RETURN groups;
+END $$;
+
 CREATE OR REPLACE FUNCTION __KN__.row_for(
   source text, tab jsonb, person text, distinct_ text, overrides jsonb, attempt integer,
   seeding jsonb DEFAULT NULL)
@@ -1636,6 +1684,10 @@ DECLARE
   values_ jsonb := '[]'::jsonb;
   borrowed jsonb := '{}'::jsonb;
   part_of_key jsonb := '[]'::jsonb;
+  only_one jsonb := '{}'::jsonb;
+  group_ jsonb;
+  kept text;
+  must_fill boolean;
   key jsonb;
   row_ jsonb;
   col jsonb;
@@ -1664,6 +1716,22 @@ BEGIN
     part_of_key := part_of_key || (key->'columns');
   END LOOP;
 
+  -- Where exactly one of a set may be filled in: the one already chosen, or
+  -- else the first that can be - a key needs a parent row to point at. The
+  -- rest are written as nothing, whatever their default.
+  FOR group_ IN SELECT * FROM jsonb_array_elements(__KN__.exactly_one(tab)) LOOP
+    SELECT c INTO kept FROM jsonb_array_elements_text(group_) WITH ORDINALITY AS e(c, pos)
+     WHERE forced ? c ORDER BY pos LIMIT 1;
+    IF kept IS NULL THEN
+      SELECT c INTO kept FROM jsonb_array_elements_text(group_) WITH ORDINALITY AS e(c, pos)
+       WHERE NOT (part_of_key ? c) OR borrowed ? c ORDER BY pos LIMIT 1;
+    END IF;
+    FOR name IN SELECT jsonb_array_elements_text(group_) LOOP
+      only_one := jsonb_set(only_one, ARRAY[name], to_jsonb(name = kept));
+    END LOOP;
+    kept := NULL;
+  END LOOP;
+
   FOR col IN SELECT * FROM jsonb_array_elements(tab->'columns') LOOP
     name := col->>'name';
 
@@ -1672,6 +1740,13 @@ BEGIN
       values_ := values_ || jsonb_build_array(forced->name);
       CONTINUE;
     END IF;
+
+    IF only_one->name = 'false'::jsonb THEN
+      columns := columns || to_jsonb(name);
+      values_ := values_ || jsonb_build_array('null'::jsonb);
+      CONTINUE;
+    END IF;
+    must_fill := coalesce(only_one->name = 'true'::jsonb, false);
 
     IF name = owner THEN
       columns := columns || to_jsonb(name);
@@ -1712,9 +1787,11 @@ BEGIN
       values_ := values_ || jsonb_build_array(borrowed->name);
       CONTINUE;
     END IF;
-    -- Anything with a default can supply its own value.
+    -- Anything with a default can supply its own value. A column that may be
+    -- empty is left empty - unless it is the one of a set that has to be
+    -- filled in.
     CONTINUE WHEN col->>'default_expr' IS NOT NULL;
-    CONTINUE WHEN NOT (col->>'not_null')::boolean;
+    CONTINUE WHEN NOT (col->>'not_null')::boolean AND NOT must_fill;
 
     columns := columns || to_jsonb(name);
     -- A CHECK that lists what it will accept beats anything invented here.
@@ -2414,11 +2491,35 @@ BEGIN
     CONTINUE WHEN labels IS NULL OR jsonb_array_length(labels) < 2;
     lowest := __KN__.lowest_role(labels);
     IF lowest IS NOT NULL THEN
-      RETURN jsonb_build_object('column', col->>'name', 'lowest', lowest);
+      -- Every role not plainly in charge, the lowest first and then upwards:
+      -- the order reads are tried in.
+      RETURN jsonb_build_object('column', col->>'name', 'lowest', lowest, 'ladder',
+        jsonb_build_array(lowest) || coalesce((
+          SELECT jsonb_agg(l ORDER BY pos DESC)
+            FROM jsonb_array_elements_text(labels) WITH ORDINALITY AS e(l, pos)
+           WHERE l <> lowest AND l !~* 'owner|admin|super|root'), '[]'::jsonb));
     END IF;
   END LOOP;
   RETURN NULL;
 END $$;
+
+/*
+ * The columns of a table that look like they hold a secret: a token, a secret
+ * or a key, a password, or the payload a webhook carried. Mirrors
+ * secretColumns in tamper.js. Found on a blind test (HelixOps).
+ */
+CREATE OR REPLACE FUNCTION __KN__.secret_columns(tab jsonb)
+RETURNS jsonb LANGUAGE sql IMMUTABLE AS $$
+  SELECT coalesce(jsonb_agg(c->>'name' ORDER BY pos), '[]'::jsonb)
+    FROM jsonb_array_elements(coalesce(tab->'columns', '[]'::jsonb)) WITH ORDINALITY AS e(c, pos)
+   WHERE (c->>'name') ~* '(^|_)(token|secret|password|passwd|pwd|payload|credentials?|(api|private|access|client|signing|service|encryption|secret|license)_?key|(request|response)_body)(_|$)';
+$$;
+
+/* Whether a role's own name says it may only look. */
+CREATE OR REPLACE FUNCTION __KN__.look_only(role_ text)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+  SELECT role_ ~* 'view' OR role_ ~* 'read' OR role_ ~* 'guest' OR role_ ~* 'observ' OR role_ ~* 'audit';
+$$;
 
 /* Whether a column is a key on its own: one row per person, at most. */
 CREATE OR REPLACE FUNCTION __KN__.alone_unique(tab jsonb, column_name text)
@@ -2461,7 +2562,8 @@ BEGIN
        AND NOT (k->'columns' ? person);
     CONTINUE WHEN jsonb_array_length(keys) = 0 OR __KN__.alone_unique(tab, person);
     found := found || jsonb_build_array(jsonb_build_object(
-      'table', tab, 'person', person, 'role', role_->>'column', 'lowest', role_->>'lowest', 'keys', keys));
+      'table', tab, 'person', person, 'role', role_->>'column', 'lowest', role_->>'lowest',
+      'ladder', role_->'ladder', 'keys', keys));
   END LOOP;
   -- A table named for members first: it is the one a team rule asks.
   SELECT coalesce(jsonb_agg(m ORDER BY (m->'table'->>'name') !~* 'member', at), '[]'::jsonb) INTO found
@@ -2533,20 +2635,27 @@ DECLARE
   shape integer;
   at text;
   theirs jsonb;
+  team jsonb;
   overrides jsonb;
+  joins jsonb;
   key jsonb;
   name text;
   parent text;
-  as_ text;
+  parent_key jsonb;
+  to_team jsonb;
+  pointed jsonb;
   row_ jsonb;
   join_ text;
   refused text;
   owner text;
+  where_ text[];
   not_theirs text;
   target text;
   column_ text;
   finding_key text;
-  move record;
+  read_key text;
+  moves jsonb;
+  move jsonb;
   was bigint;
   now_ bigint;
   before_ jsonb;
@@ -2554,6 +2663,11 @@ DECLARE
   can jsonb;
   changed jsonb;
   stuck text;
+  secrets jsonb;
+  look text;
+  role_ text;
+  tried jsonb;
+  i integer;
 BEGIN
   FOR member IN SELECT * FROM jsonb_array_elements(__KN__.memberships(tables)) LOOP
     SELECT (s->>'attempt')::integer INTO shape
@@ -2571,37 +2685,52 @@ BEGIN
     CONTINUE WHEN theirs IS NULL;
 
     -- Their team, as the first person's own membership names it.
-    overrides := jsonb_build_object(member->>'role', member->>'lowest');
+    team := '{}'::jsonb;
     FOR key IN SELECT * FROM jsonb_array_elements(member->'keys') LOOP
       FOR name IN SELECT jsonb_array_elements_text(key->'columns') LOOP
         IF name <> member->>'person' THEN
-          overrides := jsonb_set(overrides, ARRAY[name], coalesce(theirs->name, 'null'::jsonb));
+          team := jsonb_set(team, ARRAY[name], coalesce(theirs->name, 'null'::jsonb));
         END IF;
       END LOOP;
     END LOOP;
-    parent := member->'keys'->0->>'refTable';
-    as_ := 'as a "' || (member->>'lowest') || '" in ' || (member->'table'->>'name');
+    parent_key := member->'keys'->0;
+    parent := parent_key->>'refTable';
+
+    -- Putting the other person in that team, as each role in turn. Built up
+    -- front, before anybody changes role.
+    joins := '{}'::jsonb;
+    refused := NULL;
+    FOR role_ IN SELECT jsonb_array_elements_text(member->'ladder') LOOP
+      BEGIN
+        overrides := jsonb_set(team, ARRAY[member->>'role'], to_jsonb(role_));
+        row_ := __KN__.row_for(source, member->'table', __KN__.user_b(), '9', overrides, shape);
+        joins := jsonb_set(joins, ARRAY[role_],
+          to_jsonb(__KN__.insert_statement(source, member->'table'->>'name', row_)));
+      EXCEPTION WHEN OTHERS THEN
+        IF role_ = member->>'lowest' THEN refused := SQLERRM; END IF;
+      END;
+    END LOOP;
+    join_ := joins->>(member->>'lowest');
 
     -- Whether they can be put in the team at all, tried once on its own.
-    refused := NULL;
-    BEGIN
-      row_ := __KN__.row_for(source, member->'table', __KN__.user_b(), '9', overrides, shape);
-      join_ := __KN__.insert_statement(source, member->'table'->>'name', row_);
+    IF refused IS NULL THEN
       BEGIN
         EXECUTE join_;
         RAISE EXCEPTION 'kryptheon: undoing the join' USING ERRCODE = 'KN001';
-      EXCEPTION WHEN SQLSTATE 'KN001' THEN
-        NULL;
+      EXCEPTION
+        WHEN SQLSTATE 'KN001' THEN
+          NULL;
+        WHEN OTHERS THEN
+          refused := SQLERRM;
       END;
-    EXCEPTION WHEN OTHERS THEN
-      refused := SQLERRM;
-    END;
+    END IF;
     IF refused IS NOT NULL THEN
       -- Said once, on the table that would not take them.
       blocked := blocked || jsonb_build_array(jsonb_build_object(
         'table', member->'table'->>'name',
         'key', 'role:' || (member->'table'->>'name') || ':' || (member->>'lowest'),
-        'why', as_ || ': I could not add one: ' || refused));
+        'why', 'as a "' || (member->>'lowest') || '" in ' || (member->'table'->>'name') ||
+               ': I could not add one: ' || refused));
       CONTINUE;
     END IF;
 
@@ -2610,54 +2739,141 @@ BEGIN
                                  WHERE s->>'table' = tab->>'name');
       CONTINUE WHEN done ? (tab->>'name');
       done := done || to_jsonb(tab->>'name');
+      SELECT (s->>'attempt')::integer INTO shape
+        FROM jsonb_array_elements(coalesce(seeded, '[]'::jsonb)) s
+       WHERE s->>'table' = tab->>'name';
+      shape := coalesce(shape, 0);
       finding_key := 'role:' || (tab->>'name') || ':' || (member->>'lowest');
       owner := __KN__.owner_column(tab);
-      -- Never their own rows: changing what you made yourself is not a role
-      -- question, and the row that put them in the team is theirs.
-      not_theirs := CASE WHEN owner IS NULL THEN ''
-        ELSE ' WHERE ' || __KN__.always_quote(owner) || ' IS DISTINCT FROM ' || quote_literal(__KN__.user_b()) END;
+
+      -- A table that names the team itself, and the team it is to name.
+      SELECT k INTO to_team
+        FROM jsonb_array_elements(__KN__.foreign_keys(tab) || __KN__.implied_keys(tab, tables))
+             WITH ORDINALITY AS e(k, pos)
+       WHERE k->>'refTable' = parent
+         AND jsonb_array_length(k->'columns') = jsonb_array_length(parent_key->'refColumns')
+       ORDER BY pos LIMIT 1;
+      IF NOT FOUND THEN to_team := NULL; END IF;
+      pointed := '{}'::jsonb;
+      IF to_team IS NOT NULL THEN
+        FOR i IN 0 .. jsonb_array_length(to_team->'columns') - 1 LOOP
+          pointed := jsonb_set(pointed, ARRAY[to_team->'columns'->>i], coalesce(team->(
+            SELECT parent_key->'columns'->>((p.pos - 1)::integer)
+              FROM jsonb_array_elements_text(parent_key->'refColumns') WITH ORDINALITY AS p(c, pos)
+             WHERE p.c = to_team->'refColumns'->>i), 'null'::jsonb));
+        END LOOP;
+      END IF;
+
+      -- Never their own rows, and only the team they joined, where the table
+      -- says which team a row is in.
+      where_ := ARRAY[]::text[];
+      IF owner IS NOT NULL THEN
+        where_ := where_ || (__KN__.always_quote(owner) || ' IS DISTINCT FROM ' || quote_literal(__KN__.user_b()));
+      END IF;
+      FOR name IN SELECT jsonb_object_keys(pointed) ORDER BY 1 LOOP
+        where_ := where_ || (__KN__.always_quote(name) || ' = ' || quote_literal(pointed->>name));
+      END LOOP;
+      not_theirs := CASE WHEN array_length(where_, 1) IS NULL THEN ''
+        ELSE ' WHERE ' || array_to_string(where_, ' AND ') END;
       target := __KN__.always_quote(source) || '.' || __KN__.always_quote(tab->>'name');
       column_ := __KN__.always_quote(__KN__.first_writable(tab));
+      moves := jsonb_build_array(
+        jsonb_build_object('what', 'change',
+          'statement', 'UPDATE ' || target || ' SET ' || column_ || ' = ' || column_ || not_theirs),
+        jsonb_build_object('what', 'delete', 'statement', 'DELETE FROM ' || target || not_theirs));
+
+      -- Adding a row to the team, said only of a role whose own name says it
+      -- may only look, and written under the other person's name: a rule that
+      -- lets a member add a row only as themselves is them speaking for
+      -- themselves.
+      IF __KN__.look_only(member->>'lowest') AND to_team IS NOT NULL THEN
+        BEGIN
+          row_ := __KN__.row_for(source, tab, __KN__.user_a(), '11', pointed, shape);
+          moves := jsonb_build_array(jsonb_build_object('what', 'add',
+            'statement', __KN__.insert_statement(source, tab->>'name', row_))) || moves;
+        EXCEPTION WHEN OTHERS THEN
+          NULL;
+        END;
+      END IF;
+
       can := '[]'::jsonb;
       changed := '{}'::jsonb;
       stuck := NULL;
-      FOR move IN
-        SELECT * FROM (VALUES
-          (1, 'change', 'UPDATE ' || target || ' SET ' || column_ || ' = ' || column_ || not_theirs),
-          (2, 'delete', 'DELETE FROM ' || target || not_theirs)) AS m(n, what, statement)
-        ORDER BY n
-      LOOP
-        before_ := __KN__.try_write('authenticated', __KN__.user_b(), move.statement);
-        after_ := __KN__.try_write_joined('authenticated', __KN__.user_b(), move.statement, join_);
+      FOR move IN SELECT * FROM jsonb_array_elements(moves) LOOP
+        before_ := __KN__.try_write('authenticated', __KN__.user_b(), move->>'statement');
+        after_ := __KN__.try_write_joined('authenticated', __KN__.user_b(), move->>'statement', join_);
         was := __KN__.rows_moved(before_);
         now_ := __KN__.rows_moved(after_);
         IF was IS NULL OR now_ IS NULL THEN
           stuck := CASE WHEN now_ IS NULL THEN after_->>'why' ELSE before_->>'why' END;
         ELSIF now_ > was THEN
-          can := can || to_jsonb(move.what);
-          changed := jsonb_set(changed, ARRAY[move.what], to_jsonb(now_ - was));
+          can := can || to_jsonb(move->>'what');
+          changed := jsonb_set(changed, ARRAY[move->>'what'], to_jsonb(now_ - was));
         END IF;
       END LOOP;
 
       IF jsonb_array_length(can) = 0 AND stuck IS NOT NULL THEN
         blocked := blocked || jsonb_build_array(jsonb_build_object(
-          'table', tab->>'name', 'key', finding_key, 'why', as_ || ': ' || stuck));
-        CONTINUE;
+          'table', tab->>'name', 'key', finding_key,
+          'why', 'as a "' || (member->>'lowest') || '" in ' || (member->'table'->>'name') || ': ' || stuck));
+      ELSE
+        completed := completed || to_jsonb(finding_key);
+        IF jsonb_array_length(can) > 0 THEN
+          findings := findings || jsonb_build_array(jsonb_build_object(
+            'kind', 'role',
+            'table', tab->>'name',
+            'who', member->>'lowest',
+            'via', member->'table'->>'name',
+            'roleColumn', member->>'role',
+            'parent', parent,
+            'can', can,
+            'changed', changed,
+            'columns', coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c), '[]'::jsonb),
+            'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+        END IF;
       END IF;
-      completed := completed || to_jsonb(finding_key);
-      IF jsonb_array_length(can) > 0 THEN
-        findings := findings || jsonb_build_array(jsonb_build_object(
-          'kind', 'role',
-          'table', tab->>'name',
-          'who', member->>'lowest',
-          'via', member->'table'->>'name',
-          'roleColumn', member->>'role',
-          'parent', parent,
-          'can', can,
-          'changed', changed,
-          'columns', coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c), '[]'::jsonb),
-          'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
-      END IF;
+
+      -- Reading what a member should not see, said only of a table holding a
+      -- secret. Every role not in charge, from the lowest up; the first that
+      -- can read is the one named.
+      secrets := __KN__.secret_columns(tab);
+      CONTINUE WHEN jsonb_array_length(secrets) = 0;
+      look := 'SELECT 1 FROM ' || target || not_theirs;
+      was := __KN__.rows_moved(__KN__.try_write('authenticated', __KN__.user_b(), look));
+      tried := '[]'::jsonb;
+      FOR role_ IN SELECT jsonb_array_elements_text(member->'ladder') LOOP
+        read_key := 'teamread:' || (tab->>'name') || ':' || role_;
+        IF joins ? role_ THEN
+          after_ := __KN__.try_write_joined('authenticated', __KN__.user_b(), look, joins->>role_);
+        ELSE
+          after_ := jsonb_build_object('ok', false, 'count', 0, 'why', 'I could not add one');
+        END IF;
+        now_ := __KN__.rows_moved(after_);
+        IF was IS NULL OR now_ IS NULL THEN
+          blocked := blocked || jsonb_build_array(jsonb_build_object(
+            'table', tab->>'name', 'key', read_key,
+            'why', 'as a "' || role_ || '" in ' || (member->'table'->>'name') || ': ' ||
+                   CASE WHEN now_ IS NULL THEN after_->>'why' ELSE 'reading it failed before joining' END));
+          EXIT;
+        END IF;
+        completed := completed || to_jsonb(read_key);
+        IF now_ > was THEN
+          findings := findings || jsonb_build_array(jsonb_build_object(
+            'kind', 'teamread',
+            'table', tab->>'name',
+            'who', role_,
+            'via', member->'table'->>'name',
+            'roleColumn', member->>'role',
+            'parent', parent,
+            'readable', now_ - was,
+            'secrets', secrets,
+            'below', tried,
+            'columns', coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c), '[]'::jsonb),
+            'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+          EXIT;
+        END IF;
+        tried := tried || to_jsonb(role_);
+      END LOOP;
     END LOOP;
   END LOOP;
 

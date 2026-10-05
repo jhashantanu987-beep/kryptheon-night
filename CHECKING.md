@@ -125,7 +125,11 @@ believed never again.
 finding disappears from the second run for several reasons and only one of them
 is good news: the table was secured, or it became impossible to test, or it was
 dropped outright. In all three it is gone from the list, and in only one has
-anybody been made safe.
+anybody been made safe. And an earlier run on another database - the
+repository's, then production's, from the same folder (HelixOps) - is said to
+be a comparison of two databases, with how their tables differ, never as a fix
+or as something a fix opened, and never earns a badge. cli.check.js proves the
+same through the real command and its exit code.
 
 **untouched.check.js** - the promise. It photographs functions, privileges,
 tables, columns, policies, row level security flags, roles, sequences and the
@@ -212,11 +216,13 @@ killed process made it fail, and keep failing, blaming a run that had
 behaved perfectly. It now asks about the engines that run installed, by
 name - the same rule as everything else here: know your own litter.
 
-**shapes.check.js** - twenty-eight small apps, each built around a shape real
+**shapes.check.js** - thirty-three small apps, each down both engines, each built around a shape real
 projects have and no fixture did: an enum, a `text[]`, a generated column, a
 domain type, a composite key, a table that is only an id, a view that
 mentions an enum, a CHECK on a varchar column, a CHECK whose values have
-commas in them. Skipped counts as a
+commas in them, exactly one of two parents set (HelixOps' documents, as a
+sum of IS NOT NULL and as num_nonnulls), and a sum that asks for both. Skipped
+counts as a
 failure here on purpose.
 
 **verdicts.check.js** - seventeen apps that each declare the honest answer up
@@ -257,8 +263,16 @@ joining added counts, so an open table, a person's own rows and a rule that
 checks the role stay quiet. Reported as something to check, never a break.
 An invitation is not a members table, a one-team profile is not attacked, a
 team that will not take a viewer is said to be untested, and every write and
-the joining are undone. Both engines, the nightly run and the re-check. Thirty
-mutations, each caught.
+the joining are undone. Both engines, the nightly run and the re-check.
+
+Round 9 (HelixOps) added what a member can read and add. A table holding a
+token, key, secret, password or payload is read as every role not in charge,
+from the lowest up, and the first that can read it is named - a "dispatcher"
+reading API client keys, a "viewer" reading integration tokens or webhook
+payloads. A role whose name says it only looks ("viewer") adding a row to the
+team, written under someone else's name, is reported too; a member adding a
+note as themselves is not. Where a table names its team, writes and reads stay
+inside the team joined. Forty-nine mutations across both rounds, each caught.
 
 **buckets.check.js** - a Supabase Storage bucket switched to public, with a
 read rule saying only some people may have its files: probably meant to be

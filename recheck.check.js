@@ -442,6 +442,77 @@ const cases = [
       return problems;
     },
   },
+  {
+    // Found on a blind test (HelixOps): the repository's database, then the
+    // production one, from the same folder - and six differences were called
+    // "NEW problems", with "A fix can open something else".
+    name: 'an earlier run on another database is said to be a comparison, never a fix or a break',
+    run: () => {
+      const problems = [];
+      const where = (database, tables) => ({ database: database, host: '10.0.0.1', port: 5432, schema: 'public', tables: tables });
+      const repo = Object.assign({}, BEFORE, { findings: [CUSTOMERS], where: where('repo_db', ['customers', 'orders', 'profiles']) });
+      const live = after({ findings: [ORDERS], checked: ['customers', 'orders', 'profiles', 'tokens'] });
+      live.where = where('live_db', ['customers', 'orders', 'profiles', 'tokens']);
+      const r = recheck.compare(repo, live);
+      const said = recheck.describe(r).join('\n');
+      if (!r.elsewhere || !r.elsewhere.otherDatabase) problems.push('two databases were not told apart: ' + JSON.stringify(r.elsewhere));
+      if (r.allClear) problems.push('a comparison of two databases was called all clear');
+      if (!/This is not a re-check of the same database\./.test(said)) problems.push('it never says so: ' + said);
+      if (said.replace(/\s+/g, ' ').indexOf('was on "repo_db" on 10.0.0.1:5432, and this one is on "live_db" on 10.0.0.1:5432') < 0) {
+        problems.push('it does not name both databases: ' + said);
+      }
+      if (!/1 table only in this one \(tokens\)/.test(said.replace(/\s+/g, ' '))) problems.push('it does not say how the tables differ: ' + said);
+      if (/A fix can open something else|NEW problem|fixed:/.test(said)) problems.push('it still talks about a fix: ' + said);
+      if (!/1 found here and not in the earlier run:/.test(said)) problems.push('the new one is not said as a difference: ' + said);
+      if (!/1 found in the earlier run and not here:/.test(said)) problems.push('the missing one is not said as a difference: ' + said);
+      if (!/differences between the two databases, not something a fix/.test(said.replace(/\s+/g, ' '))) problems.push(said);
+      // Everything else clean and nothing untested: still no badge between two databases.
+      const clean = recheck.compare(Object.assign({}, repo, { findings: [] }), Object.assign({}, live, { findings: [] }));
+      if (clean.allClear || recheck.badgeLines(clean, 6).length) problems.push('a badge was given for two different databases');
+      return problems;
+    },
+  },
+  {
+    name: 'the same database again is a re-check, worded as one',
+    run: () => {
+      const problems = [];
+      const where = { database: 'app', host: null, port: null, schema: 'public', tables: ['customers', 'orders', 'profiles'] };
+      const first = Object.assign({}, BEFORE, { findings: [CUSTOMERS], where: where });
+      const second = Object.assign(after({ findings: [CUSTOMERS, ORDERS] }), { where: where });
+      const r = recheck.compare(first, second);
+      const said = recheck.describe(r).join('\n');
+      if (r.elsewhere) problems.push('the same database was called another: ' + JSON.stringify(r.elsewhere));
+      if (!/1 NEW problem that were not there before:/.test(said) || !/A fix can open something else/.test(said)) problems.push(said);
+      if (/not a re-check of the same database/.test(said)) problems.push('it doubted the same database');
+      // Another schema in the same database is another app.
+      const other = recheck.compare(first, Object.assign(after({ findings: [] }), { where: Object.assign({}, where, { schema: 'staging' }) }));
+      if (!other.elsewhere) problems.push('another schema was taken for the same app');
+      else if (recheck.describe(other).join('\n').indexOf(', schema "staging"') < 0) problems.push('the other schema is not named');
+      return problems;
+    },
+  },
+  {
+    // A run saved before runs said where they were: judged by its tables.
+    name: 'an earlier run that does not say where it was is judged by the tables it attacked',
+    run: () => {
+      const problems = [];
+      const old = Object.assign({}, BEFORE, { findings: [CUSTOMERS] });
+      const elsewhere = after({ checked: ['invoices', 'ledgers', 'payouts', 'customers'] });
+      elsewhere.where = { database: 'x', host: null, port: null, schema: 'public', tables: ['invoices', 'ledgers', 'payouts', 'customers'] };
+      const r = recheck.compare(old, elsewhere);
+      if (!r.elsewhere || !r.elsewhere.otherShape || r.elsewhere.otherDatabase) problems.push('a mostly different set of tables: ' + JSON.stringify(r.elsewhere));
+      else if (!/looked at a very different set of tables/.test(recheck.describe(r).join(' ').replace(/\s+/g, ' '))) problems.push(recheck.describe(r).join('\n'));
+      // The same tables, one added: an ordinary re-check.
+      const near = after({ checked: ['customers', 'orders', 'profiles', 'notes'] });
+      near.where = { database: 'x', host: null, port: null, schema: 'public', tables: [] };
+      if (recheck.compare(old, near).elsewhere) problems.push('one new table made it another database');
+      // A function or a bucket is not a table of the app.
+      const fns = after({ checked: ['customers', 'orders', 'profiles'] });
+      fns.attempted = fns.attempted.concat(['privileged:a', 'privileged:b', 'privileged:c', 'privileged:d', 'bucket:e', 'bucket:f']);
+      if (recheck.compare(old, fns).elsewhere) problems.push('functions and buckets were counted as tables');
+      return problems;
+    },
+  },
 ];
 
 let failures = 0;

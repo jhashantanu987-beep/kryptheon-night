@@ -416,8 +416,21 @@ async function scan(client, sourceSchema, options) {
     // copy, the way seeding did.
     const tagged = taggerFor(plan, theirs);
 
+    // Where this run was, so a re-check can tell a database it saw before from
+    // another one entirely (recheck.elsewhereOf). The name and address only.
+    const at = (await client.query(
+      'SELECT current_database() AS database, host(inet_server_addr()) AS host, inet_server_port() AS port',
+    )).rows[0];
+
     return {
       stopped: null,
+      where: {
+        database: at.database,
+        host: at.host || null,
+        port: at.port || null,
+        schema: sourceSchema,
+        tables: plan.tables.map((table) => table.name).sort(),
+      },
       attacksRun: attempted.length,
       notChecked: notChecked,
       attempted: attempted,
@@ -786,8 +799,8 @@ function report(result) {
   if (toVerify.length) {
     // A viewer who can edit was really tried; a function or a bucket was only
     // read. Either way it is the owner's call, and the line says which.
-    const tried = toVerify.some((f) => f.kind === 'role');
-    const spotted = toVerify.some((f) => f.kind !== 'role');
+    const tried = toVerify.some((f) => f.kind === 'role' || f.kind === 'teamread');
+    const spotted = toVerify.some((f) => f.kind !== 'role' && f.kind !== 'teamread');
     const it = toVerify.length === 1 ? 'it' : 'them';
     line('  ' + toVerify.length + ' thing' + (toVerify.length === 1 ? '' : 's') + ' to check - ' +
       (spotted && !tried ? 'I did not attack ' + it + ', only spotted the risk.'
@@ -912,7 +925,9 @@ async function main() {
     if (result.findings.length) report(result);
     else notTestedLines(result).forEach(line);
     saveRun(file, result);
-    process.exitCode = result.stopped ? 2 : verdict.allClear ? 0 : 1;
+    // Two different databases: the verdict is a comparison, so the exit code
+    // is this run's own answer, the same as a first run.
+    process.exitCode = result.stopped ? 2 : verdict.elsewhere ? exitCodeFor(result) : verdict.allClear ? 0 : 1;
   } finally {
     await client.end();
   }

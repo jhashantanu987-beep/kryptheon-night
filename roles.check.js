@@ -31,6 +31,8 @@ const APP = 'kn_roles_' + STAMP;
 const LISTED = 'kn_rolesck_' + STAMP;
 const SINGLE = 'kn_rolesone_' + STAMP;
 const FULL = 'kn_rolesno_' + STAMP;
+// A team whose lowest role is a plain "member": it may add rows.
+const CREW = 'kn_rolesmem_' + STAMP;
 const WHO = "nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid";
 
 const results = [];
@@ -52,13 +54,19 @@ const at = (app) => (name) => schema.quote(app) + '.' + schema.quote(name);
  *   members        a person may update their own row            -> not reported
  *   access_grants  roles nobody's rule reads, named before members
  *   invites        created_by and a role: an invitation, not a member
+ *   vault          a secret every member can read                -> reported (read, viewer)
+ *   api_keys       a key members and up can read                  -> reported (read, member)
+ *   signing_keys   a key only owner and admin can read            -> not reported
+ *   comments       any member may add one, but only as themselves -> not reported
+ *   projects       owner/admin write; the other team's own rows are
+ *                  pointed at by its milestones                  -> tried, not stuck
  */
 async function buildApp(client) {
   const q = at(APP);
   const s = schema.quote(APP);
   await client.query('CREATE SCHEMA ' + s);
   await client.query('GRANT USAGE ON SCHEMA ' + s + ' TO anon, authenticated');
-  await client.query('CREATE TYPE ' + s + ".member_role AS ENUM ('owner', 'admin', 'member', 'viewer')");
+  await client.query('CREATE TYPE ' + s + ".member_role AS ENUM ('owner', 'admin', 'editor', 'member', 'viewer')");
   await client.query('CREATE TABLE ' + q('workspaces') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL)');
   await client.query('CREATE TABLE ' + q('access_grants') + ' (workspace_id uuid NOT NULL REFERENCES ' + q('workspaces') + '(id),' +
     ' user_id uuid NOT NULL, role ' + s + '.member_role NOT NULL, PRIMARY KEY (workspace_id, user_id))');
@@ -66,7 +74,7 @@ async function buildApp(client) {
     ' user_id uuid NOT NULL, role ' + s + '.member_role NOT NULL, PRIMARY KEY (workspace_id, user_id))');
   await client.query('CREATE TABLE ' + q('invites') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
     ' REFERENCES ' + q('workspaces') + '(id), created_by uuid NOT NULL, role ' + s + '.member_role NOT NULL)');
-  for (const t of ['customers', 'tickets', 'invoices', 'open_board', 'reports', 'squads']) {
+  for (const t of ['customers', 'tickets', 'invoices', 'open_board', 'reports', 'squads', 'projects']) {
     await client.query('CREATE TABLE ' + q(t) + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
       ' REFERENCES ' + q('workspaces') + '(id), label text NOT NULL)');
   }
@@ -76,6 +84,17 @@ async function buildApp(client) {
     ' REFERENCES ' + q('workspaces') + '(id), user_id uuid NOT NULL, body text NOT NULL)');
   await client.query('CREATE TABLE ' + q('squad_members') + ' (squad_id uuid NOT NULL REFERENCES ' + q('squads') + '(id),' +
     ' user_id uuid NOT NULL, PRIMARY KEY (squad_id, user_id))');
+  // A share link anyone signed in can already read: not a role question.
+  await client.query('ALTER TABLE ' + q('open_board') + ' ADD COLUMN share_token text');
+  for (const [t, secret] of [['vault', 'secret'], ['api_keys', 'api_key'], ['signing_keys', 'signing_key']]) {
+    await client.query('CREATE TABLE ' + q(t) + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
+      ' REFERENCES ' + q('workspaces') + '(id), label text NOT NULL, ' + secret + ' text NOT NULL)');
+  }
+  await client.query('CREATE TABLE ' + q('comments') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
+    ' REFERENCES ' + q('workspaces') + '(id), author_id uuid NOT NULL, body text NOT NULL)');
+  await client.query('CREATE TABLE ' + q('milestones') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
+    ' REFERENCES ' + q('workspaces') + '(id), project_id uuid NOT NULL REFERENCES ' + q('projects') + '(id), created_by uuid NOT NULL,' +
+    ' label text NOT NULL)');
 
   // The helpers as an app that works writes them: definer, so the members
   // table is read without its own rule asking again.
@@ -88,7 +107,7 @@ async function buildApp(client) {
   const staff = (col, roles) => q('has_role') + '(' + col + ", '{" + roles + "}'::" + s + '.member_role[])';
 
   const tables = ['workspaces', 'access_grants', 'members', 'invites', 'customers', 'tickets', 'invoices', 'open_board',
-    'reports', 'squads', 'deals', 'notes', 'squad_members'];
+    'reports', 'squads', 'deals', 'notes', 'squad_members', 'vault', 'api_keys', 'signing_keys', 'comments', 'projects', 'milestones'];
   for (const t of tables) {
     await client.query('GRANT SELECT, INSERT, UPDATE, DELETE ON ' + q(t) + ' TO authenticated');
     await client.query('ALTER TABLE ' + q(t) + ' ENABLE ROW LEVEL SECURITY');
@@ -117,6 +136,14 @@ async function buildApp(client) {
   await policy('notes', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
   await policy('notes', 'own', 'FOR UPDATE TO authenticated USING (user_id = ' + WHO + ')');
   await policy('notes', 'own_delete', 'FOR DELETE TO authenticated USING (user_id = ' + WHO + ')');
+  await policy('vault', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
+  await policy('api_keys', 'reads', 'FOR SELECT TO authenticated USING (' + staff('workspace_id', 'owner,admin,editor,member') + ')');
+  await policy('signing_keys', 'reads', 'FOR SELECT TO authenticated USING (' + staff('workspace_id', 'owner,admin') + ')');
+  await policy('comments', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
+  await policy('comments', 'own_add', 'FOR INSERT TO authenticated WITH CHECK (' + member('workspace_id') + ' AND author_id = ' + WHO + ')');
+  await policy('projects', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
+  await policy('projects', 'staff', 'FOR ALL TO authenticated USING (' + staff('workspace_id', 'owner,admin') + ')');
+  await policy('milestones', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
   await policy('squad_members', 'squad_member_manage', 'FOR ALL TO authenticated USING (EXISTS (SELECT 1 FROM ' + q('squads') +
     ' t WHERE t.id = squad_id AND ' + member('t.workspace_id') + '))');
 }
@@ -174,6 +201,27 @@ async function buildFull(client) {
   }
 }
 
+/** A crew whose roles are owner, admin and member: the lowest may add. */
+async function buildCrew(client) {
+  const q = at(CREW);
+  await client.query('CREATE SCHEMA ' + schema.quote(CREW));
+  await client.query('GRANT USAGE ON SCHEMA ' + schema.quote(CREW) + ' TO anon, authenticated');
+  await client.query('CREATE TABLE ' + q('orgs') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL)');
+  await client.query('CREATE TABLE ' + q('crew') + ' (org_id uuid NOT NULL REFERENCES ' + q('orgs') + '(id), user_id uuid NOT NULL,' +
+    " role text NOT NULL CHECK (role IN ('owner', 'admin', 'member')), PRIMARY KEY (org_id, user_id))");
+  await client.query('CREATE TABLE ' + q('tasks') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), org_id uuid NOT NULL REFERENCES ' +
+    q('orgs') + '(id), title text NOT NULL)');
+  await client.query('CREATE FUNCTION ' + q('in_crew') + '(p uuid) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER AS ' +
+    '$$ SELECT EXISTS (SELECT 1 FROM ' + q('crew') + ' WHERE org_id = p AND user_id = ' + WHO + ') $$');
+  for (const t of ['orgs', 'crew', 'tasks']) {
+    await client.query('GRANT SELECT, INSERT, UPDATE, DELETE ON ' + q(t) + ' TO authenticated');
+    await client.query('ALTER TABLE ' + q(t) + ' ENABLE ROW LEVEL SECURITY');
+  }
+  await client.query('CREATE POLICY reads ON ' + q('crew') + ' FOR SELECT TO authenticated USING (user_id = ' + WHO + ')');
+  await client.query('CREATE POLICY anything ON ' + q('tasks') + ' FOR ALL TO authenticated USING (' + q('in_crew') + '(org_id))' +
+    ' WITH CHECK (' + q('in_crew') + '(org_id))');
+}
+
 /** Every row of every table in a schema, so "nothing changed" can be checked. */
 async function contentsOf(client, where) {
   const { rows } = await client.query(
@@ -218,8 +266,10 @@ async function ranked(client, app, engine) {
 }
 
 const told = (r) => ({
-  findings: (r.findings || []).map((f) => f.table + '/' + f.who + '/' + f.via + '.' + f.roleColumn + '/' + f.parent + '/' +
-    [...(f.can || [])].sort().join('+') + '/' + JSON.stringify(f.changed)).sort(),
+  findings: (r.findings || []).map((f) => f.kind + ':' + f.table + '/' + f.who + '/' + f.via + '.' + f.roleColumn + '/' + f.parent + '/' +
+    (f.kind === 'teamread'
+      ? 'read ' + f.readable + ' below ' + JSON.stringify(f.below) + ' ' + JSON.stringify(f.secrets)
+      : [...(f.can || [])].sort().join('+') + '/' + JSON.stringify(f.changed))).sort(),
   completed: [...(r.completed || [])].sort(),
   blocked: (r.blocked || []).map((b) => b.key + ' ' + String(b.why).split(':').slice(0, 2).join(':')).sort(),
 });
@@ -245,6 +295,7 @@ async function main() {
     await buildListed(client);
     await buildSingle(client);
     await buildFull(client);
+    await buildCrew(client);
 
     // ------------------------------------------------ what it decides
     const LABELS = [
@@ -257,14 +308,15 @@ async function main() {
     ];
     const WANT = ['viewer', 'viewer', 'auditor', 'member', null, 'Read_Only'];
     const plans = {};
-    for (const app of [APP, LISTED, SINGLE, FULL]) plans[app] = await schema.readSchema(client, app);
+    for (const app of [APP, LISTED, SINGLE, FULL, CREW]) plans[app] = await schema.readSchema(client, app);
     const nodeSays = {
       lowest: LABELS.map((labels) => tamper.lowestRole(labels)),
       memberships: {},
     };
     for (const app of Object.keys(plans)) {
       nodeSays.memberships[app] = tamper.memberships(plans[app].tables).map((m) =>
-        m.table.name + ':' + m.person + ':' + m.role + ':' + m.lowest + ':' + m.keys.map((k) => k.refTable).join('+'));
+        m.table.name + ':' + m.person + ':' + m.role + ':' + m.lowest + ':' + m.keys.map((k) => k.refTable).join('+') + ':' +
+          m.ladder.join('>'));
     }
     const sqlSays = { lowest: [], memberships: {} };
     await sqlengine.withEngine(client, async (target) => {
@@ -276,7 +328,8 @@ async function main() {
         const { rows } = await client.query('SELECT ' + schema.quote(target) + '.memberships($1::jsonb) AS answer',
           [JSON.stringify(plans[app].tables)]);
         sqlSays.memberships[app] = rows[0].answer.map((m) =>
-          m.table.name + ':' + m.person + ':' + m.role + ':' + m.lowest + ':' + m.keys.map((k) => k.refTable).join('+'));
+          m.table.name + ':' + m.person + ':' + m.role + ':' + m.lowest + ':' + m.keys.map((k) => k.refTable).join('+') + ':' +
+          m.ladder.join('>'));
       }
     });
 
@@ -288,13 +341,14 @@ async function main() {
       return p;
     })());
 
-    check('the members table is found by its role, never an invitation or a one-team profile, in both engines', (() => {
+    check('the members table is found by its role, with its roles from the lowest up, never an invitation or a one-team profile, in both engines', (() => {
       const p = [];
       const want = {};
-      want[APP] = ['members:user_id:role:viewer:workspaces', 'access_grants:user_id:role:viewer:workspaces'];
-      want[LISTED] = ['org_users:user_id:role:viewer:orgs'];
+      want[APP] = ['members:user_id:role:viewer:workspaces:viewer>member>editor', 'access_grants:user_id:role:viewer:workspaces:viewer>member>editor'];
+      want[LISTED] = ['org_users:user_id:role:viewer:orgs:viewer>editor'];
       want[SINGLE] = [];
-      want[FULL] = ['members:user_id:role:viewer:teams'];
+      want[FULL] = ['members:user_id:role:viewer:teams:viewer'];
+      want[CREW] = ['crew:user_id:role:member:orgs:member'];
       for (const [who, says] of [['node', nodeSays], ['sql', sqlSays]]) {
         for (const app of Object.keys(want)) {
           if (JSON.stringify(says.memberships[app]) !== JSON.stringify(want[app])) {
@@ -308,13 +362,15 @@ async function main() {
     // ------------------------------------------------ what it finds
     const node = await ranked(client, APP, 'node');
     const sql = await ranked(client, APP, 'sql');
-    check('a viewer who can change customers, tickets and squad members is found - and nothing else', (() => {
+    check('a viewer who can add or change customers, change tickets and squad members, and read the vault is found, and a member who can read api keys - nothing else', (() => {
       const p = [];
       const want = [
-        'customers/viewer/members.role/workspaces/change/{"change":1}',
-        'squad_members/viewer/members.role/workspaces/change+delete/{"change":1,"delete":1}',
-        'tickets/viewer/members.role/workspaces/change/{"change":1}',
-      ];
+        'role:customers/viewer/members.role/workspaces/add+change/{"add":1,"change":1}',
+        'role:squad_members/viewer/members.role/workspaces/change+delete/{"change":1,"delete":1}',
+        'role:tickets/viewer/members.role/workspaces/change/{"change":1}',
+        'teamread:api_keys/member/members.role/workspaces/read 1 below ["viewer"] ["api_key"]',
+        'teamread:vault/viewer/members.role/workspaces/read 1 below [] ["secret"]',
+      ].sort();
       for (const [who, r] of [['node', node], ['sql', sql]]) {
         const said = told(r.answer);
         if (JSON.stringify(said.findings) !== JSON.stringify(want)) p.push(who + ' found ' + JSON.stringify(said.findings));
@@ -326,9 +382,16 @@ async function main() {
     check('every team table was tried, so a rule that checks the role is a pass and not a gap', (() => {
       const p = [];
       for (const [who, r] of [['node', node], ['sql', sql]]) {
-        for (const table of ['invoices', 'notes', 'open_board', 'members', 'workspaces', 'reports', 'invites', 'deals']) {
+        for (const table of ['invoices', 'notes', 'open_board', 'members', 'workspaces', 'reports', 'invites', 'deals',
+          'comments', 'projects', 'milestones', 'signing_keys']) {
           if (!(r.answer.completed || []).includes('role:' + table + ':viewer')) p.push(who + ': ' + table + ' never tried');
         }
+        // A secret only owner and admin read was asked of every lower role.
+        for (const role of ['viewer', 'member']) {
+          if (!(r.answer.completed || []).includes('teamread:signing_keys:' + role)) p.push(who + ': signing_keys never read as ' + role);
+        }
+        // An ordinary table is never read as a role question.
+        if ((r.answer.completed || []).some((k) => /^teamread:(reports|customers|tickets):/.test(k))) p.push(who + ': read an ordinary table');
       }
       return p;
     })());
@@ -352,7 +415,20 @@ async function main() {
       const p = [];
       for (const [who, r] of [['node', listedNode], ['sql', listedSql]]) {
         const said = told(r.answer).findings;
-        if (JSON.stringify(said) !== JSON.stringify(['docs/viewer/org_users.role/orgs/change+delete/{"change":1,"delete":1}'])) {
+        if (JSON.stringify(said) !== JSON.stringify(['role:docs/viewer/org_users.role/orgs/add+change+delete/{"add":1,"change":1,"delete":1}'])) {
+          p.push(who + ' found ' + JSON.stringify(said));
+        }
+      }
+      return p;
+    })());
+
+    const crewNode = await ranked(client, CREW, 'node');
+    const crewSql = await ranked(client, CREW, 'sql');
+    check('a plain "member" changing a task is found, but adding one is not counted against them', (() => {
+      const p = [];
+      for (const [who, r] of [['node', crewNode], ['sql', crewSql]]) {
+        const said = told(r.answer).findings;
+        if (JSON.stringify(said) !== JSON.stringify(['role:tasks/member/crew.role/orgs/change+delete/{"change":1,"delete":1}'])) {
           p.push(who + ' found ' + JSON.stringify(said));
         }
       }
@@ -379,20 +455,26 @@ async function main() {
       const p = [];
       for (const [engine, result] of scans) {
         if (result.stopped) { p.push(engine + ' stopped: ' + result.stopped); continue; }
-        const roles = result.findings.filter((f) => f.kind === 'role');
-        const names = roles.map((f) => f.table).sort().join(',');
-        if (names !== 'customers,squad_members,tickets') p.push(engine + ' reported ' + names);
+        const roles = result.findings.filter((f) => f.kind === 'role' || f.kind === 'teamread');
+        const names = roles.map((f) => f.kind + ':' + f.table).sort().join(',');
+        if (names !== 'role:customers,role:squad_members,role:tickets,teamread:api_keys,teamread:vault') p.push(engine + ' reported ' + names);
         for (const f of roles) {
           if (f.status !== 'verification required') p.push(engine + ' ' + f.table + ' is ' + f.status);
           if (f.severity !== 'HIGH') p.push(engine + ' ' + f.table + ' is ' + f.severity);
-          if (!/undone straight away/.test(f.body)) p.push(engine + ' ' + f.table + ' never says it was undone');
+          const settled = f.kind === 'teamread' ? /Nothing was changed\./ : /undone straight away/;
+          if (!settled.test(f.body)) p.push(engine + ' ' + f.table + ' never says it was undone or untouched');
           if (!/please check it rather than assume it/.test(f.fixPrompt.replace(/\s+/g, ' '))) p.push(engine + ' ' + f.table + ' prompt claims a break');
-          if (!/"members"\."role" is "viewer"/.test(f.fixPrompt.replace(/\s+/g, ' '))) p.push(engine + ' ' + f.table + ' prompt: ' + f.fixPrompt);
+          if (f.fixPrompt.replace(/\s+/g, ' ').indexOf('"members"."role" is "' + f.who + '"') < 0) p.push(engine + ' ' + f.table + ' prompt: ' + f.fixPrompt);
         }
         const customers = roles.find((f) => f.table === 'customers');
-        if (customers && customers.headline !== 'A "viewer" in a workspace can change rows in your customers table.') {
+        if (customers && customers.headline !== 'A "viewer" in a workspace can change rows in and add rows to your customers table.') {
           p.push(engine + ': ' + customers.headline);
         }
+        const keys = roles.find((f) => f.table === 'api_keys');
+        if (keys && keys.headline !== 'A "member" in a workspace can read your api_keys table, which holds api_key.') {
+          p.push(engine + ': ' + keys.headline);
+        }
+        if (keys && !/As "viewer" they could not read it either\. Nothing was changed\./.test(keys.body)) p.push(engine + ': ' + keys.body);
         const squad = roles.find((f) => f.table === 'squad_members');
         if (squad && squad.headline !== 'A "viewer" in a workspace can delete rows from and change rows in your squad_members table.') {
           p.push(engine + ': ' + squad.headline);
@@ -452,26 +534,27 @@ async function main() {
     check('the nightly run inside the database finds them too', (() => {
       if (!night) return ['no run was written'];
       if (night.stopped) return ['stopped: ' + night.stopped];
-      const roles = (night.findings || []).filter((f) => f.kind === 'role').map((f) => f.table).sort().join(',');
-      return roles === 'customers,squad_members,tickets' ? [] : ['found ' + roles];
+      const roles = (night.findings || []).filter((f) => f.kind === 'role' || f.kind === 'teamread').map((f) => f.kind + ':' + f.table).sort().join(',');
+      return roles === 'role:customers,role:squad_members,role:tickets,teamread:api_keys,teamread:vault' ? [] : ['found ' + roles];
     })());
 
     // ------------------------------------------------ the re-check
     const before = scans[0][1];
     await client.query('DROP POLICY tickets_member ON ' + at(APP)('tickets'));
+    await client.query('DROP POLICY reads ON ' + at(APP)('vault'));
     const after = await scanner.scan(client, APP, { quiet: true });
-    check('a viewer rule tightened is called fixed by the re-check, and the others still open', (() => {
+    check('a viewer rule and a secret read tightened are called fixed by the re-check, and the others still open', (() => {
       const verdict = recheck.compare(before, after);
       const p = [];
       const fixed = verdict.fixed.map(recheck.keyOf);
       const open = verdict.stillOpen.map(recheck.keyOf);
-      if (!fixed.includes('role:tickets:viewer')) p.push('fixed ' + JSON.stringify(fixed));
+      if (!fixed.includes('role:tickets:viewer') || !fixed.includes('teamread:vault:viewer')) p.push('fixed ' + JSON.stringify(fixed));
       if (!open.includes('role:customers:viewer')) p.push('still open ' + JSON.stringify(open));
       if (verdict.unverifiable.length) p.push('unverifiable ' + JSON.stringify(verdict.unverifiable.map(recheck.keyOf)));
       return p;
     })());
   } finally {
-    for (const app of [APP, LISTED, SINGLE, FULL]) {
+    for (const app of [APP, LISTED, SINGLE, FULL, CREW]) {
       await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(app) + ' CASCADE').catch(() => {});
     }
     await client.end().catch(() => {});

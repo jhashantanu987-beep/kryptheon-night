@@ -16,6 +16,7 @@ const fixture = require('./fixture.js');
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 const STAMP = Date.now().toString(36);
 const APP = 'kn_cli_' + STAMP;
+const OTHER = 'kn_cliother_' + STAMP;
 const q = (name) => schema.quote(name);
 const BIN = path.join(__dirname, 'bin', 'kryptheon-night.js');
 
@@ -28,8 +29,8 @@ const check = (name, problems) => results.push({ name, problems });
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'kn-cli-'));
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'kryptheon-home-'));
 
-function run() {
-  const r = spawnSync(process.execPath, [BIN, '--yes', '--schema', APP], {
+function run(which) {
+  const r = spawnSync(process.execPath, [BIN, '--yes', '--schema', which || APP], {
     cwd: WORK,
     encoding: 'utf8',
     timeout: 300000,
@@ -112,7 +113,50 @@ async function main() {
       if (problems.length) problems.push('output:\n' + second.out.slice(-1500));
       return problems;
     })());
+
+    // Then another app from the same folder. Found on a blind test
+    // (HelixOps): the repository's database, then production's, and the
+    // differences came back as "NEW problems" a fix had opened.
+    await client.query('CREATE SCHEMA ' + q(OTHER));
+    await fixture.ensureRoles(client, OTHER, q);
+    await client.query('CREATE TABLE ' + q(OTHER) + '.ledger (id serial PRIMARY KEY, memo text)');
+    await client.query('ALTER TABLE ' + q(OTHER) + '.ledger ENABLE ROW LEVEL SECURITY');
+    await client.query(
+      'CREATE FUNCTION ' + q(OTHER) + '.tally() RETURNS bigint LANGUAGE sql SECURITY DEFINER ' +
+        'SET search_path = pg_catalog AS $$ SELECT count(*) FROM ' + q(OTHER) + '.ledger $$',
+    );
+    await client.query('GRANT EXECUTE ON FUNCTION ' + q(OTHER) + '.tally() TO anon');
+    const third = run(OTHER);
+    check('3. a run on another app from the same folder is said to be a comparison, and exits on its own answer', (() => {
+      const problems = [];
+      if (third.code !== 0) problems.push('exit ' + third.code + ' - a thing to check alone is not "something got through"');
+      if (!/This is not a re-check of the same database\./.test(third.out)) problems.push('it never says it is another database');
+      if (/A fix can open something else|NEW problem/.test(third.out)) problems.push('it talks about a fix');
+      if (!/1 found here and not in the earlier run:/.test(third.out)) problems.push('the function is not said as a difference');
+      const flat = third.out.replace(/\s+/g, ' ');
+      const database = new URL(CONNECTION).pathname.replace(/^\//, '');
+      if (flat.indexOf('was on "' + database + '"') < 0) problems.push('it does not name the database it was on');
+      if (flat.indexOf('1 table only in the earlier one (notes); 1 table only in this one (ledger)') < 0) problems.push('it does not say how the tables differ');
+      if (problems.length) problems.push('output:\n' + third.out.slice(-1800));
+      return problems;
+    })());
+
+    // And back, down the other door: scan.js --recheck.
+    const back = spawnSync(process.execPath, [path.join(__dirname, 'scan.js'), APP, '--recheck'], {
+      cwd: WORK, encoding: 'utf8', timeout: 300000,
+      env: Object.assign({}, process.env, { KN_DATABASE_URL: CONNECTION, KRYPTHEON_HOME: HOME }),
+    });
+    check('4. scan.js --recheck says the same, and exits on its own answer', (() => {
+      const problems = [];
+      const out = String(back.stdout || '') + String(back.stderr || '');
+      if (back.status !== 0) problems.push('exit ' + back.status);
+      if (!/This is not a re-check of the same database\./.test(out)) problems.push('it never says it is another database');
+      if (/problems? (is|are) fixed/.test(out)) problems.push('it calls a difference a fix');
+      if (problems.length) problems.push('output:\n' + out.slice(-1800));
+      return problems;
+    })());
   } finally {
+    await client.query('DROP SCHEMA IF EXISTS ' + q(OTHER) + ' CASCADE').catch(() => {});
     await client.query('DROP SCHEMA IF EXISTS ' + q(APP) + ' CASCADE').catch(() => {});
     await client.end().catch(() => {});
     fs.rmSync(WORK, { recursive: true, force: true });

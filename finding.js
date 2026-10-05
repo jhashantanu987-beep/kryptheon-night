@@ -89,6 +89,12 @@ function listOf(items) {
 }
 
 /** One of a table's things: workspaces -> workspace, companies -> company. */
+/** The same, with its article: a workspace, an organization. */
+function aOne(table) {
+  const one = oneOf(table);
+  return (/^[aeiou]/i.test(one) ? 'an ' : 'a ') + one;
+}
+
 function oneOf(table) {
   return String(table || 'team').replace(/ies$/, 'y').replace(/s$/, '');
 }
@@ -110,7 +116,7 @@ function severityOf(finding, contents) {
     // because the app is broken for whoever it fails for, but not a break-in.
     return 'HIGH';
   }
-  if (finding.kind === 'role' || finding.kind === 'bucket') {
+  if (finding.kind === 'role' || finding.kind === 'teamread' || finding.kind === 'bucket') {
     // Something to check, never a confirmed break: whether a viewer may edit,
     // or a bucket may be public, is the owner's decision. So never CRITICAL.
     return 'HIGH';
@@ -345,8 +351,12 @@ function headlineFor(finding) {
   if (finding.kind === 'role') {
     const order = ['delete', 'change', 'add'];
     const does = order.filter((what) => (finding.can || []).includes(what)).map((what) => WRITE_WORDS[what]);
-    return 'A "' + finding.who + '" in a ' + oneOf(finding.parent) + ' can ' + listOf(does) + ' your ' +
+    return 'A "' + finding.who + '" in ' + aOne(finding.parent) + ' can ' + listOf(does) + ' your ' +
       finding.table + ' table.';
+  }
+  if (finding.kind === 'teamread') {
+    return 'A "' + finding.who + '" in ' + aOne(finding.parent) + ' can read your ' + finding.table +
+      ' table, which holds ' + listOf(finding.secrets || []) + '.';
   }
   if (finding.kind === 'bucket') {
     return 'Your ' + finding.table + ' storage bucket is public, but a rule says only some people may read it.';
@@ -439,16 +449,33 @@ function bodyFor(finding, contents) {
     // edit is a hole in one app and the design of another.
     const did = [];
     const rows = (n) => n + (n === 1 ? ' row' : ' rows');
+    if ((finding.can || []).includes('add')) did.push('added ' + rows((finding.changed || {}).add || 1));
     if ((finding.can || []).includes('change')) did.push('changed ' + rows((finding.changed || {}).change || 1));
     if ((finding.can || []).includes('delete')) did.push('deleted ' + rows((finding.changed || {}).delete || 1));
     const place = oneOf(finding.parent);
     return (
       'I put one of my fake people into the other one\'s ' + place + ' as a "' + finding.who +
       '" - the lowest role in ' + finding.via + '.' + finding.roleColumn + ' - and, signed in as them, I ' +
-      listOf(did) + ' in ' + finding.table + ' that belonged to that ' + place + ', on a copy of your app. ' +
+      listOf(did) + ' in ' + finding.table + ' for that ' + place + ', on a copy of your app. ' +
       'Before joining, they could not. Every one of those was undone straight away. Whether a "' + finding.who +
       '" may do this is your decision: if it is meant to, nothing needs fixing; if a "' + finding.who +
       '" should only look, the rules on this table let them do more.'
+    );
+  }
+
+  if (finding.kind === 'teamread') {
+    // Said as what was read and by whom, and which roles below it could not:
+    // a dispatcher seeing a key may be the design, a viewer rarely is.
+    const place = oneOf(finding.parent);
+    const n = finding.readable || 1;
+    const below = (finding.below || []).map((r) => '"' + r + '"');
+    return (
+      'I put one of my fake people into the other one\'s ' + place + ' as a "' + finding.who + '" and, signed ' +
+      'in as them, read ' + n + (n === 1 ? ' row' : ' rows') + ' of ' + finding.table + ' for that ' + place +
+      ', on a copy of your app - including ' + listOf(finding.secrets || []) + '. Before joining, they could not.' +
+      (below.length ? ' As ' + listOf(below).replace(/ and /, ' or ') + ' they could not read it either.' : '') +
+      ' Nothing was changed. Whether a "' + finding.who + '" should see these is your decision: if not, a read ' +
+      'rule on this table lets them.'
     );
   }
 
@@ -747,9 +774,9 @@ function fixPromptFor(finding) {
     ? [
       'My app may have a permissions problem - please check it rather than assume it.',
       '',
-      'In my database, a member of a ' + oneOf(finding.parent) + ' whose role in "' + finding.via + '"."' +
+      'In my database, a member of ' + aOne(finding.parent) + ' whose role in "' + finding.via + '"."' +
         finding.roleColumn + '" is "' + finding.who + '" can ' +
-        listOf((finding.can || []).map((what) => ({ change: 'change', delete: 'delete' })[what])) +
+        listOf((finding.can || []).map((what) => ({ add: 'add', change: 'change', delete: 'delete' })[what])) +
         ' rows of that ' + oneOf(finding.parent) + ' in the "' + finding.table + '" table. This was proved ' +
         'on a copy of the database: a "' + finding.who + '" was added, and the writes went through.',
       '',
@@ -763,6 +790,25 @@ function fixPromptFor(finding) {
         finding.who + '" should still see these rows.',
       '',
       'Then check every other table where members can write for the same thing.',
+    ]
+    : finding.kind === 'teamread'
+    ? [
+      'My app may have a permissions problem - please check it rather than assume it.',
+      '',
+      'In my database, a member of ' + aOne(finding.parent) + ' whose role in "' + finding.via + '"."' +
+        finding.roleColumn + '" is "' + finding.who + '" can read the "' + finding.table + '" table of that ' +
+        oneOf(finding.parent) + ', including ' + listOf((finding.secrets || []).map((c) => '"' + c + '"')) +
+        '. This was proved on a copy of the database: a "' + finding.who + '" was added, and the rows came back.',
+      '',
+      'First tell me: should a "' + finding.who + '" see these? If yes, change nothing.',
+      '',
+      'If not, make the rules on "' + finding.table + '" that cover SELECT or ALL check the member\'s role as ' +
+        'well as membership. Postgres lets a read through if ANY permissive policy allows it, so a strict rule ' +
+        'beside a loose one does nothing: list every such policy on "' + finding.table + '" and narrow or drop ' +
+        'the loose one. If members need the other columns, a view or function that leaves the secret ones out ' +
+        'is often the better fix.',
+      '',
+      'Then check every other table that holds tokens, keys, secrets or payloads for the same thing.',
     ]
     : finding.kind === 'bucket'
     ? [
@@ -958,7 +1004,7 @@ function fixPromptFor(finding) {
 
 // Found and said, but never claimed as a break: the owner decides. Counted
 // apart in the report, never towards the exit code or a clean re-check.
-const TO_CHECK = ['privileged', 'role', 'bucket'];
+const TO_CHECK = ['privileged', 'role', 'teamread', 'bucket'];
 
 /** Everything the report needs about one thing the attack found. */
 function describe(finding) {
@@ -994,6 +1040,8 @@ function describe(finding) {
     can: finding.can,
     via: finding.via,
     roleColumn: finding.roleColumn,
+    readable: finding.readable,
+    secrets: finding.secrets,
     bucket: finding.bucket,
     proof: finding.kind === 'recursive'
       ? 'Using ' + listOf((finding.reads || []).map((t) => '"' + t + '"')) + ' stopped with ' +
@@ -1004,8 +1052,11 @@ function describe(finding) {
       ? 'As a "' + finding.who + '" who had just joined, I ' +
         listOf((finding.can || []).map((what) => {
           const n = (finding.changed || {})[what] || 1;
-          return (what === 'change' ? 'changed ' : 'deleted ') + n + (n === 1 ? ' row' : ' rows');
+          return ({ add: 'added ', change: 'changed ', delete: 'deleted ' })[what] + n + (n === 1 ? ' row' : ' rows');
         })) + ' in "' + finding.table + '" that I could not touch before joining. All of it was undone.'
+      : finding.kind === 'teamread'
+      ? 'As a "' + finding.who + '" who had just joined, I read ' + (finding.readable || 1) +
+        ((finding.readable || 1) === 1 ? ' row' : ' rows') + ' of "' + finding.table + '" that I could not read before joining.'
       : finding.kind === 'bucket'
       ? 'I read that "' + finding.bucket + '" is public and that ' + listOf((finding.rules || []).map((r) => '"' + r + '"')) +
         ' says who may read it. I did not open any file.'
@@ -1113,7 +1164,7 @@ function describeAll(findings) {
   // Writes above reads: a table somebody emptied is worse than one they read.
   // A looping rule sits with the reads: it breaks the app for everyone it
   // fails for, which matters more than a duplicate or a stray row.
-  const byKind = { writable: 0, exposed: 1, crossed: 2, recursive: 2.5, duplicated: 3, orphaned: 4, role: 4.5, bucket: 4.7, privileged: 5 };
+  const byKind = { writable: 0, exposed: 1, crossed: 2, recursive: 2.5, duplicated: 3, orphaned: 4, role: 4.5, teamread: 4.6, bucket: 4.7, privileged: 5 };
   const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (byKind[d.kind] === undefined ? 9 : byKind[d.kind]);
   return described.sort((a, b) => rank(a) - rank(b));
 }
