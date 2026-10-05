@@ -642,6 +642,19 @@ BEGIN
       parts := parts || CASE WHEN bare = src THEN '''' || target || ''', ' || part ELSE part END;
     END LOOP;
     def := replace(def, m[1] || m[2], m[1] || array_to_string(parts, ', '));
+  ELSE
+    -- None pinned, so a bare name in the body is looked up on the caller's
+    -- path when it runs, and that path has never heard of the copy. Found on
+    -- a blind test (OrbitDesk): the copy's has_role read the original's
+    -- members with the original's enum, and every rule calling it failed with
+    -- "operator does not exist". Pinned the way the copy was built: the copy
+    -- first, then where the original's bare names would have gone. A BEGIN
+    -- ATOMIC body has no AS line and needs none.
+    SELECT string_agg('''' || s || '''', ', ' ORDER BY first) INTO head
+      FROM (SELECT s, min(at) AS first
+              FROM unnest(ARRAY[target, src, 'public', 'extensions']) WITH ORDINALITY AS u(s, at)
+             GROUP BY s) p;
+    def := regexp_replace(def, E'\nAS ', E'\n SET search_path TO ' || head || E'\nAS ');
   END IF;
   RETURN __KN__.rewrite_own_table_refs(def, plan, target, copied);
 END $$;

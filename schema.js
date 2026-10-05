@@ -764,11 +764,26 @@ function copyFunctionStatement(fn, plan, target, copiedNames) {
     () => 'CREATE FUNCTION ' + quote(target) + '.',
   );
   // The settings line, e.g.  SET search_path TO 'public', 'storage'
+  const pinned = /^\s*SET search_path (?:TO|=) /m.test(def);
   def = def.replace(/^(\s*SET search_path (?:TO|=) )(.*)$/m, (all, head, list) =>
     head + list.split(',').map((part) => {
       const bare = part.trim().replace(/^'(.*)'$/, '$1').replace(/^"(.*)"$/, '$1');
       return bare === plan.schema ? "'" + target + "', " + part.trim() : part.trim();
     }).join(', '));
+  // None pinned, so a bare name in the body is looked up on the caller's path
+  // when it runs - and the caller's path has never heard of the copy. Found on
+  // a blind test (OrbitDesk): member_of and has_role read `workspace_members`
+  // bare, so the copy's helpers read the original's members, with the
+  // original's workspace_role, against the copy's. Every rule calling has_role
+  // failed with "operator does not exist", 13 attacks never ran, and a loop
+  // through member_of never fired because the original's table was empty.
+  // So the copy's helper is pinned the way the copy itself was built: the copy
+  // first, then where the original's bare names would have gone. A BEGIN
+  // ATOMIC body has no AS line and needs none - it was bound when it was made.
+  if (!pinned) {
+    const path = Array.from(new Set([target, plan.schema, 'public', 'extensions']));
+    def = def.replace(/\nAS /, '\n SET search_path TO ' + path.map((s) => "'" + s + "'").join(', ') + '\nAS ');
+  }
   return rewriteOwnTableRefs(def, plan, target, copiedNames);
 }
 

@@ -46,9 +46,21 @@ async function build(client) {
   // Closed to anon, as an app might: the copy must keep it closed.
   await client.query('REVOKE ALL ON FUNCTION ' + q('has_role') + '(uuid, ' + q('role_t') + '[]) FROM PUBLIC');
   await client.query('GRANT EXECUTE ON FUNCTION ' + q('has_role') + '(uuid, ' + q('role_t') + '[]) TO authenticated');
+  // The OrbitDesk shape: a SQL helper with no search_path of its own, every
+  // name in it bare - members, role_t - the way an app in `public` writes
+  // them. Created with the app on the path, as the app's own migration was.
+  await client.query('SET search_path TO ' + schema.quote(APP) + ', public');
+  try {
+    await client.query('CREATE TABLE memos (id serial PRIMARY KEY, org_id uuid NOT NULL, body text)');
+    await client.query('CREATE FUNCTION bare_role(p_org uuid, p_roles role_t[]) RETURNS boolean LANGUAGE sql STABLE AS ' +
+      "$$ SELECT EXISTS (SELECT 1 FROM members WHERE org_id = p_org AND user_id = nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid AND role = ANY (p_roles)) $$");
+    await client.query("CREATE POLICY admins ON memos FOR SELECT USING (bare_role(org_id, ARRAY['owner', 'admin']::role_t[]))");
+  } finally {
+    await client.query('RESET search_path');
+  }
   // Not called by any rule: stays out of the copy.
   await client.query('CREATE FUNCTION ' + q('unused') + '() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$');
-  for (const t of ['members', 'docs', 'notes']) {
+  for (const t of ['members', 'docs', 'notes', 'memos']) {
     await client.query('GRANT SELECT ON ' + q(t) + ' TO anon, authenticated');
     await client.query('ALTER TABLE ' + q(t) + ' ENABLE ROW LEVEL SECURITY');
   }
@@ -71,7 +83,7 @@ async function main() {
 
     check('only the helpers a rule calls, and what they call, are taken', (() => {
       const got = schema.functionsToCopy(plan).map((f) => f.name).sort();
-      return JSON.stringify(got) === '["has_role","in_org","is_admin"]' ? [] : ['copied ' + JSON.stringify(got)];
+      return JSON.stringify(got) === '["bare_role","has_role","in_org","is_admin"]' ? [] : ['copied ' + JSON.stringify(got)];
     })());
 
     check('a copied helper is named in the copy and looks in the copy first', (() => {
@@ -81,6 +93,22 @@ async function main() {
       if (!made.startsWith('CREATE FUNCTION "' + COPY + '".is_admin(')) p.push('header: ' + made.split('\n')[0]);
       if (!new RegExp("SET search_path TO '" + COPY + "', '?" + APP).test(made)) p.push('search_path: ' + (made.match(/SET search_path.*/) || ['none'])[0]);
       if (made.includes('CREATE OR REPLACE')) p.push('it could replace something of the same name');
+      return p;
+    })());
+
+    check('a copied helper that pinned no search_path is given one that looks in the copy first', (() => {
+      const p = [];
+      const fn = plan.functions.find((f) => f.name === 'bare_role');
+      const made = schema.copyFunctionStatement(fn, plan, COPY, ['bare_role']);
+      const lines = made.split('\n').filter((line) => /SET search_path/.test(line));
+      if (lines.length !== 1) p.push(lines.length + ' search_path lines');
+      else if (lines[0] !== " SET search_path TO '" + COPY + "', '" + APP + "', 'public', 'extensions'") p.push(lines[0]);
+      if (!/\n SET search_path[^\n]*\nAS \$/.test(made)) p.push('not just before the body');
+      // A body written BEGIN ATOMIC is bound when it is created, with the copy
+      // first on the path; it has no AS line and is left exactly as it was.
+      const atomic = { def: 'CREATE OR REPLACE FUNCTION ' + APP + '.f()\n RETURNS integer\n LANGUAGE sql\nBEGIN ATOMIC\n SELECT 1;\nEND\n' };
+      const kept = schema.copyFunctionStatement(atomic, plan, COPY, []);
+      if (/search_path/.test(kept)) p.push('a BEGIN ATOMIC body was given a search_path');
       return p;
     })());
 
@@ -117,9 +145,16 @@ async function main() {
       await client.query('INSERT INTO ' + schema.quote(COPY) + ".members VALUES ($1, $2, 'admin')", [org, user]);
       await client.query('INSERT INTO ' + schema.quote(COPY) + '.docs (org_id, body) VALUES ($1, $2)', [org, 'x']);
       await client.query('INSERT INTO ' + schema.quote(COPY) + '.notes (org_id, body) VALUES ($1, $2)', [org, 'y']);
-      const read = async (table) => {
+      await client.query('INSERT INTO ' + schema.quote(COPY) + '.memos (org_id, body) VALUES ($1, $2)', [org, 'z']);
+      // `path` is the caller's search_path. PostgREST puts the app's schema on
+      // it, so a bare name in the original's helper reaches the original's
+      // table - and a copied helper that followed the caller's path read the
+      // original's members, with the original's role_t, and every rule calling
+      // it failed: "operator does not exist: role_t = <copy>.role_t".
+      const read = async (table, path) => {
         await client.query('BEGIN');
         try {
+          if (path) await client.query('SET LOCAL search_path TO ' + path);
           await client.query('SET LOCAL ROLE authenticated');
           await client.query("SELECT set_config('request.jwt.claims', $1, true)", [JSON.stringify({ sub: user, role: 'authenticated' })]);
           return (await client.query('SELECT * FROM ' + schema.quote(COPY) + '.' + schema.quote(table))).rows.length;
@@ -131,10 +166,14 @@ async function main() {
       };
       const docs = await read('docs');
       const notes = await read('notes');
+      const memos = await read('memos', schema.quote(APP) + ', public');
+      const memosDefault = await read('memos');
       check('a member who exists only in the copy passes the copy\'s rules', (() => {
         const p = [];
         if (docs !== 1) p.push('docs (SQL helper, qualified): ' + docs);
         if (notes !== 1) p.push('notes (PL/pgSQL helper, pinned search_path, bare names): ' + notes);
+        if (memos !== 1) p.push('memos (SQL helper, no search_path, bare names, app on the caller\'s path): ' + memos);
+        if (memosDefault !== 1) p.push('memos (the same, caller on the default path): ' + memosDefault);
         return p;
       })());
 

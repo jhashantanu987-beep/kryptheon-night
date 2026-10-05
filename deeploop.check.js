@@ -42,6 +42,30 @@ async function build(client) {
   }
 }
 
+// The OrbitDesk shape of the same loop: the helper has no search_path of its
+// own and names members bare. Found on a blind test - the copy's helper read
+// the original's members, which the scan never seeds, so the loop never
+// fired and was not reported.
+const BARE = 'kn_deepbare_' + STAMP;
+async function buildBare(client) {
+  await client.query('CREATE SCHEMA ' + schema.quote(BARE));
+  await client.query('GRANT USAGE ON SCHEMA ' + schema.quote(BARE) + ' TO anon, authenticated');
+  await client.query('SET search_path TO ' + schema.quote(BARE) + ', public');
+  try {
+    await client.query('CREATE TABLE members (org_id uuid NOT NULL, user_id uuid NOT NULL, PRIMARY KEY (org_id, user_id))');
+    await client.query('CREATE TABLE docs (id serial PRIMARY KEY, org_id uuid NOT NULL, body text)');
+    await client.query('CREATE FUNCTION is_member(p_org uuid) RETURNS boolean LANGUAGE sql STABLE AS ' +
+      '$$ SELECT EXISTS (SELECT 1 FROM members WHERE org_id = p_org AND user_id = ' + WHO + ') $$');
+    for (const t of ['members', 'docs']) {
+      await client.query('GRANT SELECT ON ' + t + ' TO anon, authenticated');
+      await client.query('ALTER TABLE ' + t + ' ENABLE ROW LEVEL SECURITY');
+      await client.query('CREATE POLICY reads ON ' + t + ' FOR SELECT TO authenticated USING (is_member(org_id))');
+    }
+  } finally {
+    await client.query('RESET search_path');
+  }
+}
+
 async function main() {
   if (!CONNECTION) {
     console.error('\n  node deeploop.check.js "<postgres connection string>"\n');
@@ -52,6 +76,23 @@ async function main() {
   try {
     await fixture.ensureRoles(client, null, schema.quote);
     await build(client);
+    await buildBare(client);
+
+    for (const [engine, run] of [
+      ['node', () => scanner.scan(client, BARE, { quiet: true })],
+      ['sql', () => sqlengine.withEngine(client, (t) => scanner.scan(client, BARE, { quiet: true, engine: sqlengine.adapterFor(t) }))],
+    ]) {
+      const result = await run();
+      check(engine + ': a loop through a helper that names its table bare is found in the copy', (() => {
+        if (result.stopped) return ['stopped: ' + result.stopped];
+        const loops = (result.findings || []).filter((f) => f.kind === 'recursive').map((f) => f.table);
+        const p = [];
+        if (JSON.stringify(loops) !== '["members"]') p.push('loops: ' + JSON.stringify(loops));
+        const unrelated = (result.notChecked || []).filter((n) => !/stack depth limit exceeded/.test(String(n.why)));
+        if (unrelated.length) p.push('not checked for another reason: ' + JSON.stringify(unrelated));
+        return p;
+      })());
+    }
 
     check('"stack depth limit exceeded" is read as a loop; other errors are not', (() => {
       const p = [];
@@ -141,6 +182,7 @@ async function main() {
     })());
   } finally {
     await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(APP) + ' CASCADE').catch(() => {});
+    await client.query('DROP SCHEMA IF EXISTS ' + schema.quote(BARE) + ' CASCADE').catch(() => {});
     await client.end().catch(() => {});
   }
 
