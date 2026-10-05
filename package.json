@@ -1,6 +1,6 @@
 {
   "name": "kryptheon-night",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "Attacks a copy of your Supabase database and tells you in plain English what got in.",
   "license": "MIT",
   "type": "commonjs",
