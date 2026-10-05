@@ -272,7 +272,17 @@ reading API client keys, a "viewer" reading integration tokens or webhook
 payloads. A role whose name says it only looks ("viewer") adding a row to the
 team, written under someone else's name, is reported too; a member adding a
 note as themselves is not. Where a table names its team, writes and reads stay
-inside the team joined. Forty-nine mutations across both rounds, each caught.
+inside the team joined.
+
+Round 10 (LaunchRail): writes are tried up the same ladder. Production gave the
+"analyst" role its own UPDATE rule on feature flags, and only the "viewer"
+below it was ever tried. Now each role not in charge is tried from the lowest
+up, and the first that can write is named - unless a rule for that command
+lists the role among those allowed to write (has_role(team, ARRAY[...]), the
+same list as an array literal, or a list inside a helper the rule calls): that
+is the app's design, and the roles above are still tried. A rule written for
+one role on its own, role = 'analyst', is not such a list. Owner and admin are
+never tried. Seventy-six mutations across the three rounds, each caught.
 
 **buckets.check.js** - a Supabase Storage bucket switched to public, with a
 read rule saying only some people may have its files: probably meant to be

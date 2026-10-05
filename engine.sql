@@ -2493,7 +2493,7 @@ BEGIN
     IF lowest IS NOT NULL THEN
       -- Every role not plainly in charge, the lowest first and then upwards:
       -- the order reads are tried in.
-      RETURN jsonb_build_object('column', col->>'name', 'lowest', lowest, 'ladder',
+      RETURN jsonb_build_object('column', col->>'name', 'type', col->>'type', 'lowest', lowest, 'ladder',
         jsonb_build_array(lowest) || coalesce((
           SELECT jsonb_agg(l ORDER BY pos DESC)
             FROM jsonb_array_elements_text(labels) WITH ORDINALITY AS e(l, pos)
@@ -2563,7 +2563,7 @@ BEGIN
     CONTINUE WHEN jsonb_array_length(keys) = 0 OR __KN__.alone_unique(tab, person);
     found := found || jsonb_build_array(jsonb_build_object(
       'table', tab, 'person', person, 'role', role_->>'column', 'lowest', role_->>'lowest',
-      'ladder', role_->'ladder', 'keys', keys));
+      'roleType', role_->>'type', 'ladder', role_->'ladder', 'keys', keys));
   END LOOP;
   -- A table named for members first: it is the one a team rule asks.
   SELECT coalesce(jsonb_agg(m ORDER BY (m->'table'->>'name') !~* 'member', at), '[]'::jsonb) INTO found
@@ -2623,7 +2623,49 @@ RETURNS bigint LANGUAGE sql IMMUTABLE AS $$
     ELSE 0 END;
 $$;
 
-CREATE OR REPLACE FUNCTION __KN__.teammate(source text, tables jsonb, seeded jsonb)
+/*
+ * Whether the app's own rules name this role among those allowed to make
+ * this kind of write: the role in a list in a permissive rule for that
+ * command, or in a list inside a helper that rule calls. A rule written for
+ * one role on its own (role = 'analyst', LaunchRail) is not a list of who may
+ * write. Mirrors allowedByRules in tamper.js.
+ */
+CREATE OR REPLACE FUNCTION __KN__.allowed_by_rules(rules jsonb, table_name text, what text, role_ text, type_ text)
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  esc constant text := '([.*+?^${}()|\[\]\\])';
+  label text := '''' || regexp_replace(replace(role_, '''', ''''''), esc, '\\\1', 'g') || '''';
+  type_name text := regexp_replace(replace(split_part(coalesce(type_, 'text'), '.', -1), '"', ''), esc, '\\\1', 'g');
+  in_rule_list text := 'ARRAY\[[^]]*' || label || '::("?[A-Za-z0-9_$]+"?\.)?"?' || type_name || '"?';
+  -- The same list written as an array literal, kept as '{...}'::role[].
+  in_rule_literal text := '''\{([^}'']*,)?"?' || regexp_replace(role_, esc, '\\\1', 'g') ||
+    '"?(,[^}'']*)?\}''::("?[A-Za-z0-9_$]+"?\.)?"?' || type_name || '"?\[\]';
+  in_helper_list text := '(\mIN\s*\(|ARRAY\[)[^])]*' || label;
+  command text := CASE what WHEN 'add' THEN 'INSERT' WHEN 'change' THEN 'UPDATE' WHEN 'delete' THEN 'DELETE' END;
+  policy jsonb;
+  body text;
+BEGIN
+  FOR policy IN SELECT * FROM jsonb_array_elements(coalesce(rules->'policies', '[]'::jsonb)) LOOP
+    CONTINUE WHEN policy->>'table_name' <> table_name;
+    CONTINUE WHEN upper(coalesce(policy->>'permissive', 'PERMISSIVE')) <> 'PERMISSIVE';
+    CONTINUE WHEN upper(coalesce(policy->>'cmd', 'ALL')) NOT IN ('ALL', command);
+    body := coalesce(policy->>'qual', '') || ' ' || coalesce(policy->>'with_check', '');
+    IF body ~* in_rule_list OR body ~* in_rule_literal THEN RETURN true; END IF;
+    IF EXISTS (
+        SELECT 1 FROM jsonb_array_elements(coalesce(rules->'functions', '[]'::jsonb)) f
+         WHERE __KN__.calls_function(body, f->>'name')
+           AND coalesce(f->>'src', '') ~* in_helper_list) THEN
+      RETURN true;
+    END IF;
+  END LOOP;
+  RETURN false;
+END $$;
+
+-- The three-argument teammate of 0.1.26-0.1.28, dropped so an engine
+-- upgraded in place keeps one version and every call stays unambiguous.
+DROP FUNCTION IF EXISTS __KN__.teammate(text, jsonb, jsonb);
+
+CREATE OR REPLACE FUNCTION __KN__.teammate(source text, tables jsonb, seeded jsonb, rules jsonb)
 RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
   findings jsonb := '[]'::jsonb;
@@ -2668,6 +2710,9 @@ DECLARE
   role_ text;
   tried jsonb;
   i integer;
+  before_all jsonb;
+  below jsonb;
+  listed boolean;
 BEGIN
   FOR member IN SELECT * FROM jsonb_array_elements(__KN__.memberships(tables)) LOOP
     SELECT (s->>'attempt')::integer INTO shape
@@ -2743,7 +2788,6 @@ BEGIN
         FROM jsonb_array_elements(coalesce(seeded, '[]'::jsonb)) s
        WHERE s->>'table' = tab->>'name';
       shape := coalesce(shape, 0);
-      finding_key := 'role:' || (tab->>'name') || ':' || (member->>'lowest');
       owner := __KN__.owner_column(tab);
 
       -- A table that names the team itself, and the team it is to name.
@@ -2786,52 +2830,84 @@ BEGIN
       -- may only look, and written under the other person's name: a rule that
       -- lets a member add a row only as themselves is them speaking for
       -- themselves.
-      IF __KN__.look_only(member->>'lowest') AND to_team IS NOT NULL THEN
+      IF to_team IS NOT NULL AND EXISTS (
+          SELECT 1 FROM jsonb_array_elements_text(member->'ladder') r WHERE __KN__.look_only(r)) THEN
         BEGIN
           row_ := __KN__.row_for(source, tab, __KN__.user_a(), '11', pointed, shape);
-          moves := jsonb_build_array(jsonb_build_object('what', 'add',
+          moves := jsonb_build_array(jsonb_build_object('what', 'add', 'lookOnly', true,
             'statement', __KN__.insert_statement(source, tab->>'name', row_))) || moves;
         EXCEPTION WHEN OTHERS THEN
           NULL;
         END;
       END IF;
 
-      can := '[]'::jsonb;
-      changed := '{}'::jsonb;
-      stuck := NULL;
+      -- Every role not in charge, from the lowest up, the way reads are tried
+      -- (LaunchRail: production gave "analyst" its own UPDATE rule and only
+      -- "viewer" was tried). The first role that can write where the app's own
+      -- rules do not list it is the one named. What each write did before
+      -- joining is asked once.
+      before_all := '{}'::jsonb;
       FOR move IN SELECT * FROM jsonb_array_elements(moves) LOOP
-        before_ := __KN__.try_write('authenticated', __KN__.user_b(), move->>'statement');
-        after_ := __KN__.try_write_joined('authenticated', __KN__.user_b(), move->>'statement', join_);
-        was := __KN__.rows_moved(before_);
-        now_ := __KN__.rows_moved(after_);
-        IF was IS NULL OR now_ IS NULL THEN
-          stuck := CASE WHEN now_ IS NULL THEN after_->>'why' ELSE before_->>'why' END;
-        ELSIF now_ > was THEN
-          can := can || to_jsonb(move->>'what');
-          changed := jsonb_set(changed, ARRAY[move->>'what'], to_jsonb(now_ - was));
-        END IF;
+        before_all := jsonb_set(before_all, ARRAY[move->>'what'],
+          __KN__.try_write('authenticated', __KN__.user_b(), move->>'statement'));
       END LOOP;
+      below := '[]'::jsonb;
+      FOR role_ IN SELECT jsonb_array_elements_text(member->'ladder') LOOP
+        finding_key := 'role:' || (tab->>'name') || ':' || role_;
+        IF NOT (joins ? role_) THEN
+          blocked := blocked || jsonb_build_array(jsonb_build_object(
+            'table', tab->>'name', 'key', finding_key,
+            'why', 'as a "' || role_ || '" in ' || (member->'table'->>'name') || ': I could not add one'));
+          EXIT;
+        END IF;
+        can := '[]'::jsonb;
+        changed := '{}'::jsonb;
+        stuck := NULL;
+        listed := false;
+        FOR move IN SELECT * FROM jsonb_array_elements(moves) LOOP
+          CONTINUE WHEN coalesce((move->>'lookOnly')::boolean, false) AND NOT __KN__.look_only(role_);
+          -- A write the rules list this role for is not asked: whatever it did
+          -- would not be reported, and a key refusing it left the table untested.
+          IF __KN__.allowed_by_rules(rules, tab->>'name', move->>'what', role_, member->>'roleType') THEN
+            listed := true;
+            CONTINUE;
+          END IF;
+          before_ := before_all->(move->>'what');
+          after_ := __KN__.try_write_joined('authenticated', __KN__.user_b(), move->>'statement', joins->>role_);
+          was := __KN__.rows_moved(before_);
+          now_ := __KN__.rows_moved(after_);
+          IF was IS NULL OR now_ IS NULL THEN
+            stuck := CASE WHEN now_ IS NULL THEN after_->>'why' ELSE before_->>'why' END;
+          ELSIF now_ > was THEN
+            can := can || to_jsonb(move->>'what');
+            changed := jsonb_set(changed, ARRAY[move->>'what'], to_jsonb(now_ - was));
+          END IF;
+        END LOOP;
 
-      IF jsonb_array_length(can) = 0 AND stuck IS NOT NULL THEN
-        blocked := blocked || jsonb_build_array(jsonb_build_object(
-          'table', tab->>'name', 'key', finding_key,
-          'why', 'as a "' || (member->>'lowest') || '" in ' || (member->'table'->>'name') || ': ' || stuck));
-      ELSE
+        IF jsonb_array_length(can) = 0 AND stuck IS NOT NULL THEN
+          blocked := blocked || jsonb_build_array(jsonb_build_object(
+            'table', tab->>'name', 'key', finding_key,
+            'why', 'as a "' || role_ || '" in ' || (member->'table'->>'name') || ': ' || stuck));
+          EXIT;
+        END IF;
         completed := completed || to_jsonb(finding_key);
         IF jsonb_array_length(can) > 0 THEN
           findings := findings || jsonb_build_array(jsonb_build_object(
             'kind', 'role',
             'table', tab->>'name',
-            'who', member->>'lowest',
+            'who', role_,
             'via', member->'table'->>'name',
             'roleColumn', member->>'role',
             'parent', parent,
             'can', can,
             'changed', changed,
+            'below', below,
             'columns', coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c), '[]'::jsonb),
             'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+          EXIT;
         END IF;
-      END IF;
+        IF NOT listed THEN below := below || to_jsonb(role_); END IF;
+      END LOOP;
 
       -- Reading what a member should not see, said only of a table holding a
       -- secret. Every role not in charge, from the lowest up; the first that
@@ -3403,7 +3479,8 @@ BEGIN
 
     seen     := __KN__.impersonate(copy_name, theirs || views);
     wrote    := __KN__.tamper(copy_name, theirs, sown->'seeded', copy_plan->'policies');
-    ranked   := __KN__.teammate(copy_name, theirs, sown->'seeded');
+    ranked   := __KN__.teammate(copy_name, theirs, sown->'seeded',
+                  jsonb_build_object('policies', copy_plan->'policies', 'functions', copy_plan->'functions'));
     stranded := __KN__.orphan(copy_name, theirs, sown->'seeded');
     raced    := __KN__.collide(copy_name, theirs, copy_plan->'indexes');
 

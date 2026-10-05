@@ -89,6 +89,16 @@ function listOf(items) {
 }
 
 /** One of a table's things: workspaces -> workspace, companies -> company. */
+/** A role, quoted, with its article: a "viewer", an "analyst". */
+function aRole(role) {
+  return (/^[aeiou]/i.test(String(role)) ? 'an "' : 'a "') + role + '"';
+}
+
+/** The first letter made a capital, for the start of a sentence. */
+function capital(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 /** The same, with its article: a workspace, an organization. */
 function aOne(table) {
   const one = oneOf(table);
@@ -351,11 +361,11 @@ function headlineFor(finding) {
   if (finding.kind === 'role') {
     const order = ['delete', 'change', 'add'];
     const does = order.filter((what) => (finding.can || []).includes(what)).map((what) => WRITE_WORDS[what]);
-    return 'A "' + finding.who + '" in ' + aOne(finding.parent) + ' can ' + listOf(does) + ' your ' +
+    return capital(aRole(finding.who)) + ' in ' + aOne(finding.parent) + ' can ' + listOf(does) + ' your ' +
       finding.table + ' table.';
   }
   if (finding.kind === 'teamread') {
-    return 'A "' + finding.who + '" in ' + aOne(finding.parent) + ' can read your ' + finding.table +
+    return capital(aRole(finding.who)) + ' in ' + aOne(finding.parent) + ' can read your ' + finding.table +
       ' table, which holds ' + listOf(finding.secrets || []) + '.';
   }
   if (finding.kind === 'bucket') {
@@ -453,13 +463,18 @@ function bodyFor(finding, contents) {
     if ((finding.can || []).includes('change')) did.push('changed ' + rows((finding.changed || {}).change || 1));
     if ((finding.can || []).includes('delete')) did.push('deleted ' + rows((finding.changed || {}).delete || 1));
     const place = oneOf(finding.parent);
+    // The roles below it that were tried first and could not, when there are
+    // any: a role in the middle is named because the ones under it held.
+    const below = (finding.below || []).map((r) => '"' + r + '"');
     return (
-      'I put one of my fake people into the other one\'s ' + place + ' as a "' + finding.who +
-      '" - the lowest role in ' + finding.via + '.' + finding.roleColumn + ' - and, signed in as them, I ' +
-      listOf(did) + ' in ' + finding.table + ' for that ' + place + ', on a copy of your app. ' +
-      'Before joining, they could not. Every one of those was undone straight away. Whether a "' + finding.who +
-      '" may do this is your decision: if it is meant to, nothing needs fixing; if a "' + finding.who +
-      '" should only look, the rules on this table let them do more.'
+      'I put one of my fake people into the other one\'s ' + place + ' as ' + aRole(finding.who) +
+      ' - ' + (below.length ? 'a role' : 'the lowest role') + ' in ' + finding.via + '.' + finding.roleColumn +
+      ' - and, signed in as them, I ' + listOf(did) + ' in ' + finding.table + ' for that ' + place +
+      ', on a copy of your app. Before joining, they could not.' +
+      (below.length ? ' As ' + listOf(below).replace(/ and /, ' or ') + ' they could not either, and no rule on this ' +
+        'table lists ' + aRole(finding.who).replace(/^an? /, '') + ' among the roles allowed to make that change.' : '') +
+      ' Every one of those was undone straight away. Whether ' + aRole(finding.who) + ' may do this is your ' +
+      'decision: if it is meant to, nothing needs fixing; if not, the rules on this table let them do more.'
     );
   }
 
@@ -470,11 +485,11 @@ function bodyFor(finding, contents) {
     const n = finding.readable || 1;
     const below = (finding.below || []).map((r) => '"' + r + '"');
     return (
-      'I put one of my fake people into the other one\'s ' + place + ' as a "' + finding.who + '" and, signed ' +
+      'I put one of my fake people into the other one\'s ' + place + ' as ' + aRole(finding.who) + ' and, signed ' +
       'in as them, read ' + n + (n === 1 ? ' row' : ' rows') + ' of ' + finding.table + ' for that ' + place +
       ', on a copy of your app - including ' + listOf(finding.secrets || []) + '. Before joining, they could not.' +
       (below.length ? ' As ' + listOf(below).replace(/ and /, ' or ') + ' they could not read it either.' : '') +
-      ' Nothing was changed. Whether a "' + finding.who + '" should see these is your decision: if not, a read ' +
+      ' Nothing was changed. Whether ' + aRole(finding.who) + ' should see these is your decision: if not, a read ' +
       'rule on this table lets them.'
     );
   }
@@ -778,16 +793,16 @@ function fixPromptFor(finding) {
         finding.roleColumn + '" is "' + finding.who + '" can ' +
         listOf((finding.can || []).map((what) => ({ add: 'add', change: 'change', delete: 'delete' })[what])) +
         ' rows of that ' + oneOf(finding.parent) + ' in the "' + finding.table + '" table. This was proved ' +
-        'on a copy of the database: a "' + finding.who + '" was added, and the writes went through.',
+        'on a copy of the database: ' + aRole(finding.who) + ' was added, and the writes went through.',
       '',
-      'First tell me: should a "' + finding.who + '" be able to do that? If yes, change nothing.',
+      'First tell me: should ' + aRole(finding.who) + ' be able to do that? If yes, change nothing.',
       '',
       'If not, make the rules on "' + finding.table + '" that cover UPDATE, DELETE, INSERT or ALL check ' +
         'the member\'s role as well as membership - for example with a helper that reads "' + finding.via +
         '" for auth.uid() and the roles allowed to edit. Postgres lets a write through if ANY permissive ' +
         'policy allows it, so a strict rule beside a loose one does nothing: list every such policy on "' +
-        finding.table + '" and narrow or drop the loose one. Keep the read rule as it is if a "' +
-        finding.who + '" should still see these rows.',
+        finding.table + '" and narrow or drop the loose one. Keep the read rule as it is if ' +
+        aRole(finding.who) + ' should still see these rows.',
       '',
       'Then check every other table where members can write for the same thing.',
     ]
@@ -798,9 +813,9 @@ function fixPromptFor(finding) {
       'In my database, a member of ' + aOne(finding.parent) + ' whose role in "' + finding.via + '"."' +
         finding.roleColumn + '" is "' + finding.who + '" can read the "' + finding.table + '" table of that ' +
         oneOf(finding.parent) + ', including ' + listOf((finding.secrets || []).map((c) => '"' + c + '"')) +
-        '. This was proved on a copy of the database: a "' + finding.who + '" was added, and the rows came back.',
+        '. This was proved on a copy of the database: ' + aRole(finding.who) + ' was added, and the rows came back.',
       '',
-      'First tell me: should a "' + finding.who + '" see these? If yes, change nothing.',
+      'First tell me: should ' + aRole(finding.who) + ' see these? If yes, change nothing.',
       '',
       'If not, make the rules on "' + finding.table + '" that cover SELECT or ALL check the member\'s role as ' +
         'well as membership. Postgres lets a read through if ANY permissive policy allows it, so a strict rule ' +
@@ -1049,13 +1064,13 @@ function describe(finding) {
       : finding.kind === 'privileged'
       ? 'I did not call "' + finding.fn + '". This is a reach that exists in the grants, not a break I ran.'
       : finding.kind === 'role'
-      ? 'As a "' + finding.who + '" who had just joined, I ' +
+      ? 'As ' + aRole(finding.who) + ' who had just joined, I ' +
         listOf((finding.can || []).map((what) => {
           const n = (finding.changed || {})[what] || 1;
           return ({ add: 'added ', change: 'changed ', delete: 'deleted ' })[what] + n + (n === 1 ? ' row' : ' rows');
         })) + ' in "' + finding.table + '" that I could not touch before joining. All of it was undone.'
       : finding.kind === 'teamread'
-      ? 'As a "' + finding.who + '" who had just joined, I read ' + (finding.readable || 1) +
+      ? 'As ' + aRole(finding.who) + ' who had just joined, I read ' + (finding.readable || 1) +
         ((finding.readable || 1) === 1 ? ' row' : ' rows') + ' of "' + finding.table + '" that I could not read before joining.'
       : finding.kind === 'bucket'
       ? 'I read that "' + finding.bucket + '" is public and that ' + listOf((finding.rules || []).map((r) => '"' + r + '"')) +

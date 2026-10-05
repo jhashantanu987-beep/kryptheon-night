@@ -60,6 +60,10 @@ const at = (app) => (name) => schema.quote(app) + '.' + schema.quote(name);
  *   comments       any member may add one, but only as themselves -> not reported
  *   projects       owner/admin write; the other team's own rows are
  *                  pointed at by its milestones                  -> tried, not stuck
+ *   flags          a role list lets owner/admin/editor change it, and a rule
+ *                  of its own lets a "member" (LaunchRail's analyst) -> reported (change, member)
+ *   drafts         a role list that names member and editor     -> not reported
+ *   chores         a helper whose own list names member         -> not reported
  */
 async function buildApp(client) {
   const q = at(APP);
@@ -74,7 +78,7 @@ async function buildApp(client) {
     ' user_id uuid NOT NULL, role ' + s + '.member_role NOT NULL, PRIMARY KEY (workspace_id, user_id))');
   await client.query('CREATE TABLE ' + q('invites') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
     ' REFERENCES ' + q('workspaces') + '(id), created_by uuid NOT NULL, role ' + s + '.member_role NOT NULL)');
-  for (const t of ['customers', 'tickets', 'invoices', 'open_board', 'reports', 'squads', 'projects']) {
+  for (const t of ['customers', 'tickets', 'invoices', 'open_board', 'reports', 'squads', 'projects', 'flags', 'drafts', 'chores', 'boards', 'pins', 'stages']) {
     await client.query('CREATE TABLE ' + q(t) + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
       ' REFERENCES ' + q('workspaces') + '(id), label text NOT NULL)');
   }
@@ -92,6 +96,11 @@ async function buildApp(client) {
   }
   await client.query('CREATE TABLE ' + q('comments') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
     ' REFERENCES ' + q('workspaces') + '(id), author_id uuid NOT NULL, body text NOT NULL)');
+  // A stage a member may do anything to, whose items point at it: deleting
+  // one is refused by the key, which is not the member being refused.
+  await client.query('CREATE TABLE ' + q('stage_items') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
+    ' REFERENCES ' + q('workspaces') + '(id), stage_id uuid NOT NULL REFERENCES ' + q('stages') + '(id), created_by uuid NOT NULL,' +
+    ' label text NOT NULL)');
   await client.query('CREATE TABLE ' + q('milestones') + ' (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), workspace_id uuid NOT NULL' +
     ' REFERENCES ' + q('workspaces') + '(id), project_id uuid NOT NULL REFERENCES ' + q('projects') + '(id), created_by uuid NOT NULL,' +
     ' label text NOT NULL)');
@@ -103,11 +112,16 @@ async function buildApp(client) {
   await client.query('CREATE FUNCTION ' + q('has_role') + '(p_workspace uuid, p_roles ' + s + '.member_role[]) RETURNS boolean' +
     ' LANGUAGE sql STABLE SECURITY DEFINER AS $$ SELECT EXISTS (SELECT 1 FROM ' + q('members') +
     ' WHERE workspace_id = p_workspace AND user_id = ' + WHO + ' AND role = ANY (p_roles)) $$');
+  // A helper that lists, in its own body, who may touch a chore.
+  await client.query('CREATE FUNCTION ' + q('can_touch') + '(p_workspace uuid) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER AS ' +
+    '$$ SELECT EXISTS (SELECT 1 FROM ' + q('members') + ' WHERE workspace_id = p_workspace AND user_id = ' + WHO +
+    " AND role IN ('owner', 'admin', 'member')) $$");
   const member = (col) => q('is_member') + '(' + col + ')';
   const staff = (col, roles) => q('has_role') + '(' + col + ", '{" + roles + "}'::" + s + '.member_role[])';
 
   const tables = ['workspaces', 'access_grants', 'members', 'invites', 'customers', 'tickets', 'invoices', 'open_board',
-    'reports', 'squads', 'deals', 'notes', 'squad_members', 'vault', 'api_keys', 'signing_keys', 'comments', 'projects', 'milestones'];
+    'reports', 'squads', 'deals', 'notes', 'squad_members', 'vault', 'api_keys', 'signing_keys', 'comments', 'projects', 'milestones',
+    'flags', 'drafts', 'chores', 'boards', 'pins', 'stages', 'stage_items'];
   for (const t of tables) {
     await client.query('GRANT SELECT, INSERT, UPDATE, DELETE ON ' + q(t) + ' TO authenticated');
     await client.query('ALTER TABLE ' + q(t) + ' ENABLE ROW LEVEL SECURITY');
@@ -144,6 +158,25 @@ async function buildApp(client) {
   await policy('projects', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
   await policy('projects', 'staff', 'FOR ALL TO authenticated USING (' + staff('workspace_id', 'owner,admin') + ')');
   await policy('milestones', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
+  for (const t of ['flags', 'drafts', 'chores']) await policy(t, 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
+  await policy('flags', 'flags_update', 'FOR UPDATE TO authenticated USING (' + staff('workspace_id', 'owner,admin,editor') + ')');
+  // Production's own rule for one role, the shape LaunchRail added.
+  await policy('flags', 'flag_member_update', 'FOR UPDATE TO authenticated USING (EXISTS (SELECT 1 FROM ' + q('members') +
+    " m WHERE m.workspace_id = flags.workspace_id AND m.user_id = " + WHO + " AND m.role = 'member'))");
+  await policy('drafts', 'drafts_update', 'FOR UPDATE TO authenticated USING (' + staff('workspace_id', 'owner,admin,editor,member') + ')');
+  await policy('chores', 'chores_update', 'FOR UPDATE TO authenticated USING (' + q('can_touch') + '(workspace_id))');
+  // A viewer a list names, and a member given a rule of its own: the member
+  // is named, and the viewer is not said to have been unable.
+  for (const t of ['boards', 'pins']) await policy(t, 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
+  await policy('boards', 'boards_viewers', 'FOR UPDATE TO authenticated USING (' + staff('workspace_id', 'viewer') + ')');
+  await policy('boards', 'boards_member', 'FOR UPDATE TO authenticated USING (EXISTS (SELECT 1 FROM ' + q('members') +
+    " m WHERE m.workspace_id = boards.workspace_id AND m.user_id = " + WHO + " AND m.role = 'member'))");
+  await policy('stages', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
+  await policy('stages', 'stages_all', 'FOR ALL TO authenticated USING (' + staff('workspace_id', 'owner,admin,member') + ')');
+  await policy('stage_items', 'reads', 'FOR SELECT TO authenticated USING (' + member('workspace_id') + ')');
+  // Only a member may add a pin: adding is asked of a role that only looks.
+  await policy('pins', 'pins_member', 'FOR INSERT TO authenticated WITH CHECK (EXISTS (SELECT 1 FROM ' + q('members') +
+    " m WHERE m.workspace_id = pins.workspace_id AND m.user_id = " + WHO + " AND m.role = 'member'))");
   await policy('squad_members', 'squad_member_manage', 'FOR ALL TO authenticated USING (EXISTS (SELECT 1 FROM ' + q('squads') +
     ' t WHERE t.id = squad_id AND ' + member('t.workspace_id') + '))');
 }
@@ -246,7 +279,8 @@ async function ranked(client, app, engine) {
       const copied = await schema.readSchema(client, copy);
       const sown = await attack.seed(client, copy, copied.tables);
       before = await contentsOf(client, copy);
-      answer = await tamper.teammate(client, copy, copied.tables, sown.seeded);
+      answer = await tamper.teammate(client, copy, copied.tables, sown.seeded,
+        { policies: copied.policies, functions: copied.functions });
       after = await contentsOf(client, copy);
     } else {
       await sqlengine.withEngine(client, async (target) => {
@@ -255,7 +289,8 @@ async function ranked(client, app, engine) {
         const copied = await sqlengine.readSchema(client, target, copy);
         const sown = await sqlengine.seed(client, target, copy, copied.tables);
         before = await contentsOf(client, copy);
-        answer = await sqlengine.teammate(client, target, copy, copied.tables, sown.seeded);
+        answer = await sqlengine.teammate(client, target, copy, copied.tables, sown.seeded,
+          { policies: copied.policies, functions: copied.functions });
         after = await contentsOf(client, copy);
       });
     }
@@ -269,10 +304,41 @@ const told = (r) => ({
   findings: (r.findings || []).map((f) => f.kind + ':' + f.table + '/' + f.who + '/' + f.via + '.' + f.roleColumn + '/' + f.parent + '/' +
     (f.kind === 'teamread'
       ? 'read ' + f.readable + ' below ' + JSON.stringify(f.below) + ' ' + JSON.stringify(f.secrets)
-      : [...(f.can || [])].sort().join('+') + '/' + JSON.stringify(f.changed))).sort(),
+      : [...(f.can || [])].sort().join('+') + '/' + JSON.stringify(f.changed) +
+        ((f.below || []).length ? ' below ' + JSON.stringify(f.below) : ''))).sort(),
   completed: [...(r.completed || [])].sort(),
   blocked: (r.blocked || []).map((b) => b.key + ' ' + String(b.why).split(':').slice(0, 2).join(':')).sort(),
 });
+
+// Who a team's rules allow to write: LaunchRail's repository rule, its
+// production rule for one role, a helper's own list, and the edges.
+const RULE_LIST = { table_name: 'flags', permissive: 'PERMISSIVE', cmd: 'UPDATE',
+  qual: "has_project_role(project_id, ARRAY['owner'::kn_x.project_role, 'maintainer'::kn_x.project_role, 'developer'::kn_x.project_role])" };
+const RULE_ONE = { table_name: 'flags', permissive: 'PERMISSIVE', cmd: 'UPDATE',
+  qual: "(EXISTS ( SELECT 1 FROM projects p JOIN organization_members om ON true WHERE om.role = 'analyst'::org_role))" };
+const RULE_HELPER = { table_name: 'docs', permissive: 'PERMISSIVE', cmd: 'ALL', qual: 'can_edit(org_id)' };
+const RULE_NARROWS = { table_name: 'docs', permissive: 'RESTRICTIVE', cmd: 'DELETE', qual: "role = ANY (ARRAY['viewer'::text])" };
+const FNS = [{ name: 'can_edit', src: "select exists(select 1 from m where role in ('owner', 'editor'))" },
+  { name: 'is_admin', src: "select role = 'viewer'" }];
+// A list written as an array literal, the way roles.check's own helper calls are.
+const RULE_LITERAL = { table_name: 'drafts', permissive: 'PERMISSIVE', cmd: 'UPDATE',
+  qual: "kn_x.has_role(workspace_id, '{owner,admin,editor,member}'::kn_x.member_role[])" };
+const RULES = { policies: [RULE_LIST, RULE_ONE, RULE_HELPER, RULE_NARROWS, RULE_LITERAL], functions: FNS };
+const CASES = [
+  { rules: RULES, table: 'flags', what: 'change', role: 'developer', type: 'kn_x.project_role', want: true },
+  { rules: RULES, table: 'flags', what: 'change', role: 'developer', type: 'org_role', want: false },
+  { rules: RULES, table: 'flags', what: 'change', role: 'analyst', type: 'org_role', want: false },
+  { rules: RULES, table: 'flags', what: 'delete', role: 'developer', type: 'project_role', want: false },
+  { rules: RULES, table: 'flags', what: 'add', role: 'maintainer', type: 'project_role', want: false },
+  { rules: RULES, table: 'docs', what: 'delete', role: 'editor', type: 'text', want: true },
+  { rules: RULES, table: 'docs', what: 'delete', role: 'viewer', type: 'text', want: false },
+  { rules: RULES, table: 'other', what: 'change', role: 'developer', type: 'project_role', want: false },
+  { rules: RULES, table: 'drafts', what: 'change', role: 'member', type: 'kn_x.member_role', want: true },
+  { rules: RULES, table: 'drafts', what: 'change', role: 'owner', type: 'member_role', want: true },
+  { rules: RULES, table: 'drafts', what: 'change', role: 'mem', type: 'member_role', want: false },
+  { rules: RULES, table: 'drafts', what: 'change', role: 'viewer', type: 'member_role', want: false },
+  { rules: RULES, table: 'drafts', what: 'change', role: 'member', type: 'org_role', want: false },
+];
 
 /** Both engines, the whole scan, on one schema. */
 async function bothScans(client, app) {
@@ -318,6 +384,15 @@ async function main() {
         m.table.name + ':' + m.person + ':' + m.role + ':' + m.lowest + ':' + m.keys.map((k) => k.refTable).join('+') + ':' +
           m.ladder.join('>'));
     }
+    const nodeAllowed = CASES.map((c) => tamper.allowedByRules(c.rules, c.table, c.what, c.role, c.type));
+    const sqlAllowed = [];
+    await sqlengine.withEngine(client, async (target) => {
+      for (const c of CASES) {
+        const { rows } = await client.query('SELECT ' + schema.quote(target) + '.allowed_by_rules($1::jsonb, $2, $3, $4, $5) AS answer',
+          [JSON.stringify(c.rules), c.table, c.what, c.role, c.type]);
+        sqlAllowed.push(rows[0].answer);
+      }
+    });
     const sqlSays = { lowest: [], memberships: {} };
     await sqlengine.withEngine(client, async (target) => {
       for (const labels of LABELS) {
@@ -332,6 +407,15 @@ async function main() {
           m.ladder.join('>'));
       }
     });
+
+    check('a role a rule lists is allowed, and one given a rule of its own is not, the same in both engines', (() => {
+      const p = [];
+      const want = CASES.map((c) => c.want);
+      for (const [who, said] of [['node', nodeAllowed], ['sql', sqlAllowed]]) {
+        if (JSON.stringify(said) !== JSON.stringify(want)) p.push(who + ': ' + JSON.stringify(said) + ' want ' + JSON.stringify(want));
+      }
+      return p;
+    })());
 
     check('the lowest role is the one that may only look, in both engines', (() => {
       const p = [];
@@ -366,6 +450,8 @@ async function main() {
       const p = [];
       const want = [
         'role:customers/viewer/members.role/workspaces/add+change/{"add":1,"change":1}',
+        'role:flags/member/members.role/workspaces/change/{"change":1} below ["viewer"]',
+        'role:boards/member/members.role/workspaces/change/{"change":1}',
         'role:squad_members/viewer/members.role/workspaces/change+delete/{"change":1,"delete":1}',
         'role:tickets/viewer/members.role/workspaces/change/{"change":1}',
         'teamread:api_keys/member/members.role/workspaces/read 1 below ["viewer"] ["api_key"]',
@@ -386,6 +472,15 @@ async function main() {
           'comments', 'projects', 'milestones', 'signing_keys']) {
           if (!(r.answer.completed || []).includes('role:' + table + ':viewer')) p.push(who + ': ' + table + ' never tried');
         }
+        // A role a list names is passed over, and the roles above it still
+        // tried: every rung of drafts and chores, and none of them reported.
+        for (const table of ['drafts', 'chores', 'stages']) {
+          for (const role of ['viewer', 'member', 'editor']) {
+            if (!(r.answer.completed || []).includes('role:' + table + ':' + role)) p.push(who + ': ' + table + ' never tried as ' + role);
+          }
+        }
+        // Nobody in charge is ever tried.
+        if ((r.answer.completed || []).some((k) => /^role:.*:(owner|admin)$/.test(k))) p.push(who + ': tried a role in charge');
         // A secret only owner and admin read was asked of every lower role.
         for (const role of ['viewer', 'member']) {
           if (!(r.answer.completed || []).includes('teamread:signing_keys:' + role)) p.push(who + ': signing_keys never read as ' + role);
@@ -457,7 +552,7 @@ async function main() {
         if (result.stopped) { p.push(engine + ' stopped: ' + result.stopped); continue; }
         const roles = result.findings.filter((f) => f.kind === 'role' || f.kind === 'teamread');
         const names = roles.map((f) => f.kind + ':' + f.table).sort().join(',');
-        if (names !== 'role:customers,role:squad_members,role:tickets,teamread:api_keys,teamread:vault') p.push(engine + ' reported ' + names);
+        if (names !== 'role:boards,role:customers,role:flags,role:squad_members,role:tickets,teamread:api_keys,teamread:vault') p.push(engine + ' reported ' + names);
         for (const f of roles) {
           if (f.status !== 'verification required') p.push(engine + ' ' + f.table + ' is ' + f.status);
           if (f.severity !== 'HIGH') p.push(engine + ' ' + f.table + ' is ' + f.severity);
@@ -475,6 +570,17 @@ async function main() {
           p.push(engine + ': ' + keys.headline);
         }
         if (keys && !/As "viewer" they could not read it either\. Nothing was changed\./.test(keys.body)) p.push(engine + ': ' + keys.body);
+        // A role in the middle, named because the one under it held.
+        const flags = roles.find((f) => f.table === 'flags');
+        if (!flags) p.push(engine + ': flags not reported');
+        else {
+          if (flags.headline !== 'A "member" in a workspace can change rows in your flags table.') p.push(engine + ': ' + flags.headline);
+          const body = flags.body.replace(/\s+/g, ' ');
+          if (body.indexOf('as a "member" - a role in members.role -') < 0) p.push(engine + ' calls it the lowest role: ' + body);
+          if (body.indexOf('As "viewer" they could not either, and no rule on this table lists "member" among the roles allowed') < 0) {
+            p.push(engine + ' does not say who could not: ' + body);
+          }
+        }
         const squad = roles.find((f) => f.table === 'squad_members');
         if (squad && squad.headline !== 'A "viewer" in a workspace can delete rows from and change rows in your squad_members table.') {
           p.push(engine + ': ' + squad.headline);
@@ -505,10 +611,10 @@ async function main() {
       const fn = require('./finding.js').describe({ kind: 'privileged', fn: 'export_all', table: 'export_all', args: '', columns: [] });
       const p = [];
       const alone = printed(roles);
-      if (!/3 things to check - whether each is a problem is your decision\./.test(alone)) p.push(alone.split('\n').slice(0, 4).join(' | '));
+      if (!/5 things to check - whether each is a problem is your decision\./.test(alone)) p.push(alone.split('\n').slice(0, 4).join(' | '));
       if (/problems? found/.test(alone)) p.push('counted as problems');
       const mixed = printed(roles.concat([fn]));
-      if (!/4 things to check - whether each is a problem is your decision\./.test(mixed)) p.push(mixed.split('\n').slice(0, 4).join(' | '));
+      if (!/6 things to check - whether each is a problem is your decision\./.test(mixed)) p.push(mixed.split('\n').slice(0, 4).join(' | '));
       const onlyRead = printed([fn]);
       if (!/1 thing to check - I did not attack it, only spotted the risk\./.test(onlyRead)) p.push(onlyRead.split('\n').slice(0, 4).join(' | '));
       return p;
@@ -535,7 +641,7 @@ async function main() {
       if (!night) return ['no run was written'];
       if (night.stopped) return ['stopped: ' + night.stopped];
       const roles = (night.findings || []).filter((f) => f.kind === 'role' || f.kind === 'teamread').map((f) => f.kind + ':' + f.table).sort().join(',');
-      return roles === 'role:customers,role:squad_members,role:tickets,teamread:api_keys,teamread:vault' ? [] : ['found ' + roles];
+      return roles === 'role:boards,role:customers,role:flags,role:squad_members,role:tickets,teamread:api_keys,teamread:vault' ? [] : ['found ' + roles];
     })());
 
     // ------------------------------------------------ the re-check

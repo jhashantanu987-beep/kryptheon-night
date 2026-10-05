@@ -153,7 +153,7 @@ function nodeEngine() {
     tamper: (client, into, tables, seeded, policies) =>
       tamper.tamper(client, into, tables, seeded, policies),
     orphan: (client, into, tables, seeded) => orphan.orphan(client, into, tables, seeded),
-    teammate: (client, into, tables, seeded) => tamper.teammate(client, into, tables, seeded),
+    teammate: (client, into, tables, seeded, rules) => tamper.teammate(client, into, tables, seeded, rules),
   };
 }
 
@@ -305,7 +305,10 @@ async function scan(client, sourceSchema, options) {
 
     // What the least trusted member of a team can change there. Rolled back
     // like the writes above, and the joining with them.
-    const ranked = await engine.teammate(client, copyName, theirs, sown.seeded);
+    // With the copy's rules and helpers, so a role a rule lists as allowed to
+    // write is not reported (tamper.allowedByRules).
+    const ranked = await engine.teammate(client, copyName, theirs, sown.seeded,
+      { policies: copyPlan.policies, functions: copyPlan.functions });
     for (const key of ranked.completed) attempted.push(key);
     for (const stuck of ranked.blocked) {
       notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });

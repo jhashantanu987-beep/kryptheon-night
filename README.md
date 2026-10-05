@@ -74,7 +74,7 @@ whether they are meant:
 
 | check | the question |
 |---|---|
-| **Lowest role** | can a viewer in a team change or add to what is in it, and which roles can read its tokens, keys and payloads? (tried on the copy, undone) |
+| **Team roles** | which role in a team, from the lowest up, can change what its rules do not list it for, and which can read its tokens, keys and payloads? (tried on the copy, undone) |
 | **Storage** | is a bucket public although a rule says who may read it? (settings only, never a file) |
 | **Open functions** | can a visitor with no account call a function that skips the rules? |
 

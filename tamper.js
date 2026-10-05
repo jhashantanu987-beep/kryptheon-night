@@ -289,7 +289,7 @@ function roleColumnOf(table) {
     // the order reads are tried in, so the least trusted one that can read a
     // secret is the one named.
     const ladder = [lowest].concat(labels.filter((label) => label !== lowest && !IN_CHARGE.test(label)).reverse());
-    if (lowest) return { column: column.name, lowest: lowest, ladder: ladder };
+    if (lowest) return { column: column.name, type: column.type, lowest: lowest, ladder: ladder };
   }
   return null;
 }
@@ -325,11 +325,49 @@ function memberships(tables) {
     const keys = attack.foreignKeys(table).concat(attack.impliedKeys(table, tables))
       .filter((key) => key.refTable !== table.name && names.has(key.refTable) && !key.columns.includes(person));
     if (!keys.length || aloneUnique(table, person)) continue;
-    found.push({ table: table, person: person, role: role.column, lowest: role.lowest, ladder: role.ladder, keys: keys });
+    found.push({ table: table, person: person, role: role.column, roleType: role.type, lowest: role.lowest,
+      ladder: role.ladder, keys: keys });
   }
   // A table named for members first: it is the one a team rule asks.
   const named = (m) => (/member/i.test(m.table.name) ? 0 : 1);
   return found.map((m, i) => [m, i]).sort((a, b) => named(a[0]) - named(b[0]) || a[1] - b[1]).map((pair) => pair[0]);
+}
+
+// What each kind of write is called in a rule.
+const COMMAND = { add: 'INSERT', change: 'UPDATE', delete: 'DELETE' };
+
+/**
+ * Whether the app's own rules name this role among those allowed to make
+ * this kind of write - the way a repository's role rule does it: the role in
+ * a list in a permissive rule for that command, has_role(team,
+ * ARRAY['owner', 'maintainer', 'developer']), or in a list inside a helper
+ * that rule calls (role IN ('owner', 'developer')). A rule written for one
+ * role on its own - role = 'analyst', the shape production added in
+ * LaunchRail - is not a list of who may write, and stays something to check.
+ */
+function allowedByRules(rules, table, what, role, type) {
+  const escape = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const label = "'" + escape(String(role).split("'").join("''")) + "'";
+  const typeName = escape(String(type || 'text').split('.').pop().split('"').join(''));
+  const inRuleList = new RegExp('ARRAY\\[[^\\]]*' + label + '::("?[A-Za-z0-9_$]+"?\\.)?"?' + typeName + '"?', 'i');
+  // The same list written as an array literal - has_role(team,
+  // '{owner,admin,member}') - which Postgres keeps as '{...}'::role[].
+  const bare = escape(String(role));
+  const inRuleLiteral = new RegExp("'\\{([^}']*,)?\"?" + bare + "\"?(,[^}']*)?\\}'::(\"?[A-Za-z0-9_$]+\"?\\.)?\"?" +
+    typeName + '"?\\[\\]', 'i');
+  const inHelperList = new RegExp('(\\bIN\\s*\\(|ARRAY\\[)[^)\\]]*' + label, 'i');
+  const calls = (text, name) => new RegExp('(^|[^A-Za-z0-9_$])"?' + escape(name) + '"?\\s*\\(').test(text);
+  const functions = (rules && rules.functions) || [];
+  for (const policy of (rules && rules.policies) || []) {
+    if (policy.table_name !== table) continue;
+    if (String(policy.permissive || 'PERMISSIVE').toUpperCase() !== 'PERMISSIVE') continue;
+    const cmd = String(policy.cmd || 'ALL').toUpperCase();
+    if (cmd !== 'ALL' && cmd !== COMMAND[what]) continue;
+    const text = String(policy.qual || '') + ' ' + String(policy.with_check || '');
+    if (inRuleList.test(text) || inRuleLiteral.test(text)) return true;
+    if (functions.some((fn) => calls(text, fn.name) && inHelperList.test(String(fn.src || '')))) return true;
+  }
+  return false;
 }
 
 /**
@@ -341,7 +379,7 @@ function memberships(tables) {
  * and a person changing their own rows is the feature. Both rolled back, the
  * joining with them.
  */
-async function teammate(client, schema, tables, seeded) {
+async function teammate(client, schema, tables, seeded, rules) {
   const findings = [];
   const completed = [];
   const blocked = [];
@@ -413,7 +451,6 @@ async function teammate(client, schema, tables, seeded) {
     for (const table of tables) {
       if (!shapeFor.has(table.name) || done.has(table.name)) continue;
       done.add(table.name);
-      const key = 'role:' + table.name + ':' + member.lowest;
       const owner = attack.ownerColumn(table);
       // A table that names the team itself, and the team it is to name.
       const toTeam = attack.foreignKeys(table).concat(attack.impliedKeys(table, tables))
@@ -448,11 +485,12 @@ async function teammate(client, schema, tables, seeded) {
       // under the other person's name: a rule that lets a member add a row
       // only as themselves - a note they wrote - is a member speaking for
       // themselves, and refuses it (OrbitDesk's internal notes, by design).
-      if (lookOnly(member.lowest) && toTeam) {
+      if (toTeam && member.ladder.some(lookOnly)) {
         try {
           const row = await attack.rowFor(client, schema, table, attack.USER_A, 11, pointed, shapeFor.get(table.name));
           moves.unshift({
             what: 'add',
+            lookOnly: true,
             statement: row.columns.length
               ? 'INSERT INTO ' + target + ' (' + row.columns.map(quote).join(', ') + ') VALUES (' +
                 row.values.map((_, i) => '$' + (i + 1)).join(', ') + ')'
@@ -463,39 +501,75 @@ async function teammate(client, schema, tables, seeded) {
           // Nothing to point a new row at: there is no row to add.
         }
       }
-      const can = [];
-      const changed = {};
-      let stuck = null;
+
+      // Every role not in charge, from the lowest up, the way reads are tried:
+      // found on a blind test (LaunchRail), where production gave the
+      // "analyst" role its own UPDATE rule on feature flags and only the
+      // "viewer" below it was ever tried. The first role that can write where
+      // the app's own rules do not list it is the one named; a role a rule
+      // lists among those allowed to write is the design, and the roles above
+      // it are still tried. What each write did before joining is asked once.
+      const beforeJoining = new Map();
       for (const move of moves) {
-        const before = await tryWrite(client, 'authenticated', attack.USER_B, move.statement, move.values);
-        const after = await tryWrite(client, 'authenticated', attack.USER_B, move.statement, move.values, join);
-        const was = counted(before);
-        const now = counted(after);
-        if (was === null || now === null) {
-          stuck = now === null ? after.why : before.why;
-        } else if (now > was) {
-          can.push(move.what);
-          changed[move.what] = now - was;
-        }
+        beforeJoining.set(move.what, await tryWrite(client, 'authenticated', attack.USER_B, move.statement, move.values));
       }
-      if (!can.length && stuck) {
-        blocked.push({ table: table.name, key: key, why: as(member.lowest) + ': ' + stuck });
-      } else {
+      const below = [];
+      for (const role of member.ladder) {
+        const key = 'role:' + table.name + ':' + role;
+        let joined;
+        try {
+          joined = await joinAs(role);
+        } catch (err) {
+          blocked.push({ table: table.name, key: key, why: as(role) + ': I could not add one: ' + err.message });
+          break;
+        }
+        const can = [];
+        const changed = {};
+        let stuck = null;
+        // Whether this role could write where the rules list it: then it is
+        // not one that "could not", whatever is said of the roles above it.
+        let listed = false;
+        for (const move of moves) {
+          if (move.lookOnly && !lookOnly(role)) continue;
+          // A write the rules list this role for is not asked: whatever it
+          // did would not be reported, and a key refusing it on the way out
+          // left the table untested (HelixOps' assets, as a dispatcher).
+          if (allowedByRules(rules, table.name, move.what, role, member.roleType)) {
+            listed = true;
+            continue;
+          }
+          const after = await tryWrite(client, 'authenticated', attack.USER_B, move.statement, move.values, joined);
+          const was = counted(beforeJoining.get(move.what));
+          const now = counted(after);
+          if (was === null || now === null) {
+            stuck = now === null ? after.why : beforeJoining.get(move.what).why;
+          } else if (now > was) {
+            can.push(move.what);
+            changed[move.what] = now - was;
+          }
+        }
+        if (!can.length && stuck) {
+          blocked.push({ table: table.name, key: key, why: as(role) + ': ' + stuck });
+          break;
+        }
         completed.push(key);
         if (can.length) {
           findings.push({
             kind: 'role',
             table: table.name,
-            who: member.lowest,
+            who: role,
             via: member.table.name,
             roleColumn: member.role,
             parent: parent,
             can: can,
             changed: changed,
+            below: below.slice(),
             columns: (table.columns || []).map((c) => c.name),
             rlsEnabled: table.rlsEnabled,
           });
+          break;
         }
+        if (!listed) below.push(role);
       }
 
       // Reading what a member should not see, said only of a table holding a
@@ -552,6 +626,7 @@ module.exports = {
   writeAsFor: writeAsFor,
   tamper: tamper,
   lowestRole: lowestRole,
+  allowedByRules: allowedByRules,
   secretColumns: secretColumns,
   lookOnly: lookOnly,
   roleColumnOf: roleColumnOf,

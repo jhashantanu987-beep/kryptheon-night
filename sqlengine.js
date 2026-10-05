@@ -115,10 +115,10 @@ async function tamper(client, target, into, tables, seeded, policies) {
 }
 
 /** What the least trusted member of a team can change. Rolled back inside the engine. */
-async function teammate(client, target, into, tables, seeded) {
+async function teammate(client, target, into, tables, seeded, rules) {
   const { rows } = await client.query(
-    'SELECT ' + quote(target) + '.teammate($1, $2::jsonb, $3::jsonb) AS answer',
-    [into, JSON.stringify(tables), JSON.stringify(seeded)],
+    'SELECT ' + quote(target) + '.teammate($1, $2::jsonb, $3::jsonb, $4::jsonb) AS answer',
+    [into, JSON.stringify(tables), JSON.stringify(seeded), JSON.stringify(rules || {})],
   );
   return rows[0].answer;
 }
@@ -171,7 +171,7 @@ function adapterFor(target) {
     tamper: (client, into, tables, sown, policies) =>
       tamper(client, target, into, tables, sown, policies),
     orphan: (client, into, tables, sown) => orphan(client, target, into, tables, sown),
-    teammate: (client, into, tables, sown) => teammate(client, target, into, tables, sown),
+    teammate: (client, into, tables, sown, rules) => teammate(client, target, into, tables, sown, rules),
   };
 }
 

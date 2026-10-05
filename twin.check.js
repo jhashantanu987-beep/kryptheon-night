@@ -515,10 +515,12 @@ async function main() {
       }
       // And what the least trusted member of a team can change. Rolled back
       // like the writes, so the tables are compared again afterwards.
-      const mineRanked = await tamper.teammate(client, byNode, fromNode.tables, mineSeeded.seeded);
+      const mineRanked = await tamper.teammate(client, byNode, fromNode.tables, mineSeeded.seeded,
+        { policies: fromNode.policies, functions: fromNode.functions });
       let theirsRanked = null;
       await sqlengine.withEngine(client, async (target) => {
-        theirsRanked = await sqlengine.teammate(client, target, bySql, fromSql.tables, theirsSeeded.seeded);
+        theirsRanked = await sqlengine.teammate(client, target, bySql, fromSql.tables, theirsSeeded.seeded,
+          { policies: fromSql.policies, functions: fromSql.functions });
       });
       const ranked = (r) => JSON.stringify({
         findings: (r.findings || []).map((f) => f.table + '/' + f.who + '/' + f.via + '.' + f.roleColumn + '/' +
