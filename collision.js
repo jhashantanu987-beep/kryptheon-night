@@ -69,6 +69,20 @@ const MUST_BE_UNIQUE = [
  */
 const ACCOUNT_TABLE = /^(users?|profiles?|accounts?|members?|auth_users|app_users|logins?)$/i;
 
+/**
+ * Tables that keep another service's credentials, so this app can call it.
+ *
+ * A token there was issued by somebody else and opens nothing in this app, so
+ * two rows sharing one is not a way in. Found on a blind test (LaunchRail):
+ * integration_credentials.access_token and refresh_token were reported as
+ * "can exist twice" - not in the answer key, and not a door into the app.
+ * Known by the table's name, or by a `provider` column naming the service.
+ */
+const OUTBOUND_TABLE = /(^|_)(integrations?|providers?|oauth|connections?|connectors?|external|third_party)(_|$)/i;
+function holdsOutboundCredentials(table) {
+  return OUTBOUND_TABLE.test(table.name) || (table.columns || []).some((c) => /^provider$/i.test(c.name));
+}
+
 /** Everything on a table that already promises "only one of these". */
 function uniquenessTexts(table, indexes) {
   const fromConstraints = (table.constraints || [])
@@ -118,6 +132,7 @@ function candidates(tables, indexes) {
       const rule = MUST_BE_UNIQUE.find((r) => r.test.test(column.name));
       if (!rule) continue;
       if (rule.accountTablesOnly && !ACCOUNT_TABLE.test(table.name)) continue;
+      if (rule.expectation === 'credential' && holdsOutboundCredentials(table)) continue;
       found.push({
         table: table.name,
         column: column.name,

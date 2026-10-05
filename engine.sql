@@ -3222,11 +3222,20 @@ DECLARE
   tab jsonb;
   col jsonb;
   expectation text;
+  outbound boolean;
 BEGIN
   FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
+    -- A table keeping another service's credentials, so this app can call
+    -- it: a token there opens nothing in this app, and two rows sharing one
+    -- is not a way in. Found on a blind test (LaunchRail), where
+    -- integration_credentials.access_token was reported as "can exist twice".
+    outbound := tab->>'name' ~* '(^|_)(integrations?|providers?|oauth|connections?|connectors?|external|third_party)(_|$)'
+      OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(tab->'columns', '[]'::jsonb)) c
+                  WHERE c->>'name' ~* '^provider$');
     FOR col IN SELECT * FROM jsonb_array_elements(coalesce(tab->'columns', '[]'::jsonb)) LOOP
       expectation := __KN__.must_be_unique(col->>'name', tab->>'name');
       CONTINUE WHEN expectation IS NULL;
+      CONTINUE WHEN expectation = 'credential' AND outbound;
       found := found || jsonb_build_array(jsonb_build_object(
         'table', tab->>'name',
         'column', col->>'name',

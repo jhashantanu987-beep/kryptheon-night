@@ -38,6 +38,7 @@ const { Client } = require('pg');
 const schema = require('./schema.js');
 const collision = require('./collision.js');
 const finding = require('./finding.js');
+const sqlengine = require('./sqlengine.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 const APP = 'kn_col_' + Date.now().toString(36);
@@ -85,6 +86,28 @@ async function buildApp(client) {
       ' (id serial PRIMARY KEY, token text NOT NULL, amount int NOT NULL CHECK (amount > 1000000))',
   );
 
+  // Tokens another service issued, kept so this app can call that service.
+  // Two rows holding the same one open nothing in this app. Found on a blind
+  // test (LaunchRail): integration_credentials.access_token and refresh_token
+  // were each reported as "can exist twice" - not in the answer key, and not
+  // a door into the app at all.
+  await client.query(
+    'CREATE TABLE ' + q('integration_credentials') +
+      ' (id serial PRIMARY KEY, provider text NOT NULL, access_token text NOT NULL, refresh_token text NOT NULL)',
+  );
+  // Known by one word of the name each, so each word is checked on its own.
+  await client.query('CREATE TABLE ' + q('oauth_tokens') + ' (id serial PRIMARY KEY, access_token text NOT NULL)');
+  await client.query('CREATE TABLE ' + q('slack_connections') + ' (id serial PRIMARY KEY, access_token text NOT NULL)');
+  await client.query('CREATE TABLE ' + q('stripe_integrations') + ' (id serial PRIMARY KEY, access_token text NOT NULL)');
+  await client.query(
+    'CREATE TABLE ' + q('user_identities') + ' (id serial PRIMARY KEY, provider text NOT NULL, access_token text NOT NULL)',
+  );
+  // Only another service's credentials are let off. A one-time code on such a
+  // table is this app's own, and can still be redeemed twice.
+  await client.query(
+    'CREATE TABLE ' + q('integration_invites') + ' (id serial PRIMARY KEY, provider text NOT NULL, invite_code text NOT NULL)',
+  );
+
   // Uniqueness enforced by something that is neither a UNIQUE constraint nor a
   // unique index, so the catalogue check cannot see it. The only thing that
   // gets this right is racing the column and counting what actually landed.
@@ -130,7 +153,7 @@ async function main() {
 
     check('1. it reports exactly the columns where a duplicate is a security problem', (() => {
       const problems = [];
-      const wanted = ['accounts.email', 'coupons.coupon_code', 'sessions.session_token', 'users.email'];
+      const wanted = ['accounts.email', 'coupons.coupon_code', 'integration_invites.invite_code', 'sessions.session_token', 'users.email'];
       const missing = wanted.filter((w) => !foundAs.includes(w));
       const extra = foundAs.filter((p) => !wanted.includes(p));
       if (missing.length) problems.push('it missed ' + missing.join(', '));
@@ -172,6 +195,32 @@ async function main() {
       const problems = [];
       if (pickedAs.includes('customers.email')) problems.push('it guessed that customers is a login table');
       return problems;
+    })());
+
+    check('6b. a token another service issued is not treated as a way into this app', (() => {
+      const problems = [];
+      for (const outbound of ['integration_credentials.access_token', 'integration_credentials.refresh_token',
+        'oauth_tokens.access_token', 'slack_connections.access_token', 'stripe_integrations.access_token',
+        'user_identities.access_token']) {
+        if (pickedAs.includes(outbound)) problems.push('it treated ' + outbound + ' as a login credential');
+      }
+      if (!pickedAs.includes('sessions.session_token')) problems.push('this app\'s own session token is no longer looked at');
+      if (!pickedAs.includes('integration_invites.invite_code')) problems.push('a one-time code on such a table was let off too');
+      return problems;
+    })());
+
+    // The engine inside the database decides the same columns.
+    let sqlPicked = null;
+    await sqlengine.withEngine(client, async (target) => {
+      const { rows } = await client.query(
+        'SELECT ' + schema.quote(target) + '.collision_candidates($1::jsonb, $2::jsonb) AS answer',
+        [JSON.stringify(plan.tables), JSON.stringify(plan.indexes)],
+      );
+      sqlPicked = (rows[0].answer || []).map((p) => p.table + '.' + p.column + ':' + p.expectation + ':' + p.covered).sort();
+    });
+    check('6c. both engines pick the same columns to race', (() => {
+      const mine = picked.map((p) => p.table + '.' + p.column + ':' + p.expectation + ':' + p.covered).sort();
+      return JSON.stringify(mine) === JSON.stringify(sqlPicked) ? [] : ['node ' + JSON.stringify(mine) + ' sql ' + JSON.stringify(sqlPicked)];
     })());
 
     check('6. a column that merely looks like a token is not treated as one', (() => {

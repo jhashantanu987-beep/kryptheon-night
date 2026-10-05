@@ -76,10 +76,10 @@ async function buildApp(client, app) {
       ' (id serial PRIMARY KEY, owner uuid NOT NULL, name text NOT NULL, email text NOT NULL, phone text)',
   );
   await client.query(
-    'CREATE TABLE ' + q('integrations') +
-      ' (id serial PRIMARY KEY, owner uuid NOT NULL, provider text NOT NULL, api_key text NOT NULL)',
+    'CREATE TABLE ' + q('api_clients') +
+      ' (id serial PRIMARY KEY, owner uuid NOT NULL, api_key text NOT NULL)',
   );
-  for (const t of ['profiles', 'customers', 'integrations']) {
+  for (const t of ['profiles', 'customers', 'api_clients']) {
     await client.query('GRANT SELECT ON ' + q(t) + ' TO anon, authenticated');
   }
   await client.query('ALTER TABLE ' + q('profiles') + ' ENABLE ROW LEVEL SECURITY');
@@ -91,7 +91,10 @@ async function buildApp(client, app) {
   await client.query(
     'CREATE POLICY read_customers ON ' + q('customers') + ' FOR SELECT TO anon, authenticated USING (true)',
   );
-  // integrations: never switched on at all, and it holds api_key.
+  // api_clients: never switched on at all, and it holds api_key - the key other
+  // systems use to call this app, so two rows sharing one is a way in. (It
+  // was "integrations" with a provider column until a blind test showed that
+  // a key kept for calling another service is not; collision.js now lets those off.)
 }
 
 const problems = [];
@@ -124,7 +127,7 @@ function must(condition, what) {
     const first = cli([appA]);
     must(first.code === 1, 'the first scan exits non-zero because it found problems');
     must(/customers/.test(first.out), 'it names the table with the rule that lets everyone through');
-    must(/integrations/.test(first.out), 'it names the table with no protection at all');
+    must(/api_clients/.test(first.out), 'it names the table with no protection at all');
     must(/access tokens/.test(first.out), 'it says an api_key column is access tokens');
     // Both attacks, through one command: the open door and the duplicate.
     must(/exist twice/.test(first.out), 'it ran the collision attack too, not only impersonation');
@@ -161,12 +164,12 @@ function must(condition, what) {
     await client.query(
       'CREATE POLICY own_customers ON ' + q('customers') + ' FOR SELECT TO authenticated USING (owner = auth.uid())',
     );
-    await client.query('ALTER TABLE ' + q('integrations') + ' ENABLE ROW LEVEL SECURITY');
+    await client.query('ALTER TABLE ' + q('api_clients') + ' ENABLE ROW LEVEL SECURITY');
     await client.query(
-      'CREATE POLICY own_integrations ON ' + q('integrations') +
+      'CREATE POLICY own_api_clients ON ' + q('api_clients') +
         ' FOR SELECT TO authenticated USING (owner = auth.uid())',
     );
-    await client.query('ALTER TABLE ' + q('integrations') + ' ADD CONSTRAINT integrations_api_key_key UNIQUE (api_key)');
+    await client.query('ALTER TABLE ' + q('api_clients') + ' ADD CONSTRAINT api_clients_api_key_key UNIQUE (api_key)');
 
     console.log('');
     console.log('  --- re-check after a real fix ---');
@@ -195,7 +198,7 @@ function must(condition, what) {
 
     // One table genuinely fixed, the other one deleted rather than secured.
     const q = (t) => schema.quote(appB) + '.' + schema.quote(t);
-    await client.query('DROP TABLE ' + q('integrations'));
+    await client.query('DROP TABLE ' + q('api_clients'));
     await client.query('DROP POLICY read_customers ON ' + q('customers'));
     await client.query(
       'CREATE POLICY own_customers ON ' + q('customers') + ' FOR SELECT TO authenticated USING (owner = auth.uid())',
@@ -206,7 +209,7 @@ function must(condition, what) {
     const again = cli([appB, '--recheck']);
     must(again.code !== 0, 'a re-check it could not complete does not exit 0, got ' + again.code);
     must(/could NOT confirm/.test(again.out), 'it says it could not confirm');
-    must(/integrations/.test(again.out), 'it names the table it could not confirm');
+    must(/api_clients/.test(again.out), 'it names the table it could not confirm');
     must(!/Kryptheon Verified/.test(again.out), 'it withholds the badge');
     must(!/3 problems are fixed/.test(again.out), 'it does not count the dropped table as fixed');
     must(/1 problem is fixed/.test(again.out), 'it still credits the one real fix');
