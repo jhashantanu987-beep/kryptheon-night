@@ -335,6 +335,38 @@ RETURNS jsonb LANGUAGE sql STABLE AS $$
     ) rows;
 $$;
 
+/*
+ * Supabase Storage's buckets: whether each is public, and the rules on
+ * storage.objects that say who may read it. The settings and the rules only,
+ * never a file. Run through EXECUTE because a database without Supabase
+ * Storage has no storage.buckets to name, and that failure is caught below
+ * and read as no buckets. Mirrors readBuckets in schema.js.
+ */
+CREATE OR REPLACE FUNCTION __KN__.read_buckets()
+RETURNS jsonb LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  found jsonb;
+BEGIN
+  EXECUTE $q$
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+              'id', b.id::text,
+              'name', b.name::text,
+              'public', coalesce(b.public, false),
+              'readRules', (SELECT coalesce(jsonb_agg(jsonb_build_object(
+                                     'name', p.policyname::text,
+                                     'roles', to_jsonb(p.roles::text[]),
+                                     'qual', p.qual) ORDER BY p.policyname), '[]'::jsonb)
+                              FROM pg_policies p
+                             WHERE p.schemaname = 'storage' AND p.tablename = 'objects'
+                               AND p.cmd IN ('SELECT', 'ALL')
+                               AND position(quote_literal(b.id::text) IN coalesce(p.qual, '')) > 0)
+            ) ORDER BY b.id), '[]'::jsonb)
+       FROM storage.buckets b $q$ INTO found;
+  RETURN found;
+EXCEPTION WHEN OTHERS THEN
+  RETURN '[]'::jsonb;
+END $$;
+
 /* Everything needed to rebuild a schema, in one shape. */
 CREATE OR REPLACE FUNCTION __KN__.read_schema(source text)
 RETURNS jsonb LANGUAGE plpgsql STABLE AS $$
@@ -362,6 +394,7 @@ BEGIN
     'views', __KN__.read_views(source),
     'viewGrants', __KN__.read_view_grants(source),
     'functions', __KN__.read_functions(source),
+    'buckets', __KN__.read_buckets(),
     -- A foreign key pointing at something whose shape could not be read is
     -- not something to guess at. The caller stops rather than attacking a
     -- copy that is missing a piece.
@@ -2330,6 +2363,308 @@ BEGIN
 END $$;
 
 -- --------------------------------------------------------------------------
+-- What the least trusted member of a team can change.
+--
+-- Mirrors teammate in tamper.js. One fake person joins the other's team with
+-- the lowest role there is, for one attempt at a time, and every write is
+-- tried before joining and after, so only what joining added is counted.
+-- Reported as something to check: whether a viewer may edit is the owner's
+-- decision. Found on two blind tests, where five holes of this shape - "any
+-- member may change it", or an UPDATE rule that checks the role beside one
+-- that does not - went unreported.
+-- --------------------------------------------------------------------------
+
+/* The role a viewer has, out of a team's list of roles, or null. */
+CREATE OR REPLACE FUNCTION __KN__.lowest_role(labels jsonb)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  pattern text;
+  found text;
+BEGIN
+  -- Labels that say "may only look", tried in this order before falling back
+  -- to the last label that is not plainly in charge.
+  FOREACH pattern IN ARRAY ARRAY['view', 'read', 'guest', 'observ', 'audit'] LOOP
+    SELECT l INTO found FROM jsonb_array_elements_text(labels) WITH ORDINALITY AS e(l, at)
+     WHERE l ~* pattern ORDER BY at LIMIT 1;
+    IF found IS NOT NULL THEN RETURN found; END IF;
+  END LOOP;
+  SELECT l INTO found FROM jsonb_array_elements_text(labels) WITH ORDINALITY AS e(l, at)
+   WHERE l !~* 'owner|admin|super|root' ORDER BY at DESC LIMIT 1;
+  RETURN found;
+END $$;
+
+/*
+ * The column holding a member's role, and its lowest value: named for a role,
+ * with a fixed list of values.
+ */
+CREATE OR REPLACE FUNCTION __KN__.role_column_of(tab jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  col jsonb;
+  labels jsonb;
+  lowest text;
+BEGIN
+  FOR col IN SELECT * FROM jsonb_array_elements(coalesce(tab->'columns', '[]'::jsonb)) LOOP
+    CONTINUE WHEN (col->>'name') !~* 'role';
+    IF jsonb_typeof(col->'enum_labels') = 'array' AND jsonb_array_length(col->'enum_labels') > 0 THEN
+      labels := col->'enum_labels';
+    ELSE
+      labels := to_jsonb(__KN__.allowed_by_check(tab, col->>'name'));
+    END IF;
+    CONTINUE WHEN labels IS NULL OR jsonb_array_length(labels) < 2;
+    lowest := __KN__.lowest_role(labels);
+    IF lowest IS NOT NULL THEN
+      RETURN jsonb_build_object('column', col->>'name', 'lowest', lowest);
+    END IF;
+  END LOOP;
+  RETURN NULL;
+END $$;
+
+/* Whether a column is a key on its own: one row per person, at most. */
+CREATE OR REPLACE FUNCTION __KN__.alone_unique(tab jsonb, column_name text)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+  SELECT EXISTS (
+    SELECT 1
+      FROM jsonb_array_elements(coalesce(tab->'constraints', '[]'::jsonb)) c,
+           LATERAL regexp_match(c->>'definition', '(?:PRIMARY KEY|UNIQUE) \(([^)]+)\)', 'i') m
+     WHERE c->>'kind' IN ('p', 'u')
+       AND array_length(string_to_array(m[1], ','), 1) = 1
+       AND replace(trim(m[1]), '"', '') = column_name);
+$$;
+
+/*
+ * The tables saying who is in which team, and as what: a person, a role, and
+ * a key to a table of the app's own that is not the person. A table where the
+ * person can appear only once is not one: nobody joins a second team there.
+ */
+CREATE OR REPLACE FUNCTION __KN__.memberships(tables jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  found jsonb := '[]'::jsonb;
+  tab jsonb;
+  person text;
+  role_ jsonb;
+  keys jsonb;
+BEGIN
+  FOR tab IN SELECT * FROM jsonb_array_elements(coalesce(tables, '[]'::jsonb)) LOOP
+    person := __KN__.owner_column(tab);
+    -- Whoever made the row is not who is in the team: an invitation's
+    -- created_by makes nobody a member of anything.
+    CONTINUE WHEN person IS NULL OR person ~* '^(created_by|author_id|owner|owner_id)$';
+    role_ := __KN__.role_column_of(tab);
+    CONTINUE WHEN role_ IS NULL;
+    SELECT coalesce(jsonb_agg(k ORDER BY at), '[]'::jsonb) INTO keys
+      FROM jsonb_array_elements(__KN__.foreign_keys(tab) || __KN__.implied_keys(tab, tables))
+           WITH ORDINALITY AS e(k, at)
+     WHERE k->>'refTable' <> tab->>'name'
+       AND EXISTS (SELECT 1 FROM jsonb_array_elements(tables) t WHERE t->>'name' = k->>'refTable')
+       AND NOT (k->'columns' ? person);
+    CONTINUE WHEN jsonb_array_length(keys) = 0 OR __KN__.alone_unique(tab, person);
+    found := found || jsonb_build_array(jsonb_build_object(
+      'table', tab, 'person', person, 'role', role_->>'column', 'lowest', role_->>'lowest', 'keys', keys));
+  END LOOP;
+  -- A table named for members first: it is the one a team rule asks.
+  SELECT coalesce(jsonb_agg(m ORDER BY (m->'table'->>'name') !~* 'member', at), '[]'::jsonb) INTO found
+    FROM jsonb_array_elements(found) WITH ORDINALITY AS e(m, at);
+  RETURN found;
+END $$;
+
+/*
+ * try_write, with something the copy's owner does first inside the same
+ * subtransaction - putting a person into a team - so it is undone with the
+ * write. A function of its own rather than a fourth argument: an installed
+ * engine upgraded in place would keep the old three-argument one beside it,
+ * and every call would become ambiguous.
+ */
+CREATE OR REPLACE FUNCTION __KN__.try_write_joined(role_ text, identity text, statement text, join_ text)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  claims text := CASE WHEN identity IS NULL
+    THEN json_build_object('role', role_)::text
+    ELSE json_build_object('sub', identity, 'role', role_)::text END;
+  moved bigint := 0;
+  worked boolean := false;
+  why text := NULL;
+BEGIN
+  BEGIN
+    EXECUTE join_;
+    EXECUTE 'SET LOCAL statement_timeout = ' || quote_literal('15s');
+    EXECUTE 'SET LOCAL ROLE ' || quote_ident(role_);
+    PERFORM set_config('request.jwt.claims', claims, true);
+
+    EXECUTE statement;
+    GET DIAGNOSTICS moved = ROW_COUNT;
+    worked := true;
+
+    RAISE EXCEPTION 'kryptheon: undoing the write' USING ERRCODE = 'KN001';
+  EXCEPTION
+    WHEN SQLSTATE 'KN001' THEN
+      NULL;
+    WHEN OTHERS THEN
+      worked := false;
+      moved := 0;
+      why := SQLERRM;
+  END;
+
+  RESET ROLE;
+  PERFORM set_config('request.jwt.claims', '', true);
+  PERFORM set_config('statement_timeout', '0', true);
+  RETURN jsonb_build_object('ok', worked, 'count', moved, 'why', why);
+END $$;
+
+/* A write's rows, or null when it decided nothing. */
+CREATE OR REPLACE FUNCTION __KN__.rows_moved(result jsonb)
+RETURNS bigint LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE __KN__.what_happened(result)
+    WHEN 'untested' THEN NULL
+    WHEN 'got through' THEN (result->>'count')::bigint
+    ELSE 0 END;
+$$;
+
+CREATE OR REPLACE FUNCTION __KN__.teammate(source text, tables jsonb, seeded jsonb)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE
+  findings jsonb := '[]'::jsonb;
+  completed jsonb := '[]'::jsonb;
+  blocked jsonb := '[]'::jsonb;
+  done jsonb := '[]'::jsonb;
+  member jsonb;
+  tab jsonb;
+  shape integer;
+  at text;
+  theirs jsonb;
+  overrides jsonb;
+  key jsonb;
+  name text;
+  parent text;
+  as_ text;
+  row_ jsonb;
+  join_ text;
+  refused text;
+  owner text;
+  not_theirs text;
+  target text;
+  column_ text;
+  finding_key text;
+  move record;
+  was bigint;
+  now_ bigint;
+  before_ jsonb;
+  after_ jsonb;
+  can jsonb;
+  changed jsonb;
+  stuck text;
+BEGIN
+  FOR member IN SELECT * FROM jsonb_array_elements(__KN__.memberships(tables)) LOOP
+    SELECT (s->>'attempt')::integer INTO shape
+      FROM jsonb_array_elements(coalesce(seeded, '[]'::jsonb)) s
+     WHERE s->>'table' = member->'table'->>'name';
+    CONTINUE WHEN NOT FOUND;
+    shape := coalesce(shape, 0);
+    at := __KN__.always_quote(source) || '.' || __KN__.always_quote(member->'table'->>'name');
+    BEGIN
+      EXECUTE 'SELECT to_jsonb(t) FROM ' || at || ' t WHERE ' || __KN__.always_quote(member->>'person') ||
+              ' = ' || quote_literal(__KN__.user_a()) || ' LIMIT 1' INTO theirs;
+    EXCEPTION WHEN OTHERS THEN
+      theirs := NULL;
+    END;
+    CONTINUE WHEN theirs IS NULL;
+
+    -- Their team, as the first person's own membership names it.
+    overrides := jsonb_build_object(member->>'role', member->>'lowest');
+    FOR key IN SELECT * FROM jsonb_array_elements(member->'keys') LOOP
+      FOR name IN SELECT jsonb_array_elements_text(key->'columns') LOOP
+        IF name <> member->>'person' THEN
+          overrides := jsonb_set(overrides, ARRAY[name], coalesce(theirs->name, 'null'::jsonb));
+        END IF;
+      END LOOP;
+    END LOOP;
+    parent := member->'keys'->0->>'refTable';
+    as_ := 'as a "' || (member->>'lowest') || '" in ' || (member->'table'->>'name');
+
+    -- Whether they can be put in the team at all, tried once on its own.
+    refused := NULL;
+    BEGIN
+      row_ := __KN__.row_for(source, member->'table', __KN__.user_b(), '9', overrides, shape);
+      join_ := __KN__.insert_statement(source, member->'table'->>'name', row_);
+      BEGIN
+        EXECUTE join_;
+        RAISE EXCEPTION 'kryptheon: undoing the join' USING ERRCODE = 'KN001';
+      EXCEPTION WHEN SQLSTATE 'KN001' THEN
+        NULL;
+      END;
+    EXCEPTION WHEN OTHERS THEN
+      refused := SQLERRM;
+    END;
+    IF refused IS NOT NULL THEN
+      -- Said once, on the table that would not take them.
+      blocked := blocked || jsonb_build_array(jsonb_build_object(
+        'table', member->'table'->>'name',
+        'key', 'role:' || (member->'table'->>'name') || ':' || (member->>'lowest'),
+        'why', as_ || ': I could not add one: ' || refused));
+      CONTINUE;
+    END IF;
+
+    FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
+      CONTINUE WHEN NOT EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(seeded, '[]'::jsonb)) s
+                                 WHERE s->>'table' = tab->>'name');
+      CONTINUE WHEN done ? (tab->>'name');
+      done := done || to_jsonb(tab->>'name');
+      finding_key := 'role:' || (tab->>'name') || ':' || (member->>'lowest');
+      owner := __KN__.owner_column(tab);
+      -- Never their own rows: changing what you made yourself is not a role
+      -- question, and the row that put them in the team is theirs.
+      not_theirs := CASE WHEN owner IS NULL THEN ''
+        ELSE ' WHERE ' || __KN__.always_quote(owner) || ' IS DISTINCT FROM ' || quote_literal(__KN__.user_b()) END;
+      target := __KN__.always_quote(source) || '.' || __KN__.always_quote(tab->>'name');
+      column_ := __KN__.always_quote(__KN__.first_writable(tab));
+      can := '[]'::jsonb;
+      changed := '{}'::jsonb;
+      stuck := NULL;
+      FOR move IN
+        SELECT * FROM (VALUES
+          (1, 'change', 'UPDATE ' || target || ' SET ' || column_ || ' = ' || column_ || not_theirs),
+          (2, 'delete', 'DELETE FROM ' || target || not_theirs)) AS m(n, what, statement)
+        ORDER BY n
+      LOOP
+        before_ := __KN__.try_write('authenticated', __KN__.user_b(), move.statement);
+        after_ := __KN__.try_write_joined('authenticated', __KN__.user_b(), move.statement, join_);
+        was := __KN__.rows_moved(before_);
+        now_ := __KN__.rows_moved(after_);
+        IF was IS NULL OR now_ IS NULL THEN
+          stuck := CASE WHEN now_ IS NULL THEN after_->>'why' ELSE before_->>'why' END;
+        ELSIF now_ > was THEN
+          can := can || to_jsonb(move.what);
+          changed := jsonb_set(changed, ARRAY[move.what], to_jsonb(now_ - was));
+        END IF;
+      END LOOP;
+
+      IF jsonb_array_length(can) = 0 AND stuck IS NOT NULL THEN
+        blocked := blocked || jsonb_build_array(jsonb_build_object(
+          'table', tab->>'name', 'key', finding_key, 'why', as_ || ': ' || stuck));
+        CONTINUE;
+      END IF;
+      completed := completed || to_jsonb(finding_key);
+      IF jsonb_array_length(can) > 0 THEN
+        findings := findings || jsonb_build_array(jsonb_build_object(
+          'kind', 'role',
+          'table', tab->>'name',
+          'who', member->>'lowest',
+          'via', member->'table'->>'name',
+          'roleColumn', member->>'role',
+          'parent', parent,
+          'can', can,
+          'changed', changed,
+          'columns', coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c), '[]'::jsonb),
+          'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+      END IF;
+    END LOOP;
+  END LOOP;
+
+  RETURN jsonb_build_object('findings', findings, 'completed', completed, 'blocked', blocked);
+END $$;
+
+-- --------------------------------------------------------------------------
 -- The interruption attack: can a half-finished write survive?
 --
 -- A request cut off partway is mostly a question about the app's code - were
@@ -2789,6 +3124,7 @@ DECLARE
   sown       jsonb;
   seen       jsonb;
   wrote      jsonb;
+  ranked     jsonb;
   stranded   jsonb;
   raced      jsonb;
   findings   jsonb := '[]'::jsonb;
@@ -2842,10 +3178,11 @@ BEGIN
 
     seen     := __KN__.impersonate(copy_name, theirs || views);
     wrote    := __KN__.tamper(copy_name, theirs, sown->'seeded', copy_plan->'policies');
+    ranked   := __KN__.teammate(copy_name, theirs, sown->'seeded');
     stranded := __KN__.orphan(copy_name, theirs, sown->'seeded');
     raced    := __KN__.collide(copy_name, theirs, copy_plan->'indexes');
 
-    findings := (seen->'findings') || (wrote->'findings') || (stranded->'findings');
+    findings := (seen->'findings') || (wrote->'findings') || (ranked->'findings') || (stranded->'findings');
 
     -- A rule that looks itself up breaks the app for whoever it fails for.
     -- One finding per table at fault, however many reads ran into it; the
@@ -2864,6 +3201,7 @@ BEGIN
     -- fixed from one whose attack simply did not run this time.
     attempted := coalesce(seen->'completed', '[]'::jsonb)
               || coalesce(wrote->'completed', '[]'::jsonb)
+              || coalesce(ranked->'completed', '[]'::jsonb)
               || coalesce(stranded->'completed', '[]'::jsonb);
 
     -- And everything that was not. Said out loud, never left out: a table
@@ -2871,6 +3209,7 @@ BEGIN
     not_checked := coalesce(sown->'skipped', '[]'::jsonb)
                 || coalesce(seen->'blocked', '[]'::jsonb)
                 || coalesce(wrote->'blocked', '[]'::jsonb)
+                || coalesce(ranked->'blocked', '[]'::jsonb)
                 || coalesce(stranded->'notTried', '[]'::jsonb)
                 || coalesce(raced->'notTried', '[]'::jsonb);
 

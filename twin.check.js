@@ -289,7 +289,7 @@ function differences(mine, theirs, where) {
 /** Only the parts of the shape the SQL engine has been taught so far. */
 const SO_FAR = [
   'schema', 'tables', 'types', 'policies', 'grants', 'sequenceGrants', 'indexes', 'views',
-  'viewGrants', 'external', 'unsupported', 'functions',
+  'viewGrants', 'external', 'unsupported', 'functions', 'buckets',
 ];
 
 function onlySoFar(shape) {
@@ -512,6 +512,27 @@ async function main() {
       if (JSON.stringify(beforeSql) !== JSON.stringify(afterSql)) {
         writeDifferences.push('sql did not put the tables back: ' +
           JSON.stringify(beforeSql) + ' -> ' + JSON.stringify(afterSql));
+      }
+      // And what the least trusted member of a team can change. Rolled back
+      // like the writes, so the tables are compared again afterwards.
+      const mineRanked = await tamper.teammate(client, byNode, fromNode.tables, mineSeeded.seeded);
+      let theirsRanked = null;
+      await sqlengine.withEngine(client, async (target) => {
+        theirsRanked = await sqlengine.teammate(client, target, bySql, fromSql.tables, theirsSeeded.seeded);
+      });
+      const ranked = (r) => JSON.stringify({
+        findings: (r.findings || []).map((f) => f.table + '/' + f.who + '/' + f.via + '.' + f.roleColumn + '/' +
+          [...(f.can || [])].sort().join('+') + '/' + JSON.stringify(f.changed)).sort(),
+        completed: [...(r.completed || [])].sort(),
+        blocked: (r.blocked || []).map((b) => b.key).sort(),
+      });
+      if (ranked(mineRanked) !== ranked(theirsRanked)) {
+        writeDifferences.push('the two engines said different things about a viewer in a team:' +
+          '\n        node ' + ranked(mineRanked) + '\n        sql  ' + ranked(theirsRanked));
+      }
+      if (JSON.stringify(afterNode) !== JSON.stringify(await contentsOf(client, byNode)) ||
+          JSON.stringify(afterSql) !== JSON.stringify(await contentsOf(client, bySql))) {
+        writeDifferences.push('a viewer in a team left the tables changed');
       }
       writeRan = true;
 

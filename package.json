@@ -31,7 +31,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "check": "node package.check.js && node store.check.js && node trouble.check.js && node intro.check.js && node finding.check.js && node outside.check.js && node recheck.check.js && node untouched.check.js && node blocked.check.js && node orphans.check.js && node guests.check.js && node usable.check.js && node twin.check.js && node engines.check.js && node external.check.js && node schema.check.js && node collision.check.js && node tamper.check.js && node orphan.check.js && node shapes.check.js && node verdicts.check.js && node shop.check.js && node privileged.check.js && node recursion.check.js && node guarded.check.js && node nightly.check.js && node words.check.js && node helpers.check.js && node deeploop.check.js && node teams.check.js && node cli.check.js && node loop.check.js",
+    "check": "node package.check.js && node store.check.js && node trouble.check.js && node intro.check.js && node finding.check.js && node outside.check.js && node recheck.check.js && node untouched.check.js && node blocked.check.js && node orphans.check.js && node guests.check.js && node usable.check.js && node twin.check.js && node engines.check.js && node external.check.js && node schema.check.js && node collision.check.js && node tamper.check.js && node orphan.check.js && node shapes.check.js && node verdicts.check.js && node shop.check.js && node privileged.check.js && node recursion.check.js && node guarded.check.js && node nightly.check.js && node words.check.js && node helpers.check.js && node deeploop.check.js && node teams.check.js && node roles.check.js && node buckets.check.js && node cli.check.js && node loop.check.js",
     "check:dry": "node package.check.js && node store.check.js && node trouble.check.js && node intro.check.js && node finding.check.js && node recheck.check.js && node outside.check.js",
     "check:package": "node package.check.js",
     "check:store": "node store.check.js",
@@ -71,7 +71,9 @@
     "check:twin": "node twin.check.js",
     "prepublishOnly": "node package.check.js",
     "check:engines": "node engines.check.js",
-    "check:installer": "node installer.check.js"
+    "check:installer": "node installer.check.js",
+    "check:roles": "node roles.check.js",
+    "check:buckets": "node buckets.check.js"
   },
   "keywords": [
     "supabase",

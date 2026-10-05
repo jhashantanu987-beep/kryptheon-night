@@ -114,6 +114,15 @@ async function tamper(client, target, into, tables, seeded, policies) {
   return rows[0].answer;
 }
 
+/** What the least trusted member of a team can change. Rolled back inside the engine. */
+async function teammate(client, target, into, tables, seeded) {
+  const { rows } = await client.query(
+    'SELECT ' + quote(target) + '.teammate($1, $2::jsonb, $3::jsonb) AS answer',
+    [into, JSON.stringify(tables), JSON.stringify(seeded)],
+  );
+  return rows[0].answer;
+}
+
 /** Can a half-finished row survive? */
 async function orphan(client, target, into, tables, seeded) {
   const { rows } = await client.query(
@@ -141,7 +150,7 @@ async function collide(client, target, into, tables, indexes) {
 }
 
 /**
- * The same six operations `scan.js` asks of an engine, done in SQL.
+ * The same seven operations `scan.js` asks of an engine, done in SQL.
  *
  * Handed an engine schema that is already installed, because installing and
  * removing it is the caller's business - `withEngine` below - and a scan
@@ -162,6 +171,7 @@ function adapterFor(target) {
     tamper: (client, into, tables, sown, policies) =>
       tamper(client, target, into, tables, sown, policies),
     orphan: (client, into, tables, sown) => orphan(client, target, into, tables, sown),
+    teammate: (client, into, tables, sown) => teammate(client, target, into, tables, sown),
   };
 }
 
@@ -194,6 +204,7 @@ module.exports = {
   impersonate: impersonate,
   tamper: tamper,
   orphan: orphan,
+  teammate: teammate,
   collide: collide,
   adapterFor: adapterFor,
   withEngine: withEngine,

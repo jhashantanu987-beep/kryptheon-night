@@ -33,6 +33,8 @@ every time a word of the product is edited:
 | `verdicts.check.js` | yes | the answer is right, not merely produced |
 | `shop.check.js` | yes | a Supabase-shaped shop is attacked whole, by both engines |
 | `teams.check.js` | yes | the two fake people are in different teams, by both engines |
+| `roles.check.js` | yes | what a team's lowest role can change is found, by both engines |
+| `buckets.check.js` | yes | a public storage bucket with a private-looking read rule is reported |
 | `loop.check.js` | yes | the whole thing, through the real command |
 
 And one that is deliberately **not** in `npm run check`:
@@ -244,6 +246,27 @@ workspace, and a view open to logged-out visitors listing every workspace and
 who is in it came back empty. Both engines; the open invoice rule is still
 caught; a parent that only takes one row keeps the one it had. Sixteen
 mutations, each caught.
+
+**roles.check.js** - what the least trusted member of a team can change. Found
+on two blind tests (OrbitDesk, AtlasPay): five holes - an UPDATE rule that
+checks the role beside one that does not, rules written FOR ALL to any member,
+a team's members managed by any member - went unreported, because nobody but
+the owner was ever in a team. One fake person joins the other's team with the
+lowest role, and every write is tried before joining and after; only what
+joining added counts, so an open table, a person's own rows and a rule that
+checks the role stay quiet. Reported as something to check, never a break.
+An invitation is not a members table, a one-team profile is not attacked, a
+team that will not take a viewer is said to be untested, and every write and
+the joining are undone. Both engines, the nightly run and the re-check. Thirty
+mutations, each caught.
+
+**buckets.check.js** - a Supabase Storage bucket switched to public, with a
+read rule saying only some people may have its files: probably meant to be
+private, so reported as something to check. Found on the same two blind tests.
+Only the bucket's settings and the rules on storage.objects are read, never a
+file. A rule open to everyone, a private bucket, a public one with no rule and
+a rule for removing files are not reported. Builds a stand-in for Storage
+where there is none and takes it away. Thirteen mutations, each caught.
 
 **loop.check.js** - nothing stubbed. Build an app with real holes, shell out to
 `scan.js` the way a person would, apply the fixes the report asked for,

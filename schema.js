@@ -356,6 +356,48 @@ async function readFunctions(client, schema) {
   return rows;
 }
 
+/**
+ * Supabase Storage's buckets: whether each is public, and the rules on
+ * storage.objects that say who may read it (a rule naming the bucket's id).
+ *
+ * The settings and the rules only - never a file, never a file's name. A
+ * database without Supabase Storage, or one this connection cannot read it in,
+ * has none. Mirrors read_buckets in engine.sql, query for query.
+ *
+ * Asked first rather than left to fail: a failed query inside a caller's
+ * transaction would abort everything after it.
+ */
+async function readBuckets(client) {
+  try {
+    const here = await client.query(
+      `SELECT to_regclass('storage.buckets') IS NOT NULL
+          AND EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_schema = 'storage' AND table_name = 'buckets' AND column_name = 'public') AS found`,
+    );
+    if (!here.rows[0].found) return [];
+    const { rows } = await client.query(BUCKETS_QUERY);
+    return rows[0].buckets;
+  } catch (err) {
+    return [];
+  }
+}
+
+const BUCKETS_QUERY =
+  `SELECT coalesce(jsonb_agg(jsonb_build_object(
+            'id', b.id::text,
+            'name', b.name::text,
+            'public', coalesce(b.public, false),
+            'readRules', (SELECT coalesce(jsonb_agg(jsonb_build_object(
+                                   'name', p.policyname::text,
+                                   'roles', to_jsonb(p.roles::text[]),
+                                   'qual', p.qual) ORDER BY p.policyname), '[]'::jsonb)
+                            FROM pg_policies p
+                           WHERE p.schemaname = 'storage' AND p.tablename = 'objects'
+                             AND p.cmd IN ('SELECT', 'ALL')
+                             AND position(quote_literal(b.id::text) IN coalesce(p.qual, '')) > 0)
+          ) ORDER BY b.id), '[]'::jsonb) AS buckets
+     FROM storage.buckets b`;
+
 async function readPolicies(client, schema) {
   const { rows } = await client.query(
     `SELECT tablename AS table_name,
@@ -632,6 +674,7 @@ async function readSchema(client, schema) {
     external: external,
     anonFunctions: await readAnonDefinerFunctions(client, schema),
     functions: await readFunctions(client, schema),
+    buckets: await readBuckets(client),
     unsupported: unsupported,
   };
 }
@@ -1398,6 +1441,7 @@ module.exports = {
   writeSchema: writeSchema,
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,
+  readBuckets: readBuckets,
   readTypes: readTypes,
   readSequenceGrants: readSequenceGrants,
   readIndexes: readIndexes,

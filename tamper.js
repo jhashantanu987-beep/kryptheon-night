@@ -47,9 +47,13 @@ const ACTORS = [
  * The rollback is not a tidy-up, it is the safety property. Nothing this
  * attack does survives the statement that did it.
  */
-async function tryWrite(client, role, identity, statement, values) {
+async function tryWrite(client, role, identity, statement, values, first) {
   await client.query('BEGIN');
   try {
+    // Something the copy's owner does first, inside the same transaction, so
+    // it is undone with the write: putting a person into a team for one
+    // attempt (see teammate below).
+    if (first) await client.query(first.statement, first.values || []);
     await client.query("SET LOCAL statement_timeout = '15s'");
     await client.query('SET LOCAL role TO ' + role);
     await client.query('SELECT set_config($1, $2, true)', [
@@ -217,6 +221,215 @@ function firstWritable(table) {
   return (plain || usable[0] || { name: 'id' }).name;
 }
 
+/*
+ * What the least trusted member of a team can change.
+ *
+ * Everything above is one customer against another. Found on two blind tests
+ * (OrbitDesk, AtlasPay): a rule written "members of this workspace may change
+ * it" lets a viewer change it too, and an UPDATE rule that checks the role is
+ * undone by a second one beside it that does not - Postgres lets a write
+ * through if any permissive rule allows it. Five planted holes of this shape
+ * went unreported, because both fake people were the owner of their own team
+ * and nobody else was ever in it.
+ *
+ * So one of them joins the other's team with the lowest role there is, for
+ * one attempt at a time, and tries to change what is in it. Whether a viewer
+ * may edit is the owner's decision, so this is reported as something to
+ * check, never as a confirmed break.
+ */
+
+// Labels that say "may only look", tried in this order before falling back
+// to the last label that is not plainly in charge.
+const LEAST_TRUSTED = [/view/i, /read/i, /guest/i, /observ/i, /audit/i];
+const IN_CHARGE = /owner|admin|super|root/i;
+// Owner columns that name who made a row rather than who is in it.
+const CREATOR = /^(created_by|author_id|owner|owner_id)$/i;
+
+/** The role a viewer has, out of a team's list of roles, or null. */
+function lowestRole(labels) {
+  for (const pattern of LEAST_TRUSTED) {
+    const found = labels.find((label) => pattern.test(label));
+    if (found) return found;
+  }
+  const plain = labels.filter((label) => !IN_CHARGE.test(label));
+  return plain.length ? plain[plain.length - 1] : null;
+}
+
+/**
+ * The column holding a member's role, and its lowest value: named for a role,
+ * with a fixed list of values (an enum, or a CHECK listing them).
+ */
+function roleColumnOf(table) {
+  for (const column of table.columns || []) {
+    if (!/role/i.test(column.name)) continue;
+    const labels = Array.isArray(column.enum_labels) && column.enum_labels.length
+      ? column.enum_labels
+      : attack.allowedByCheck(table, column.name);
+    if (labels.length < 2) continue;
+    const lowest = lowestRole(labels);
+    if (lowest) return { column: column.name, lowest: lowest };
+  }
+  return null;
+}
+
+/** Whether a column is a key on its own: one row per person, at most. */
+function aloneUnique(table, column) {
+  return (table.constraints || []).some((constraint) => {
+    if (constraint.kind !== 'p' && constraint.kind !== 'u') return false;
+    const match = /(?:PRIMARY KEY|UNIQUE) \(([^)]+)\)/i.exec(String(constraint.definition || ''));
+    if (!match) return false;
+    const columns = match[1].split(',').map((name) => name.trim().split('"').join(''));
+    return columns.length === 1 && columns[0] === column;
+  });
+}
+
+/**
+ * The tables saying who is in which team, and as what: a person, a role, and
+ * a key to a table of the app's own that is not the person. A table where the
+ * person can appear only once (profiles.org_id) is not one: nobody joins a
+ * second team there, so there is no one to add.
+ */
+function memberships(tables) {
+  const found = [];
+  const names = new Set((tables || []).map((table) => table.name));
+  for (const table of tables || []) {
+    const person = attack.ownerColumn(table);
+    // Whoever made the row is not who is in the team. Found on a blind test:
+    // workspace_invites (created_by, role, workspace_id) was taken for the
+    // members table, and an invitation made nobody a member of anything.
+    if (!person || CREATOR.test(person)) continue;
+    const role = roleColumnOf(table);
+    if (!role) continue;
+    const keys = attack.foreignKeys(table).concat(attack.impliedKeys(table, tables))
+      .filter((key) => key.refTable !== table.name && names.has(key.refTable) && !key.columns.includes(person));
+    if (!keys.length || aloneUnique(table, person)) continue;
+    found.push({ table: table, person: person, role: role.column, lowest: role.lowest, keys: keys });
+  }
+  // A table named for members first: it is the one a team rule asks.
+  const named = (m) => (/member/i.test(m.table.name) ? 0 : 1);
+  return found.map((m, i) => [m, i]).sort((a, b) => named(a[0]) - named(b[0]) || a[1] - b[1]).map((pair) => pair[0]);
+}
+
+/**
+ * For every team table: can a viewer change it?
+ *
+ * The other fake person joins the first one's team as its lowest role, and
+ * every write is tried twice - before joining and after - so only what joining
+ * added is counted: a hole open to every customer is already reported above,
+ * and a person changing their own rows is the feature. Both rolled back, the
+ * joining with them.
+ */
+async function teammate(client, schema, tables, seeded) {
+  const findings = [];
+  const completed = [];
+  const blocked = [];
+  const shapeFor = new Map((seeded || []).map((entry) => [entry.table, entry.attempt || 0]));
+  const done = new Set();
+
+  for (const member of memberships(tables)) {
+    if (!shapeFor.has(member.table.name)) continue;
+    const at = quote(schema) + '.' + quote(member.table.name);
+    let theirs = null;
+    try {
+      theirs = (await client.query('SELECT * FROM ' + at + ' WHERE ' + quote(member.person) + ' = $1 LIMIT 1',
+        [attack.USER_A])).rows[0] || null;
+    } catch (err) {
+      theirs = null;
+    }
+    if (!theirs) continue;
+
+    // Their team, as the first person's own membership names it.
+    const overrides = {};
+    overrides[member.role] = member.lowest;
+    for (const key of member.keys) {
+      key.columns.forEach((name) => { if (name !== member.person) overrides[name] = theirs[name]; });
+    }
+    const parent = member.keys[0].refTable;
+    const as = 'as a "' + member.lowest + '" in ' + member.table.name;
+    let join = null;
+    let refused = null;
+    try {
+      const row = await attack.rowFor(client, schema, member.table, attack.USER_B, 9, overrides, shapeFor.get(member.table.name));
+      join = {
+        statement: 'INSERT INTO ' + at + ' (' + row.columns.map(quote).join(', ') + ') VALUES (' +
+          row.values.map((_, i) => '$' + (i + 1)).join(', ') + ')',
+        values: row.values,
+      };
+      // Whether they can be put in the team at all, tried once on its own.
+      await client.query('BEGIN');
+      try {
+        await client.query(join.statement, join.values);
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+      }
+    } catch (err) {
+      refused = err.message;
+    }
+    if (refused) {
+      // Said once, on the table that would not take them: every team table
+      // went untested for the same reason.
+      blocked.push({ table: member.table.name, key: 'role:' + member.table.name + ':' + member.lowest,
+        why: as + ': I could not add one: ' + refused });
+      continue;
+    }
+
+    for (const table of tables) {
+      if (!shapeFor.has(table.name) || done.has(table.name)) continue;
+      done.add(table.name);
+      const key = 'role:' + table.name + ':' + member.lowest;
+      const owner = attack.ownerColumn(table);
+      // Never their own rows: changing what you made yourself is not a role
+      // question, and the row that put them in the team is theirs.
+      const notTheirs = owner ? ' WHERE ' + quote(owner) + " IS DISTINCT FROM '" + attack.USER_B + "'" : '';
+      const target = quote(schema) + '.' + quote(table.name);
+      const column = quote(firstWritable(table));
+      const moves = [
+        { what: 'change', statement: 'UPDATE ' + target + ' SET ' + column + ' = ' + column + notTheirs },
+        { what: 'delete', statement: 'DELETE FROM ' + target + notTheirs },
+      ];
+      const can = [];
+      const changed = {};
+      let stuck = null;
+      for (const move of moves) {
+        const before = await tryWrite(client, 'authenticated', attack.USER_B, move.statement, []);
+        const after = await tryWrite(client, 'authenticated', attack.USER_B, move.statement, [], join);
+        const counted = (result) => {
+          const outcome = whatHappened(result);
+          return outcome === 'untested' ? null : outcome === 'got through' ? result.count : 0;
+        };
+        const was = counted(before);
+        const now = counted(after);
+        if (was === null || now === null) {
+          stuck = now === null ? after.why : before.why;
+        } else if (now > was) {
+          can.push(move.what);
+          changed[move.what] = now - was;
+        }
+      }
+      if (!can.length && stuck) {
+        blocked.push({ table: table.name, key: key, why: as + ': ' + stuck });
+        continue;
+      }
+      completed.push(key);
+      if (can.length) {
+        findings.push({
+          kind: 'role',
+          table: table.name,
+          who: member.lowest,
+          via: member.table.name,
+          roleColumn: member.role,
+          parent: parent,
+          can: can,
+          changed: changed,
+          columns: (table.columns || []).map((c) => c.name),
+          rlsEnabled: table.rlsEnabled,
+        });
+      }
+    }
+  }
+  return { findings: findings, completed: completed, blocked: blocked };
+}
+
 module.exports = {
   ACTORS: ACTORS,
   tryWrite: tryWrite,
@@ -224,4 +437,8 @@ module.exports = {
   firstWritable: firstWritable,
   writeAsFor: writeAsFor,
   tamper: tamper,
+  lowestRole: lowestRole,
+  roleColumnOf: roleColumnOf,
+  memberships: memberships,
+  teammate: teammate,
 };

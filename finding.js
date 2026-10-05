@@ -88,6 +88,11 @@ function listOf(items) {
   return list.slice(0, -1).join(', ') + ' and ' + list[list.length - 1];
 }
 
+/** One of a table's things: workspaces -> workspace, companies -> company. */
+function oneOf(table) {
+  return String(table || 'team').replace(/ies$/, 'y').replace(/s$/, '');
+}
+
 /* --------------------------------------------------------------------------
    How bad it is.
 -------------------------------------------------------------------------- */
@@ -103,6 +108,11 @@ function severityOf(finding, contents) {
   if (finding.kind === 'recursive') {
     // Nothing leaks and nothing is written: the request fails. Serious,
     // because the app is broken for whoever it fails for, but not a break-in.
+    return 'HIGH';
+  }
+  if (finding.kind === 'role' || finding.kind === 'bucket') {
+    // Something to check, never a confirmed break: whether a viewer may edit,
+    // or a bucket may be public, is the owner's decision. So never CRITICAL.
     return 'HIGH';
   }
   if (finding.kind === 'privileged') {
@@ -332,6 +342,15 @@ function headlineFor(finding) {
   if (finding.kind === 'privileged') {
     return 'Anyone on the internet can call your ' + finding.fn + ' function, and it runs with full rights.';
   }
+  if (finding.kind === 'role') {
+    const order = ['delete', 'change', 'add'];
+    const does = order.filter((what) => (finding.can || []).includes(what)).map((what) => WRITE_WORDS[what]);
+    return 'A "' + finding.who + '" in a ' + oneOf(finding.parent) + ' can ' + listOf(does) + ' your ' +
+      finding.table + ' table.';
+  }
+  if (finding.kind === 'bucket') {
+    return 'Your ' + finding.table + ' storage bucket is public, but a rule says only some people may read it.';
+  }
   if (finding.kind === 'exposed') {
     return 'Your ' + finding.table + ' ' + (finding.isView ? 'view' : 'table') + ' can be read by anyone.';
   }
@@ -413,6 +432,36 @@ function bodyFor(finding, contents) {
       (holds ? ', in a table holding ' + holds : '') +
       '. Every one of those was undone straight away - nothing on the copy was ' +
       'kept, and your live app was never touched.';
+  }
+
+  if (finding.kind === 'role') {
+    // Said as what was done, and then whose decision it is: a viewer who may
+    // edit is a hole in one app and the design of another.
+    const did = [];
+    const rows = (n) => n + (n === 1 ? ' row' : ' rows');
+    if ((finding.can || []).includes('change')) did.push('changed ' + rows((finding.changed || {}).change || 1));
+    if ((finding.can || []).includes('delete')) did.push('deleted ' + rows((finding.changed || {}).delete || 1));
+    const place = oneOf(finding.parent);
+    return (
+      'I put one of my fake people into the other one\'s ' + place + ' as a "' + finding.who +
+      '" - the lowest role in ' + finding.via + '.' + finding.roleColumn + ' - and, signed in as them, I ' +
+      listOf(did) + ' in ' + finding.table + ' that belonged to that ' + place + ', on a copy of your app. ' +
+      'Before joining, they could not. Every one of those was undone straight away. Whether a "' + finding.who +
+      '" may do this is your decision: if it is meant to, nothing needs fixing; if a "' + finding.who +
+      '" should only look, the rules on this table let them do more.'
+    );
+  }
+
+  if (finding.kind === 'bucket') {
+    // Said as what was read, never as a file taken: no file was opened.
+    return (
+      'In Supabase Storage the bucket "' + finding.bucket + '" is set to public, so anyone with a ' +
+      'file\'s link can download it without logging in - the rules on storage.objects are not asked. ' +
+      'You also wrote ' + ((finding.rules || []).length === 1 ? 'a rule' : 'rules') + ' saying who may read it (' +
+      listOf(finding.rules || []) + '), so it was probably meant to be private. I only read the ' +
+      'bucket\'s setting and its rules; I did not open or list any file. Whether it should be public ' +
+      'is yours to say.'
+    );
   }
 
   if (finding.kind === 'privileged') {
@@ -694,6 +743,50 @@ function fixPromptFor(finding) {
       'Then sign in as an ordinary user and open the pages that use these tables, and run this ' +
         'check again - the tables it could not test will be tested this time.',
     ]
+    : finding.kind === 'role'
+    ? [
+      'My app may have a permissions problem - please check it rather than assume it.',
+      '',
+      'In my database, a member of a ' + oneOf(finding.parent) + ' whose role in "' + finding.via + '"."' +
+        finding.roleColumn + '" is "' + finding.who + '" can ' +
+        listOf((finding.can || []).map((what) => ({ change: 'change', delete: 'delete' })[what])) +
+        ' rows of that ' + oneOf(finding.parent) + ' in the "' + finding.table + '" table. This was proved ' +
+        'on a copy of the database: a "' + finding.who + '" was added, and the writes went through.',
+      '',
+      'First tell me: should a "' + finding.who + '" be able to do that? If yes, change nothing.',
+      '',
+      'If not, make the rules on "' + finding.table + '" that cover UPDATE, DELETE, INSERT or ALL check ' +
+        'the member\'s role as well as membership - for example with a helper that reads "' + finding.via +
+        '" for auth.uid() and the roles allowed to edit. Postgres lets a write through if ANY permissive ' +
+        'policy allows it, so a strict rule beside a loose one does nothing: list every such policy on "' +
+        finding.table + '" and narrow or drop the loose one. Keep the read rule as it is if a "' +
+        finding.who + '" should still see these rows.',
+      '',
+      'Then check every other table where members can write for the same thing.',
+    ]
+    : finding.kind === 'bucket'
+    ? [
+      'My app may have a storage problem - please check it rather than assume it.',
+      '',
+      'The Supabase Storage bucket "' + finding.bucket + '" is public. Anyone with a file\'s URL can ' +
+        'download it without logging in, and the storage.objects ' +
+        ((finding.rules || []).length === 1 ? 'policy that names' : 'policies that name') + ' this bucket (' +
+        listOf((finding.rules || []).map((r) => '"' + r + '"')) + ') ' +
+        ((finding.rules || []).length === 1 ? 'is' : 'are') + ' not checked for public URLs - so ' +
+        ((finding.rules || []).length === 1 ? 'it protects' : 'they protect') + ' nothing while it is public.',
+      '',
+      'First tell me: is every file in this bucket meant to be downloadable by anyone? If yes, change nothing.',
+      '',
+      'If not, make the bucket private (in the Supabase dashboard: Storage, edit the bucket, turn Public ' +
+        'off - or UPDATE storage.buckets SET public = false WHERE id = \'' + finding.bucket + '\'). Then ' +
+        'change the app to fetch these files with signed URLs (createSignedUrl) instead of getPublicUrl, ' +
+        'or the links it shows will stop working.',
+      '',
+      'Keep the read rule: once the bucket is private it is what decides who gets a file. Check that it ' +
+        'only lets in the right people.',
+      '',
+      'Then look at every other bucket for the same thing.',
+    ]
     : finding.kind === 'privileged'
     ? [
       'My app may have a security problem - please check it rather than assume it.',
@@ -863,6 +956,10 @@ function fixPromptFor(finding) {
     .join('\n');
 }
 
+// Found and said, but never claimed as a break: the owner decides. Counted
+// apart in the report, never towards the exit code or a clean re-check.
+const TO_CHECK = ['privileged', 'role', 'bucket'];
+
 /** Everything the report needs about one thing the attack found. */
 function describe(finding) {
   const contents = readContents(finding.columns);
@@ -873,7 +970,7 @@ function describe(finding) {
     // one the tool reasons about without executing, so it says so. The report
     // and the re-check both read this: a "verification required" finding is
     // never counted towards a clean re-check on its own.
-    status: finding.kind === 'privileged' ? 'verification required' : 'confirmed',
+    status: TO_CHECK.includes(finding.kind) ? 'verification required' : 'confirmed',
     table: finding.kind === 'privileged' ? finding.fn : finding.table,
     fn: finding.fn,
     args: finding.args,
@@ -892,14 +989,26 @@ function describe(finding) {
     // For a privileged function there is no "why the door is open" the way a
     // table has one; the body already carries the whole explanation, so the
     // cause line would only repeat it. Left empty and skipped by the report.
-    cause: finding.kind === 'privileged' ? '' : cause.long,
+    cause: TO_CHECK.includes(finding.kind) ? '' : cause.long,
     who: finding.who,
     can: finding.can,
+    via: finding.via,
+    roleColumn: finding.roleColumn,
+    bucket: finding.bucket,
     proof: finding.kind === 'recursive'
       ? 'Using ' + listOf((finding.reads || []).map((t) => '"' + t + '"')) + ' stopped with ' +
         loopError(finding) + '.'
       : finding.kind === 'privileged'
       ? 'I did not call "' + finding.fn + '". This is a reach that exists in the grants, not a break I ran.'
+      : finding.kind === 'role'
+      ? 'As a "' + finding.who + '" who had just joined, I ' +
+        listOf((finding.can || []).map((what) => {
+          const n = (finding.changed || {})[what] || 1;
+          return (what === 'change' ? 'changed ' : 'deleted ') + n + (n === 1 ? ' row' : ' rows');
+        })) + ' in "' + finding.table + '" that I could not touch before joining. All of it was undone.'
+      : finding.kind === 'bucket'
+      ? 'I read that "' + finding.bucket + '" is public and that ' + listOf((finding.rules || []).map((r) => '"' + r + '"')) +
+        ' says who may read it. I did not open any file.'
       : finding.kind === 'duplicated'
       ? 'I created ' + finding.copies + ' rows in "' + finding.table + '" holding the same ' +
         finding.column + '.'
@@ -1004,7 +1113,7 @@ function describeAll(findings) {
   // Writes above reads: a table somebody emptied is worse than one they read.
   // A looping rule sits with the reads: it breaks the app for everyone it
   // fails for, which matters more than a duplicate or a stray row.
-  const byKind = { writable: 0, exposed: 1, crossed: 2, recursive: 2.5, duplicated: 3, orphaned: 4, privileged: 5 };
+  const byKind = { writable: 0, exposed: 1, crossed: 2, recursive: 2.5, duplicated: 3, orphaned: 4, role: 4.5, bucket: 4.7, privileged: 5 };
   const rank = (d) => (d.severity === 'CRITICAL' ? 0 : 1) * 10 + (byKind[d.kind] === undefined ? 9 : byKind[d.kind]);
   return described.sort((a, b) => rank(a) - rank(b));
 }

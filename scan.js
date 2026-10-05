@@ -128,7 +128,7 @@ function suggest(schemas) {
 }
 
 /**
- * The engine, as six operations, so the scan does not know which one it has.
+ * The engine, as seven operations, so the scan does not know which one it has.
  *
  * `scan.js` named `schema.js`, `attack.js`, `tamper.js` and `orphan.js`
  * directly, which meant the SQL engine could only ever be reached by the twin
@@ -153,6 +153,7 @@ function nodeEngine() {
     tamper: (client, into, tables, seeded, policies) =>
       tamper.tamper(client, into, tables, seeded, policies),
     orphan: (client, into, tables, seeded) => orphan.orphan(client, into, tables, seeded),
+    teammate: (client, into, tables, seeded) => tamper.teammate(client, into, tables, seeded),
   };
 }
 
@@ -302,6 +303,14 @@ async function scan(client, sourceSchema, options) {
       notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });
     }
 
+    // What the least trusted member of a team can change there. Rolled back
+    // like the writes above, and the joining with them.
+    const ranked = await engine.teammate(client, copyName, theirs, sown.seeded);
+    for (const key of ranked.completed) attempted.push(key);
+    for (const stuck of ranked.blocked) {
+      notChecked.push({ table: stuck.table, key: stuck.key, why: stuck.why });
+    }
+
     // Can a half-finished write survive? Rolled back like the writes above.
     say('  Looking for rows that could point at nothing ...');
     const stranded = await engine.orphan(client, copyName, theirs, sown.seeded);
@@ -395,6 +404,13 @@ async function scan(client, sourceSchema, options) {
     for (const fn of plan.anonFunctions || []) attempted.push('privileged:' + fn.name);
     const privileged = privilegedOf(plan);
 
+    // Storage buckets switched to public that also have a rule saying who may
+    // read them. Read from the bucket settings and the rules, never a file.
+    // Every bucket read counts as examined, so one made private comes back
+    // from a re-check as fixed.
+    for (const bucket of plan.buckets || []) attempted.push('bucket:' + bucket.name);
+    const buckets = bucketsOf(plan);
+
     // Ties read from the original schema: the copy points auth.users keys at
     // a stand-in, and would call every table untied. Owners read from the
     // copy, the way seeding did.
@@ -406,7 +422,7 @@ async function scan(client, sourceSchema, options) {
       notChecked: notChecked,
       attempted: attempted,
       findings: finding.describeAll(
-        impersonation.findings.concat(writes.findings, stranded.findings, raced, privileged, recursive).map(tagged),
+        impersonation.findings.concat(writes.findings, ranked.findings, stranded.findings, raced, privileged, buckets, recursive).map(tagged),
       ),
     };
   } finally {
@@ -475,6 +491,37 @@ function privilegedOf(plan) {
     hasFixedSearchPath: fn.hasFixedSearchPath,
     columns: [],
   }));
+}
+
+/**
+ * A public bucket whose read rule says it was meant to be private.
+ *
+ * Found on two blind tests (OrbitDesk, AtlasPay): a bucket of exports and one
+ * of settlement evidence were switched to public. A public bucket hands any
+ * file to whoever has its link, and the rules on storage.objects are not asked.
+ * A rule that only lets in some people is how the app says the files are not
+ * for everyone - so a public bucket with one is worth a look. A rule that lets
+ * in everyone anyway (anon or public, and nothing but the bucket's name) says
+ * the opposite, and is not reported.
+ */
+function bucketsOf(plan) {
+  const escape = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const narrows = (rule, id) => {
+    const roles = schema.roleList(rule.roles);
+    const toEveryone = roles.includes('anon') || roles.includes('public');
+    const rest = String(rule.qual || '')
+      .replace(new RegExp("bucket_id\\s*=\\s*'" + escape(id) + "'(::text)?", 'gi'), '')
+      .replace(new RegExp("'" + escape(id) + "'(::text)?\\s*=\\s*bucket_id", 'gi'), '')
+      .replace(/\btrue\b|\band\b|[()\s]/gi, '');
+    return !toEveryone || rest !== '';
+  };
+  return ((plan && plan.buckets) || []).filter((b) => b.public).map((b) => ({
+    kind: 'bucket',
+    table: b.name,
+    bucket: b.id,
+    rules: (b.readRules || []).filter((rule) => narrows(rule, b.id)).map((rule) => rule.name),
+    columns: [],
+  })).filter((f) => f.rules.length);
 }
 
 /**
@@ -567,7 +614,7 @@ function nightlyRecord(latest, readAt, plan) {
     const at = f.kind === 'recursive' && !f.table ? (loops.length ? loops : ['one of your tables']) : [f.table];
     for (const table of at) night.push(tag(Object.assign({}, f, { table: table, fromNight: true })));
   }
-  const now = plan ? privilegedOf(plan).map(tag) : [];
+  const now = plan ? privilegedOf(plan).concat(bucketsOf(plan)).map(tag) : [];
   return Object.assign(record, {
     ranAt: at(run.ran_at),
     source: run.source,
@@ -737,8 +784,14 @@ function report(result) {
     line('  ' + confirmed.length + (confirmed.length === 1 ? ' problem' : ' problems') + ' found.');
   }
   if (toVerify.length) {
-    line('  ' + toVerify.length + ' thing' + (toVerify.length === 1 ? '' : 's') +
-      ' to check - I did not attack ' + (toVerify.length === 1 ? 'it' : 'them') + ', only spotted the risk.');
+    // A viewer who can edit was really tried; a function or a bucket was only
+    // read. Either way it is the owner's call, and the line says which.
+    const tried = toVerify.some((f) => f.kind === 'role');
+    const spotted = toVerify.some((f) => f.kind !== 'role');
+    const it = toVerify.length === 1 ? 'it' : 'them';
+    line('  ' + toVerify.length + ' thing' + (toVerify.length === 1 ? '' : 's') + ' to check - ' +
+      (spotted && !tried ? 'I did not attack ' + it + ', only spotted the risk.'
+        : 'whether ' + (toVerify.length === 1 ? 'it is a problem' : 'each is a problem') + ' is your decision.'));
   }
 
   for (const item of result.findings) {
@@ -887,6 +940,7 @@ module.exports = {
   scheduleTimes: scheduleTimes,
   notCheckedFromNight: notCheckedFromNight,
   privilegedOf: privilegedOf,
+  bucketsOf: bucketsOf,
   loopingTables: loopingTables,
   taggerFor: taggerFor,
   saveNightly: saveNightly,

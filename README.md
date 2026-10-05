@@ -69,6 +69,17 @@ Four questions, asked against the copy:
 | **Collision** | can the same thing exist twice? |
 | **Interruption** | can a half-finished write survive? |
 
+And three things it says are **yours to check**, because only you know
+whether they are meant:
+
+| check | the question |
+|---|---|
+| **Lowest role** | can a viewer in a team change what is in it? (tried on the copy, undone) |
+| **Storage** | is a bucket public although a rule says who may read it? (settings only, never a file) |
+| **Open functions** | can a visitor with no account call a function that skips the rules? |
+
+These are listed apart from problems and do not change the exit code.
+
 A problem reads like this:
 
     CRITICAL   customers

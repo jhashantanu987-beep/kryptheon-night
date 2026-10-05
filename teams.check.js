@@ -242,7 +242,9 @@ async function main() {
       const p = [];
       for (const [engine, result] of scans) {
         if (result.stopped) { p.push(engine + ' stopped: ' + result.stopped); continue; }
-        const said = named(result).filter((key) => /:(teams|members|invoices)$/.test(key));
+        // A viewer of the team changing its invoices is a separate question,
+        // asked and answered in roles.check.js; here it is only teammates.
+        const said = named(result).filter((key) => /:(teams|members|invoices)$/.test(key) && !/^role:/.test(key));
         if (said.length) p.push(engine + ' reported ' + JSON.stringify(said));
         for (const key of ['crossed:invoices', 'crossed:members', 'writable:invoices:any customer']) {
           if (!(result.attempted || []).includes(key)) p.push(engine + ': ' + key + ' never ran');
