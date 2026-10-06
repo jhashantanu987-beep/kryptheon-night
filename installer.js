@@ -213,6 +213,234 @@ async function configureReporting(client, schema, reportTo) {
   return { endpoint: reportTo.endpoint };
 }
 
+/*
+ * The same install, as one SQL script a person pastes into their Supabase SQL
+ * editor and runs - for somebody who never opens a terminal. It has to leave
+ * the database exactly as install() does (installscript.check.js holds the
+ * two side by side), so it does the same things in the same order and writes
+ * down the same record for uninstall to read.
+ *
+ * Every value a person supplies - the schema their app is in, the project
+ * token, where the summary goes - appears once, in the settings at the top,
+ * as one plain SQL string. The rest of the script reads them from there. That
+ * is what lets kryptheon.tech fill the script in a browser without knowing
+ * any SQL: it replaces three markers, each inside a single string.
+ */
+const SLOTS = {
+  source: 'KN_SLOT_SOURCE',
+  token: 'KN_SLOT_TOKEN',
+  endpoint: 'KN_SLOT_ENDPOINT',
+};
+
+function engineName() {
+  try {
+    const manifest = JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'package.json'), 'utf8'));
+    return 'kryptheon-night ' + manifest.version;
+  } catch (err) {
+    return 'kryptheon-night';
+  }
+}
+
+/**
+ * The script with its three markers in place, for a page to fill. Without a
+ * token the slot is filled with nothing, and the script installs the plain
+ * night that sends nothing anywhere.
+ */
+function installTemplate(options) {
+  const opts = options || {};
+  const schema = opts.schema || SCHEMA;
+  const at = opts.at || AT;
+  const engine = opts.engine || engineName();
+  const q = quote(schema);
+  const lit = (v) => literal(v);
+  return [
+    '-- Kryptheon: the nightly check, set up from inside your database.',
+    '-- ' + engine + '. Paste all of this into the SQL editor of the project',
+    '-- you want watched, and press Run. If Supabase warns about a destructive',
+    '-- operation: it means the "DROP ... IF EXISTS" lines below, which only ever',
+    '-- touch what Kryptheon itself made.',
+    '--',
+    '-- What it makes: a schema called ' + schema + ' with the checking functions in it,',
+    '-- pg_cron and pg_net if they are not here yet, and one job, kryptheon_nightly,',
+    '-- at ' + at + ' (UTC on Supabase). It never reads a row of your data.',
+    '--',
+    '-- To take it all away again: the uninstall script on kryptheon.tech, or',
+    '--   npx kryptheon-night uninstall',
+    '',
+    '-- Your settings. Only these three lines are yours; the rest is the same for everybody.',
+    'DROP TABLE IF EXISTS pg_temp.kn_install;',
+    'CREATE TEMP TABLE kn_install (source text NOT NULL, token text, endpoint text, made_extensions text[] NOT NULL DEFAULT \'{}\', made_schema boolean);',
+    'INSERT INTO kn_install (source, token, endpoint) VALUES (',
+    "  '" + SLOTS.source + "',   -- the schema your app's tables are in",
+    "  '" + SLOTS.token + "',   -- your project token; empty for no nightly summary",
+    "  '" + SLOTS.endpoint + "'   -- where the summary goes",
+    ');',
+    "UPDATE kn_install SET token = nullif(token, ''), endpoint = nullif(endpoint, '');",
+    '',
+    '-- Refused before anything is made: a token that is not one, an address that',
+    '-- is not Kryptheon\'s, or a database without the two extensions.',
+    'DO $kn$',
+    'DECLARE s record;',
+    'BEGIN',
+    '  SELECT * INTO s FROM kn_install;',
+    "  IF s.source = '' THEN RAISE EXCEPTION 'Kryptheon: name the schema your app is in (it is \"public\" for almost everyone)'; END IF;",
+    '  IF s.token IS NOT NULL OR s.endpoint IS NOT NULL THEN',
+    "    IF s.token IS NULL OR s.token !~ '^kp_[A-Za-z0-9_-]{20,100}$' THEN",
+    "      RAISE EXCEPTION 'Kryptheon: that is not a project token - copy it again from your dashboard on kryptheon.tech';",
+    '    END IF;',
+    "    IF s.endpoint IS NULL OR s.endpoint !~* '^https://[a-z0-9-]+(\\.[a-z0-9-]+)+(:443)?/functions/v1/ingest$' THEN",
+    "      RAISE EXCEPTION 'Kryptheon: the report address has to be an https address ending in /functions/v1/ingest';",
+    '    END IF;',
+    '  END IF;',
+    "  IF NOT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_net') THEN",
+    "    RAISE EXCEPTION 'Kryptheon: this database does not offer pg_net, so the nightly run cannot be installed. Supabase has it; a plain Postgres may not.';",
+    '  END IF;',
+    "  IF NOT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron') THEN",
+    "    RAISE EXCEPTION 'Kryptheon: this database does not offer pg_cron, so the nightly run cannot be installed. Supabase has it; a plain Postgres may not.';",
+    '  END IF;',
+    '  -- pg_net first, and told where to go: left to itself it lands in your own public schema.',
+    "  IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_net') THEN",
+    "    IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'extensions') THEN",
+    '      CREATE EXTENSION pg_net WITH SCHEMA extensions;',
+    '    ELSE',
+    '      CREATE EXTENSION pg_net;',
+    '    END IF;',
+    "    UPDATE kn_install SET made_extensions = array_append(made_extensions, 'pg_net');",
+    '  END IF;',
+    "  IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN",
+    '    CREATE EXTENSION pg_cron;',
+    "    UPDATE kn_install SET made_extensions = array_append(made_extensions, 'pg_cron');",
+    '  END IF;',
+    '  UPDATE kn_install SET made_schema = NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = ' + lit(schema) + ');',
+    'END $kn$;',
+    '',
+    '-- The checking functions.',
+    sqlengine.engineFor(schema),
+    '',
+    '-- What this install made, where uninstall will look for it.',
+    'CREATE TABLE IF NOT EXISTS ' + q + '.installed (' +
+      'id integer PRIMARY KEY DEFAULT 1, ' +
+      'installed_at timestamptz NOT NULL DEFAULT now(), ' +
+      'source text NOT NULL, ' +
+      'made_extensions text[] NOT NULL DEFAULT \'{}\', ' +
+      'made_schema boolean NOT NULL DEFAULT false, ' +
+      'jobid bigint, ' +
+      'CONSTRAINT only_one CHECK (id = 1));',
+    '',
+    '-- The project token, kept where only the database owner can read it - never',
+    '-- anon or authenticated, the roles your app\'s API runs as. With no token,',
+    '-- an earlier one is taken away and nothing is ever sent.',
+    'DO $kn$',
+    'DECLARE s record; r text;',
+    'BEGIN',
+    '  SELECT * INTO s FROM kn_install;',
+    '  IF s.token IS NULL THEN',
+    '    DROP TABLE IF EXISTS ' + q + '.reporting;',
+    '    RETURN;',
+    '  END IF;',
+    '  CREATE TABLE IF NOT EXISTS ' + q + '.reporting (' +
+      'id integer PRIMARY KEY DEFAULT 1, endpoint text NOT NULL, token text NOT NULL, engine text, ' +
+      'CONSTRAINT only_one CHECK (id = 1));',
+    '  REVOKE ALL ON ' + q + '.reporting FROM PUBLIC;',
+    "  FOREACH r IN ARRAY ARRAY['anon', 'authenticated'] LOOP",
+    "    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN EXECUTE format('REVOKE ALL ON %s.reporting FROM %I', " + lit(q) + ', r); END IF;',
+    '  END LOOP;',
+    '  INSERT INTO ' + q + '.reporting (id, endpoint, token, engine) VALUES (1, s.endpoint, s.token, ' + lit(engine) + ')',
+    '    ON CONFLICT (id) DO UPDATE SET endpoint = EXCLUDED.endpoint, token = EXCLUDED.token, engine = EXCLUDED.engine;',
+    'END $kn$;',
+    '',
+    '-- The nightly job, replaced rather than added to, and the record of it all.',
+    'DO $kn$',
+    'DECLARE s record; job bigint;',
+    'BEGIN',
+    '  SELECT * INTO s FROM kn_install;',
+    "  job := cron.schedule('kryptheon_nightly', " + lit(at) + ',',
+    "    'SELECT ' || " + lit(q) + " || '.' || CASE WHEN s.token IS NULL THEN 'nightly' ELSE 'nightly_and_report' END ||",
+    "    '(''' || replace(s.source, '''', '''''') || ''')');",
+    '  INSERT INTO ' + q + '.installed (id, source, made_extensions, made_schema, jobid)',
+    '    VALUES (1, s.source, s.made_extensions, s.made_schema, job)',
+    '    ON CONFLICT (id) DO UPDATE SET source = EXCLUDED.source, jobid = EXCLUDED.jobid,',
+    '      made_extensions = ' + q + '.installed.made_extensions || EXCLUDED.made_extensions, installed_at = now();',
+    'END $kn$;',
+    '',
+    "SELECT 'Installed. Kryptheon will check \"' || source || '\" every night at " + at + " (UTC)' ||",
+    "  CASE WHEN token IS NULL THEN ', and sends nothing anywhere.' ELSE ', and sends your Kryptheon dashboard a summary - never a row of data.' END AS kryptheon",
+    '  FROM kn_install;',
+    'DROP TABLE kn_install;',
+    '',
+  ].join('\n');
+}
+
+/**
+ * uninstall() as one pasted script: the job first, then the schema, then only
+ * the extensions the install wrote down as its own. Reads the same record the
+ * CLI does, so it takes back an install made either way.
+ */
+function uninstallScript(options) {
+  const schema = (options || {}).schema || SCHEMA;
+  const q = quote(schema);
+  return [
+    '-- Kryptheon: take the nightly check away again. Paste all of this into the SQL',
+    '-- editor of the project it watches, and press Run. It removes the job, the',
+    '-- ' + schema + ' schema, and any extension Kryptheon itself added - and leaves',
+    '-- alone anything that was already here.',
+    'DO $kn$',
+    'DECLARE job bigint; made_schema boolean; made text[]; e text;',
+    'BEGIN',
+    '  IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = ' + literal(schema) + ') THEN',
+    "    RAISE NOTICE 'Kryptheon is not installed here. Nothing was changed.';",
+    '    RETURN;',
+    '  END IF;',
+    '  BEGIN',
+    '    EXECUTE ' + literal('SELECT jobid, made_schema, made_extensions FROM ' + q + '.installed WHERE id = 1') + ' INTO job, made_schema, made;',
+    '  EXCEPTION WHEN OTHERS THEN',
+    '    job := NULL; made_schema := NULL; made := NULL; -- no record: the schema goes, nothing else',
+    '  END;',
+    '  IF job IS NOT NULL THEN',
+    '    BEGIN',
+    '      PERFORM cron.unschedule(job);',
+    '    EXCEPTION WHEN OTHERS THEN NULL;',
+    '    END;',
+    "    IF to_regclass('cron.job') IS NOT NULL AND EXISTS (SELECT 1 FROM cron.job j WHERE j.jobid = job) THEN",
+    "      RAISE EXCEPTION 'Kryptheon: the nightly job % is still scheduled, so nothing else was removed', job;",
+    '    END IF;',
+    '  END IF;',
+    '  DROP SCHEMA IF EXISTS ' + q + ' CASCADE;',
+    "  FOREACH e IN ARRAY coalesce(made, '{}') LOOP",
+    '    BEGIN',
+    "      EXECUTE 'DROP EXTENSION IF EXISTS ' || e;",
+    '    EXCEPTION WHEN OTHERS THEN NULL;',
+    '    END;',
+    '  END LOOP;',
+    'END $kn$;',
+    '',
+    "SELECT 'Kryptheon is gone from this database: no job, no schema, and only the extensions it added were removed.' AS kryptheon;",
+    '',
+  ].join('\n');
+}
+
+/** A value, ready to stand where a marker stood inside a SQL string. */
+function fillSlot(value) {
+  return String(value == null ? '' : value).split("'").join("''");
+}
+
+/**
+ * The script, filled in. Refuses a bad token the way install() does, before
+ * there is anything to paste.
+ */
+function installScript(options) {
+  const opts = options || {};
+  if (opts.reportTo) checkReportTo(opts.reportTo);
+  const report = opts.reportTo || {};
+  const values = { source: opts.source || 'public', token: report.token, endpoint: report.endpoint };
+  let sql = installTemplate({ schema: opts.schema, at: opts.at, engine: report.engine });
+  for (const [slot, marker] of Object.entries(SLOTS)) {
+    if (sql.split(marker).length !== 2) throw new Error('the install script carries ' + marker + ' more or less than once');
+    sql = sql.split(marker).join(fillSlot(values[slot]));
+  }
+  return sql;
+}
+
 /** A string, quoted the way Postgres wants it inside another statement. */
 function literal(text) {
   return "'" + String(text).split("'").join("''") + "'";
@@ -314,4 +542,8 @@ module.exports = {
   extensionState: extensionState,
   configureReporting: configureReporting,
   jobCommand: jobCommand,
+  installTemplate: installTemplate,
+  installScript: installScript,
+  uninstallScript: uninstallScript,
+  SLOTS: SLOTS,
 };

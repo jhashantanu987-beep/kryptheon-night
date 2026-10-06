@@ -167,6 +167,14 @@ properly.
 `uninstall` removes the job, the schema, and any extension it had to add, and
 leaves alone anything that was already there.
 
+**No terminal at all?** Your dashboard on kryptheon.tech gives you the same
+install as one SQL script: paste it into your Supabase SQL editor and press
+Run. It leaves your database exactly as `npx kryptheon-night install` does —
+`installscript.check.js` installs both ways side by side and compares every
+function, the job, the token and the record uninstall reads — and the matching
+uninstall script takes it back out, whichever way it went in. From code:
+`require('kryptheon-night/installer.js').installScript({ source, reportTo })`.
+
 ## Three answers, three exit codes
 
 | exit | meaning |

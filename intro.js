@@ -174,11 +174,20 @@ function installConsentLines(schema, source, at, reporting) {
   ];
 }
 
-/** Asks a question and hands back what was typed. */
-function ask(question) {
+/**
+ * Asks a question and hands back what was typed - or null when there is no
+ * more input to read, so a closed keyboard is an answer and not a wait forever.
+ */
+function ask(question, io) {
+  const streams = io || { input: process.stdin, output: process.stdout };
   return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const rl = readline.createInterface({ input: streams.input, output: streams.output });
+    let answered = false;
+    rl.on('close', () => {
+      if (!answered) resolve(null);
+    });
     rl.question(question, (answer) => {
+      answered = true;
       rl.close();
       resolve(String(answer || '').trim());
     });
@@ -235,9 +244,24 @@ function isYes(answer) {
   return said === 'y' || said === 'yes';
 }
 
-/** Yes or no, where anything that is not a clear yes is a no. */
-async function askYesNo(question) {
-  return isYes(await ask(question));
+/**
+ * Yes or no, where anything that is not a clear yes is a no - except an empty
+ * line, which is asked again.
+ *
+ * On Windows a pasted connection string can carry its own line ending: the
+ * hidden prompt takes it and moves on, and the Enter the person then presses
+ * to "send" the paste lands here, on a question they have not read yet. Taken
+ * as a no, it stopped an install nobody had said no to. An empty line is
+ * still never a yes; it is only not an answer.
+ */
+async function askYesNo(question, io) {
+  const streams = io || { input: process.stdin, output: process.stdout };
+  for (;;) {
+    const answer = await ask(question, streams);
+    if (answer === null) return false; // nothing more can be typed
+    if (answer !== '') return isYes(answer);
+    streams.output.write('  Type y and press Enter to go ahead, or n to stop.\n');
+  }
 }
 
 /**

@@ -46,7 +46,7 @@ function cli(args, env) {
 /** Words the person this is for has never had to learn. */
 const JARGON = /\bschema\b|\bRLS\b|row level security|\bpolic(y|ies)\b|\brollback\b|\btransaction\b|\bDDL\b|\bintrospect|\bpg_|\bSQL\b|\bgrant(s|ed)?\b/i;
 
-function main() {
+async function main() {
   /* ---- what is promised, before anything is connected to ---- */
 
   const consent = intro.consentLines('public');
@@ -146,6 +146,49 @@ function main() {
     return problems;
   })());
 
+  /* ---- an empty line is asked again ---- */
+
+  // A person at a keyboard, one key at a time: each answer arrives on its own,
+  // after the question it answers has been written.
+  async function converse(keys) {
+    const { PassThrough } = require('stream');
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let shown = '';
+    output.on('data', (d) => { shown += d; });
+    const answer = intro.askYesNo('  Go ahead? (y/n) ', { input: input, output: output });
+    for (const key of keys) {
+      await new Promise((r) => setTimeout(r, 40));
+      if (key === null) input.end();
+      else input.write(key);
+    }
+    const said = await Promise.race([answer, new Promise((r) => setTimeout(() => r('no answer after 3s'), 3000))]);
+    return { said: said, shown: shown, asked: shown.split('Go ahead? (y/n)').length - 1 };
+  }
+
+  const EOL = '\n';
+  const conversations = [
+    ['an Enter left over from a paste, then y', [EOL, 'y' + EOL], true, 2],
+    ['an Enter left over from a paste, then n', [EOL, 'n' + EOL], false, 2],
+    ['a Windows Enter, then y', ['\r\n', 'y\r\n'], true, 2],
+    ['spaces, then yes', ['   ' + EOL, 'yes' + EOL], true, 2],
+    ['n straight away', ['n' + EOL], false, 1],
+    ['something that is not a yes', ['ok' + EOL], false, 1],
+    ['an Enter, then the keyboard goes away', [EOL, null], false, 2],
+    ['the keyboard goes away before any answer', [null], false, 1],
+  ];
+  const heard = [];
+  for (const [what, keys, want, asks] of conversations) heard.push([what, want, asks, await converse(keys)]);
+  check('6b. an empty line is asked again, never taken as a yes or a no; only y or yes goes ahead', (() => {
+    const problems = [];
+    for (const [what, want, asks, got] of heard) {
+      if (got.said !== want) problems.push(what + ': answered ' + JSON.stringify(got.said) + ', expected ' + want);
+      if (got.asked !== asks) problems.push(what + ': asked ' + got.asked + ' times, expected ' + asks);
+      if (asks > 1 && !/Type y and press Enter/.test(got.shown)) problems.push(what + ': the second asking does not say what to type');
+    }
+    return problems;
+  })());
+
   /* ---- and the gate is really a gate ---- */
 
   const ungated = cli([], { KN_DATABASE_URL: NOWHERE });
@@ -209,4 +252,7 @@ function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(err.stack);
+  process.exitCode = 1;
+});
