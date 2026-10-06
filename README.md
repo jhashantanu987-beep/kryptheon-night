@@ -149,6 +149,15 @@ much faster for the same reason: on a real project the command line took 2
 minutes 16 seconds and the nightly run took 1 second, and both found the same
 five problems.
 
+**The one exception is one you ask for.** On Pro or Studio, install with the
+project token from your kryptheon.tech dashboard in the environment
+(`KRYPTHEON_PROJECT_TOKEN`, and `KRYPTHEON_REPORT_URL` for where it goes) and
+each night sends that dashboard a summary: the kind of each finding, the table
+it is on, and three counts. Never a row, never a value, never your connection
+string — `report.check.js` reads exactly what would be sent and fails if any of
+those is in it. The token is kept where only the database owner can read it.
+Install again without it and the token is deleted and nothing is sent.
+
 **One thing it cannot do.** Racing two requests against each other — the "can
 this exist twice" question — needs two connections at the same instant, and
 nothing living inside a database has them. The nightly report names every

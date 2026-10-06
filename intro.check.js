@@ -99,6 +99,17 @@ function main() {
     return problems;
   })());
 
+  check('4b. the nightly consent says it sends nothing - unless a project token was given, and then says what it sends', (() => {
+    const problems = [];
+    const quiet = intro.installConsentLines('kryptheon', 'shop', '0 3 * * *', null).join(' ');
+    const sends = intro.installConsentLines('kryptheon', 'shop', '0 3 * * *', { endpoint: 'https://x.supabase.co/functions/v1/ingest' }).join(' ');
+    if (!/sends nothing anywhere/.test(quiet)) problems.push('with no token it does not say it sends nothing');
+    if (/sends nothing/.test(sends)) problems.push('with a token it still says it sends nothing');
+    if (!/sends your\s+Kryptheon dashboard a summary/.test(sends)) problems.push('with a token it does not say what it sends');
+    if (!/Never a row, never a value, never\s+your connection string/.test(sends)) problems.push('with a token it does not say what it never sends');
+    return problems;
+  })());
+
   check('5. finding the connection string is described as buttons, not concepts', (() => {
     // "Get your database connection string" is not an instruction to
     // somebody who does not know the phrase. Screen names and what to click.

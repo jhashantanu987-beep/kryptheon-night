@@ -123,7 +123,21 @@ function consentLines(target) {
  * recognise. And the way out is on the screen where they say yes, not in a
  * README they will not read again.
  */
-function installConsentLines(schema, source, at) {
+function installConsentLines(schema, source, at, reporting) {
+  // Said as it is: with a project token the night does send something, so
+  // "sends nothing anywhere" would be a lie on exactly the screen that asks.
+  const sends = reporting
+    ? [
+      '  - It still never reads your real data. Once a night it sends your',
+      '    Kryptheon dashboard a summary of what it found: the kind of each',
+      '    finding and the table it is on. Never a row, never a value, never',
+      '    your connection string. That is what your morning report and',
+      '    alerts are made from.',
+    ]
+    : [
+      '  - It still never reads your real data, and still sends nothing anywhere.',
+      '    Nothing leaves your database, because the checking happens inside it.',
+    ];
   return [
     'This one stays. Everything else this tool does is temporary; this is not.',
     '',
@@ -143,8 +157,7 @@ function installConsentLines(schema, source, at) {
     '    tables into a temporary space, put two made-up people in it, attack',
     '    that, write down what got through, and delete the copy.',
     '',
-    '  - It still never reads your real data, and still sends nothing anywhere.',
-    '    Nothing leaves your database, because the checking happens inside it.',
+    ...sends,
     '',
     'One thing it cannot do:',
     '',

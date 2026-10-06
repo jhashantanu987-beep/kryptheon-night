@@ -35,6 +35,32 @@ const installer = require('../installer.js');
 const outside = require('../outside.js');
 const schema = require('../schema.js');
 
+/**
+ * The nightly summary, for a person on Pro or Studio: the project token and
+ * the address it goes to, from the environment - never the command line,
+ * which ends up in shell history. Null when no token is given, and then the
+ * night sends nothing at all.
+ */
+function reportToFromEnv() {
+  const token = String(process.env.KRYPTHEON_PROJECT_TOKEN || '').trim();
+  if (!token) return null;
+  return {
+    token: token,
+    endpoint: String(process.env.KRYPTHEON_REPORT_URL || '').trim(),
+    engine: engineVersion(),
+  };
+}
+
+/** "kryptheon-night 0.1.30", for the dashboard - or just the name, if it cannot be read. */
+function engineVersion() {
+  try {
+    const manifest = JSON.parse(require('fs').readFileSync(require('path').join(__dirname, '..', 'package.json'), 'utf8'));
+    return 'kryptheon-night ' + manifest.version;
+  } catch (err) {
+    return 'kryptheon-night';
+  }
+}
+
 const line = (text) => process.stdout.write(text + '\n');
 const fail = (text) => process.stderr.write(text + '\n');
 
@@ -205,9 +231,10 @@ async function runVerb(command, client, target) {
 
   if (command === 'install') {
     line('  Installing ...');
-    const done = await installer.install(client, { source: target });
+    const done = await installer.install(client, { source: target, reportTo: reportToFromEnv() });
     line('');
     line('  Installed. It will run at ' + done.at + ', watching "' + done.source + '".');
+    if (done.reporting) line('  Each night it sends your Kryptheon dashboard a summary - never a row of data.');
     line('');
     if (done.made.extensions.length) {
       line('  I had to add: ' + done.made.extensions.join(', ') + '.');
@@ -352,7 +379,7 @@ async function offerTheNight(client, target, canAsk) {
     return;
   }
 
-  block(intro.installConsentLines(installer.SCHEMA, target, installer.AT));
+  block(intro.installConsentLines(installer.SCHEMA, target, installer.AT, reportToFromEnv()));
   const sure = await intro.askYesNo('  Go ahead? (y/n) ');
   if (!sure) {
     line('');
@@ -362,9 +389,10 @@ async function offerTheNight(client, target, canAsk) {
   }
 
   try {
-    const done = await installer.install(client, { source: target });
+    const done = await installer.install(client, { source: target, reportTo: reportToFromEnv() });
     line('');
     line('  Done. It will run at ' + done.at + ', watching "' + done.source + '".');
+    if (done.reporting) line('  Each night it sends your Kryptheon dashboard a summary - never a row of data.');
     if (done.made.extensions.length) {
       line('  I added ' + done.made.extensions.join(' and ') + '; uninstall takes them back out.');
     }
@@ -429,7 +457,7 @@ function wordsFor(target, connection) {
   return {
     help: intro.whereToFindIt(),
     consent: intro.consentLines(target),
-    installConsent: intro.installConsentLines(installer.SCHEMA, target, installer.AT),
+    installConsent: intro.installConsentLines(installer.SCHEMA, target, installer.AT, reportToFromEnv()),
     // pg_cron reads this in the database's own time zone, which is UTC on
     // Supabase; the dashboard turns it into the person's local time.
     nightlyAt: installer.AT,
@@ -541,7 +569,7 @@ async function main() {
     // ends "I do not leave anything behind", which is true of a scan and false
     // of an install - and this is the one screen the product cannot be loose on.
     block(asked.command === 'install'
-      ? intro.installConsentLines(installer.SCHEMA, target, installer.AT)
+      ? intro.installConsentLines(installer.SCHEMA, target, installer.AT, reportToFromEnv())
       : intro.consentLines(target));
     const yes = await intro.askYesNo('  Go ahead? (y/n) ');
     if (!yes) {

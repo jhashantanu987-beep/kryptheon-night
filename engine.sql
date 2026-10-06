@@ -3535,3 +3535,71 @@ BEGIN
 
   RETURN run_id;
 END $$;
+
+-- --------------------------------------------------------------------------
+-- The nightly summary, for a person on Pro or Studio.
+--
+-- Only when they asked for it at install, by giving a project token: the
+-- token and the address it goes to are kept in __KN__.reporting, which no
+-- role but the owner can read. Without that table nothing is ever sent.
+--
+-- What is sent is fixed here: the kind of each finding, the table it is on,
+-- a column when the finding is about one, and three counts. Never a row of
+-- the customer's data, never a column's values or the list of a table's
+-- columns, never the connection string, and not even the text of an error,
+-- which can quote the schema.
+-- --------------------------------------------------------------------------
+
+/* The summary of one night, as the body of the report. */
+CREATE OR REPLACE FUNCTION __KN__.report_body(run_id bigint, engine text)
+RETURNS jsonb LANGUAGE sql STABLE AS $$
+  SELECT jsonb_build_object(
+    'format', 1,
+    'engine', coalesce(engine, 'kryptheon-night'),
+    'ran_at', r.ran_at,
+    'stopped', r.stopped IS NOT NULL,
+    'attacks_run', r.attacks_run,
+    'not_tested', jsonb_array_length(r.not_checked),
+    'findings', coalesce((
+      SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+               'kind', f->>'kind',
+               -- A loop found through a helper names no table; "unknown"
+               -- rather than nothing, so the night is still filed.
+               'table', coalesce(f->>'table', 'unknown'),
+               'column', f->>'column')))
+        FROM jsonb_array_elements(r.findings) f), '[]'::jsonb))
+    FROM __KN__.runs r WHERE r.id = run_id;
+$$;
+
+/*
+ * Sends one night's summary, if a project token was given at install. Never
+ * raises: a report that cannot be sent must not cost the night its own record.
+ */
+CREATE OR REPLACE FUNCTION __KN__.report(run_id bigint)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+  cfg record;
+  sent bigint;
+BEGIN
+  IF to_regclass('__KN__.reporting') IS NULL THEN RETURN NULL; END IF;
+  EXECUTE 'SELECT endpoint, token, engine FROM __KN__.reporting WHERE id = 1' INTO cfg;
+  IF cfg IS NULL OR cfg.endpoint IS NULL OR cfg.token IS NULL THEN RETURN NULL; END IF;
+  EXECUTE 'SELECT net.http_post(url := $1, body := $2, headers := $3, timeout_milliseconds := 10000)'
+    INTO sent
+    USING cfg.endpoint, __KN__.report_body(run_id, cfg.engine),
+          jsonb_build_object('Content-Type', 'application/json', 'Authorization', 'Bearer ' || cfg.token);
+  RETURN sent;
+EXCEPTION WHEN OTHERS THEN
+  RETURN NULL;
+END $$;
+
+/* What the scheduled job runs when a summary was asked for. */
+CREATE OR REPLACE FUNCTION __KN__.nightly_and_report(source text)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+  run_id bigint;
+BEGIN
+  run_id := __KN__.nightly(source);
+  PERFORM __KN__.report(run_id);
+  RETURN run_id;
+END $$;

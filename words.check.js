@@ -17,10 +17,13 @@ const SECRET = 'Zq7-never-shown-9Xw';
 const results = [];
 const check = (name, problems) => results.push({ name, problems });
 
-function words(args, connection) {
+function words(args, connection, extra) {
   const env = Object.assign({}, process.env);
   delete env.KN_DATABASE_URL;
+  delete env.KRYPTHEON_PROJECT_TOKEN;
+  delete env.KRYPTHEON_REPORT_URL;
   if (connection !== undefined) env.KN_DATABASE_URL = connection;
+  Object.assign(env, extra || {});
   const started = Date.now();
   const r = spawnSync(process.execPath, [BIN, 'words'].concat(args || []), { encoding: 'utf8', env: env, timeout: 30000 });
   let json = null;
@@ -38,6 +41,20 @@ check('1. it prints the same help and consent screens the command shows, as JSON
   if (!same(plain.json.installConsent, intro.installConsentLines(installer.SCHEMA, 'shop', installer.AT))) p.push('the nightly consent differs');
   if (plain.json.nightlyAt !== installer.AT) p.push('nightlyAt is ' + plain.json.nightlyAt);
   if (plain.json.given !== false || plain.json.warning !== null || plain.json.unusable !== null) p.push('with no string it still judged one');
+  return p;
+})());
+
+const TOKEN = 'kp_' + 'Wq'.repeat(20);
+const reporting = words(['--schema', 'shop'], undefined, {
+  KRYPTHEON_PROJECT_TOKEN: TOKEN, KRYPTHEON_REPORT_URL: 'https://abc.supabase.co/functions/v1/ingest',
+});
+check('1b. with a project token in the environment, the nightly consent is the one that says what it sends', (() => {
+  const p = [];
+  if (!reporting.json) return ['exit ' + reporting.code + ', output: ' + reporting.out.slice(0, 300)];
+  const want = intro.installConsentLines(installer.SCHEMA, 'shop', installer.AT, { endpoint: 'x' });
+  if (JSON.stringify(reporting.json.installConsent) !== JSON.stringify(want)) p.push('the nightly consent is not the reporting one');
+  if (JSON.stringify(plain.json && plain.json.installConsent) === JSON.stringify(want)) p.push('without a token it is the reporting one too');
+  if (reporting.out.includes(TOKEN)) p.push('the token was printed');
   return p;
 })());
 

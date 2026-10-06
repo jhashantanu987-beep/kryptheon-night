@@ -87,6 +87,10 @@ async function install(client, options) {
   const at = opts.at || AT;
   const made = { extensions: [], schema: false, jobid: null };
 
+  // A bad project token is refused here, before anything is made, for the
+  // same reason as the extensions below.
+  if (opts.reportTo) checkReportTo(opts.reportTo);
+
   // Both asked about before either is made. pg_net used to be created first
   // and pg_cron checked after, so a database offering one and not the other
   // kept a pg_net nobody recorded - and uninstall only removes what the
@@ -132,12 +136,15 @@ async function install(client, options) {
       'CONSTRAINT only_one CHECK (id = 1))',
   );
 
+  // The nightly summary, only if a project token was given.
+  const reporting = await configureReporting(client, schema, opts.reportTo || null);
+
   // Replaced rather than added to. cron.schedule with a name that already
   // exists updates it, but an install that ran twice under two names would
   // attack the same app twice a night for ever.
   const { rows } = await client.query(
     'SELECT cron.schedule($1, $2, $3) AS jobid',
-    ['kryptheon_nightly', at, 'SELECT ' + quote(schema) + '.nightly(' + literal(source) + ')'],
+    ['kryptheon_nightly', at, jobCommand(schema, source, reporting)],
   );
   made.jobid = rows[0].jobid;
 
@@ -150,7 +157,60 @@ async function install(client, options) {
     [source, made.extensions, made.schema, made.jobid],
   );
 
-  return { schema: schema, source: source, at: at, jobid: made.jobid, made: made };
+  return { schema: schema, source: source, at: at, jobid: made.jobid, made: made, reporting: reporting };
+}
+
+/** What the scheduled job runs: the night, and the summary only if one was asked for. */
+function jobCommand(schema, source, reporting) {
+  return 'SELECT ' + quote(schema) + '.' + (reporting ? 'nightly_and_report' : 'nightly') + '(' + literal(source) + ')';
+}
+
+// A project token from kryptheon.tech, and the one address it may be sent to.
+const TOKEN = /^kp_[A-Za-z0-9_-]{20,100}$/;
+const ENDPOINT = /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)+(:443)?\/functions\/v1\/ingest$/i;
+
+/** Throws, in words a person can act on, unless this is a token and an address it may go to. */
+function checkReportTo(reportTo) {
+  if (!TOKEN.test(String(reportTo.token || ''))) {
+    throw new Error('that is not a project token - copy it again from your dashboard on kryptheon.tech');
+  }
+  if (!ENDPOINT.test(String(reportTo.endpoint || ''))) {
+    throw new Error('the report address has to be an https address ending in /functions/v1/ingest');
+  }
+}
+
+/**
+ * Keeps the project token where the nightly job can read it and nobody else
+ * can, or takes it away when none is given - so an install without one sends
+ * nothing, even if an earlier install was given one.
+ *
+ * In a table of the engine's own schema, readable by its owner only: anon and
+ * authenticated - the roles a Supabase API call runs as - get nothing, so the
+ * token never reaches the app's API even if the schema were exposed.
+ */
+async function configureReporting(client, schema, reportTo) {
+  const table = quote(schema) + '.reporting';
+  if (!reportTo) {
+    await client.query('DROP TABLE IF EXISTS ' + table);
+    return null;
+  }
+  checkReportTo(reportTo);
+  await client.query(
+    'CREATE TABLE IF NOT EXISTS ' + table + ' (' +
+      'id integer PRIMARY KEY DEFAULT 1, endpoint text NOT NULL, token text NOT NULL, engine text, ' +
+      'CONSTRAINT only_one CHECK (id = 1))',
+  );
+  await client.query('REVOKE ALL ON ' + table + ' FROM PUBLIC');
+  for (const role of ['anon', 'authenticated']) {
+    const { rows } = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [role]);
+    if (rows.length) await client.query('REVOKE ALL ON ' + table + ' FROM ' + role);
+  }
+  await client.query(
+    'INSERT INTO ' + table + ' (id, endpoint, token, engine) VALUES (1, $1, $2, $3) ' +
+      'ON CONFLICT (id) DO UPDATE SET endpoint = EXCLUDED.endpoint, token = EXCLUDED.token, engine = EXCLUDED.engine',
+    [reportTo.endpoint, reportTo.token, reportTo.engine || null],
+  );
+  return { endpoint: reportTo.endpoint };
 }
 
 /** A string, quoted the way Postgres wants it inside another statement. */
@@ -252,4 +312,6 @@ module.exports = {
   uninstall: uninstall,
   status: status,
   extensionState: extensionState,
+  configureReporting: configureReporting,
+  jobCommand: jobCommand,
 };
