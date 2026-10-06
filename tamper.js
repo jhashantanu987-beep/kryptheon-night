@@ -114,6 +114,11 @@ async function tamper(client, schema, tables, seeded, policies) {
     rulesFor.set(policy.table_name, list);
   }
 
+  // The first person's row in tables that hold one for each person but name
+  // nobody (attack.seed), so a write is aimed at a row that is not the
+  // caller's own.
+  const firstRowOf = new Map((seeded || []).filter((entry) => entry.rowOfA).map((entry) => [entry.table, entry.rowOfA]));
+
   for (const table of tables) {
     if (!shapeFor.has(table.name)) continue; // never seeded, so nothing to protect
     const owner = attack.ownerColumn(table);
@@ -127,9 +132,12 @@ async function tamper(client, schema, tables, seeded, policies) {
       // Rows belonging to the other fake person. Scoped on purpose: a signed-in
       // customer deleting their OWN rows is not a finding, it is the feature,
       // and an unscoped DELETE would report every correctly built app.
+      const firstRow = firstRowOf.get(table.name);
       const theirRows = owner
         ? ' WHERE ' + quote(owner) + ' = ' + "'" + attack.USER_A + "'"
-        : '';
+        : firstRow
+          ? ' WHERE ' + quote(firstRow.column) + "::text = '" + firstRow.value.split("'").join("''") + "'"
+          : '';
       const at = quote(schema) + '.' + quote(table.name);
 
       // Written under a name nobody has used, which is both what makes the
@@ -334,7 +342,8 @@ function memberships(tables) {
 }
 
 // What each kind of write is called in a rule.
-const COMMAND = { add: 'INSERT', change: 'UPDATE', delete: 'DELETE' };
+// A takeover is an UPDATE too: a rule for updating is what it would hide behind.
+const COMMAND = { add: 'INSERT', change: 'UPDATE', delete: 'DELETE', takeover: 'UPDATE' };
 
 /**
  * Whether the app's own rules name this role among those allowed to make
@@ -478,6 +487,22 @@ async function teammate(client, schema, tables, seeded, rules) {
         { what: 'change', statement: 'UPDATE ' + target + ' SET ' + column + ' = ' + column + notTheirs, values: [] },
         { what: 'delete', statement: 'DELETE FROM ' + target + notTheirs, values: [] },
       ];
+      // On the members table itself: putting their own id on the first
+      // person's membership row - taking that member's place, and their role.
+      // Found on a blind test (HarborLine): a member could update any member
+      // row of the team, and repointing an admin's row made them admin. A rule
+      // that lets a role edit memberships does not make this the design, so
+      // it is asked of every role, listed or not.
+      if (table.name === member.table.name) {
+        const firstPersons = [quote(member.person) + " = '" + attack.USER_A + "'"]
+          .concat(Object.keys(pointed).map((name) => quote(name) + " = '" + String(pointed[name]).split("'").join("''") + "'"));
+        moves.push({
+          what: 'takeover',
+          anyRole: true,
+          statement: 'UPDATE ' + target + ' SET ' + quote(member.person) + " = '" + attack.USER_B + "' WHERE " + firstPersons.join(' AND '),
+          values: [],
+        });
+      }
       // Adding a row to the team, said only of a role whose own name says it
       // may only look: a member adding rows is the feature, a viewer adding
       // them is not. Found on a blind test (HelixOps): any member could add
@@ -534,7 +559,7 @@ async function teammate(client, schema, tables, seeded, rules) {
           // A write the rules list this role for is not asked: whatever it
           // did would not be reported, and a key refusing it on the way out
           // left the table untested (HelixOps' assets, as a dispatcher).
-          if (allowedByRules(rules, table.name, move.what, role, member.roleType)) {
+          if (!move.anyRole && allowedByRules(rules, table.name, move.what, role, member.roleType)) {
             listed = true;
             continue;
           }
@@ -554,7 +579,7 @@ async function teammate(client, schema, tables, seeded, rules) {
         }
         completed.push(key);
         if (can.length) {
-          findings.push({
+          findings.push(Object.assign({
             kind: 'role',
             table: table.name,
             who: role,
@@ -566,7 +591,7 @@ async function teammate(client, schema, tables, seeded, rules) {
             below: below.slice(),
             columns: (table.columns || []).map((c) => c.name),
             rlsEnabled: table.rlsEnabled,
-          });
+          }, can.includes('takeover') ? { takeover: true, personColumn: member.person } : {}));
           break;
         }
         if (!listed) below.push(role);

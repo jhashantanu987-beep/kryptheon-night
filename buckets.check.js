@@ -41,6 +41,9 @@ const BUCKETS = [
   { name: 'avatars', public: true, rule: { cmd: 'SELECT', to: 'public', extra: false }, report: false },
   // Public, with no rule at all: nothing says it was meant to be private.
   { name: 'plain', public: true, rule: null, report: false },
+  // Public, no rule, and a name that says what it holds (HarborLine's
+  // customer-exports, whose one rule had failed to load).
+  { name: 'backups', public: true, rule: null, report: true, noRule: true },
   // Private: what the rule says is what happens.
   { name: 'private', public: false, rule: { cmd: 'SELECT', to: 'public', extra: true }, report: false },
   // Public, and the only rule is about removing files, not reading them.
@@ -185,6 +188,11 @@ async function main() {
           if (!/createSignedUrl/.test(prompt)) p.push(engine + ' never says the links will need signing');
           if (!/I did not open or list any file/.test(f.body)) p.push(engine + ' body: ' + f.body);
         }
+        const backups = found.find((f) => f.table === id('backups'));
+        if (backups && backups.headline !== 'Your ' + id('backups') + ' storage bucket is public, and its name says its files are not for everyone.') {
+          p.push(engine + ': ' + backups.headline);
+        }
+        if (backups && !/no rule on storage\.objects says who may read it/.test(backups.fixPrompt.replace(/\s+/g, ' '))) p.push(engine + ' no-rule prompt: ' + backups.fixPrompt);
         const exports = found.find((f) => f.table === id('exports'));
         if (exports && exports.headline !== 'Your ' + id('exports') + ' storage bucket is public, but a rule says only some people may read it.') {
           p.push(engine + ': ' + exports.headline);
@@ -203,6 +211,19 @@ async function main() {
       objectsAfter !== objectsBefore ? ['objects ' + objectsBefore + ' -> ' + objectsAfter] : [],
       stillPublic !== BUCKETS.filter((b) => b.public).length ? ['public buckets now ' + stillPublic] : [],
     ));
+
+    // ---------------------------------------- the nightly run, inside the database
+    let nightBuckets = null;
+    await sqlengine.withEngine(client, async (target) => {
+      const runId = (await client.query('SELECT ' + schema.quote(target) + '.nightly($1) AS id', [APP])).rows[0].id;
+      const row = (await client.query('SELECT findings FROM ' + schema.quote(target) + '.runs WHERE id = $1', [runId])).rows[0];
+      nightBuckets = (row.findings || []).filter((f) => f.kind === 'bucket' && String(f.table).endsWith(STAMP));
+    });
+    check('the nightly run inside the database reports the same buckets, the same way', (() => {
+      const canon = (list) => JSON.stringify(list.map((f) => Object.keys(f).sort().reduce((o, k) => { o[k] = f[k]; return o; }, {})).sort((a, b) => (a.table < b.table ? -1 : 1)));
+      const cli = scanner.bucketsOf({ buckets: ours(fromNode.buckets) });
+      return canon(nightBuckets || []) === canon(cli) ? [] : ['nightly ' + canon(nightBuckets || []), 'cli     ' + canon(cli)];
+    })());
 
     // ---------------------------------------- the nightly read-back
     const record = scanner.nightlyRecord(

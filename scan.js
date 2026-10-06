@@ -505,6 +505,8 @@ function privilegedOf(plan) {
     args: fn.args,
     writes: fn.writes,
     hasFixedSearchPath: fn.hasFixedSearchPath,
+    // Its only check at the door is one a caller with no role slips past.
+    nullSlips: fn.nullSlips === true,
     columns: [],
   }));
 }
@@ -536,9 +538,18 @@ function bucketsOf(plan) {
     table: b.name,
     bucket: b.id,
     rules: (b.readRules || []).filter((rule) => narrows(rule, b.id)).map((rule) => rule.name),
+    // No read rule at all, and a name that says what is in it is not for
+    // everyone. Found on a blind test (HarborLine): customer-exports was
+    // public, and its one read rule had failed to load (a text compared to a
+    // uuid) - with nothing to read, the bucket was never mentioned.
+    noRule: !(b.readRules || []).length && PRIVATE_BUCKET.test(String(b.name)),
     columns: [],
-  })).filter((f) => f.rules.length);
+  })).filter((f) => f.rules.length || f.noRule);
 }
+
+// Names that say a bucket's files are somebody's own business. Whole words
+// only: "plain" or "avatars" say nothing, and stay quiet.
+const PRIVATE_BUCKET = /(^|[-_.])(exports?|private|documents?|docs|invoices?|contracts?|backups?|reports?|receipts?|statements?|payouts?|evidence|kyc|passports?|medical|records?|confidential|internal|secrets?|attachments?)([-_.]|$)/i;
 
 /**
  * What each finding needs to know about its table for its fix to be right:
@@ -619,14 +630,17 @@ function nightlyRecord(latest, readAt, plan) {
   if (!run) return record;
   // The night's findings, told as the night's: tagged with what their table
   // needs for a right fix when the schema could be read, and joined by the
-  // functions anyone can call - read now, when this is asked, because the
-  // engine inside the database does not look at them.
+  // functions anyone can call and the public buckets - read now, when this is
+  // asked, which is newer than the night. The night records them too since
+  // 0.1.32 (for the dashboard), so where they can be read now the night's own
+  // are left out rather than said twice; where they cannot, the night's stand.
   const tag = plan ? taggerFor(plan, plan.tables) : (f) => f;
   // A loop the engine could not name ("stack depth limit exceeded") is put
   // on the tables whose own rule reads back into them, read from the shape.
   const loops = plan ? loopingTables(plan) : [];
   const night = [];
   for (const f of run.findings || []) {
+    if (plan && (f.kind === 'privileged' || f.kind === 'bucket')) continue;
     const at = f.kind === 'recursive' && !f.table ? (loops.length ? loops : ['one of your tables']) : [f.table];
     for (const table of at) night.push(tag(Object.assign({}, f, { table: table, fromNight: true })));
   }

@@ -289,7 +289,7 @@ function differences(mine, theirs, where) {
 /** Only the parts of the shape the SQL engine has been taught so far. */
 const SO_FAR = [
   'schema', 'tables', 'types', 'policies', 'grants', 'sequenceGrants', 'indexes', 'views',
-  'viewGrants', 'external', 'unsupported', 'functions', 'buckets',
+  'viewGrants', 'external', 'unsupported', 'functions', 'buckets', 'anonFunctions',
 ];
 
 function onlySoFar(shape) {

@@ -531,6 +531,27 @@ function insertRow(client, schema, table, row, back) {
   );
 }
 
+/**
+ * The column that says which organization's a row is, on a table with no
+ * person's name on it - or null. Its first key to a table that others point
+ * at (an organization, a workspace, a team), where the table itself is not one
+ * of those: seeding gives each person their own organization, and a table like
+ * this one row, in the first person's. Found on a blind test (HarborLine):
+ * integration_secrets(organization_id, access_token) was readable by every
+ * signed-in user, and with no person column it was never tried at all.
+ */
+function tenantKey(table, tables, parents) {
+  // A view is not seeded: it shows whatever its tables hold, the second
+  // person's own organization included, so a row of it read by them proves
+  // nothing. Found on the same test: workspace_health, filtered to the
+  // organizations the reader belongs to, came back as a leak.
+  if (table.isView || parents.has(table.name)) return null;
+  for (const key of foreignKeys(table).concat(impliedKeys(table, tables))) {
+    if (key.refTable !== table.name && parents.has(key.refTable) && key.columns.length === 1) return key.columns[0];
+  }
+  return null;
+}
+
 /** Every table some other table points at, by a key it declared or one it implies. */
 function parentTables(tables) {
   const parents = new Set();
@@ -619,7 +640,19 @@ async function seed(client, schema, tables) {
       // this table can use the same one instead of rediscovering it, and be
       // sure a refusal is the app defending itself rather than a CHECK it
       // never satisfied.
-      seeded.push({ table: table.name, owner: owner, attempt: worked });
+      const entry = { table: table.name, owner: owner, attempt: worked };
+      // A table with nobody's name on it that got a row for each person - an
+      // organization's invoices, say - holds the second person's own row too.
+      // Which row is the first person's is kept, so a write meant for
+      // "somebody else's row" is aimed at it. Found on a blind test
+      // (HarborLine): an unscoped UPDATE changed the second person's own
+      // invoice, and was reported as any customer changing another's.
+      const firstRow = !owner && rows.get(table.name) && rows.get(table.name).get(USER_A);
+      const pk = primaryKeyOf(table);
+      if (firstRow && rows.get(table.name).size === 2 && pk && firstRow[pk] !== null && firstRow[pk] !== undefined) {
+        entry.rowOfA = { column: pk, value: String(firstRow[pk]) };
+      }
+      seeded.push(entry);
     } else {
       // Recorded, never swallowed. The report has to say this table was not
       // checked rather than let an empty table pass for a safe one.
@@ -747,8 +780,10 @@ async function impersonate(client, schema, tables) {
     return false;
   };
 
+  const parents = parentTables(tables);
   for (const table of tables) {
     const owner = ownerColumn(table);
+    const tenant = owner ? null : tenantKey(table, tables, parents);
     const anon = await readAs(client, schema, table.name, 'anon', null);
     const asA = await readAs(client, schema, table.name, 'authenticated', USER_A);
 
@@ -790,6 +825,27 @@ async function impersonate(client, schema, tables) {
           owner: owner,
           readable: theirs,
           columns: Object.keys(asA[0] || {}),
+          rlsEnabled: table.rlsEnabled,
+        });
+      }
+    }
+
+    // A table whose rows are an organization's, not a person's: its one row is
+    // the first person's organization's, and the second person - signed in,
+    // in an organization of their own - asks for it. What a logged-out
+    // stranger can already read is reported as exposed, and not twice.
+    if (tenant) {
+      const asB = await readAs(client, schema, table.name, 'authenticated', USER_B);
+      const open = Array.isArray(anon) && anon.length > 0;
+      if (settle('crossed:' + table.name, table.name, asB, 'as a signed-in user in another organization') &&
+          asB.length > 0 && !open) {
+        findings.push({
+          kind: 'crossed',
+          table: table.name,
+          owner: tenant,
+          tenant: true,
+          readable: asB.length,
+          columns: Object.keys(asB[0] || {}),
           rlsEnabled: table.rlsEnabled,
         });
       }

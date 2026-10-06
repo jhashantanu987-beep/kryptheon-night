@@ -20,6 +20,7 @@ const schema = require('./schema.js');
 const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
 const recheck = require('./recheck.js');
+const sqlengine = require('./sqlengine.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 const STAMP = Date.now().toString(36);
@@ -66,9 +67,19 @@ const FUNCTIONS = {
     ".is_org_admin(org) THEN RAISE EXCEPTION 'admins may not'; END IF; " + WRITE + ' RETURN true; END'],
   // Hands data back before it checks anything.
   returns_first: ['org int', 'BEGIN RETURN true; IF ' + ADMIN + " THEN RAISE EXCEPTION 'admin required'; END IF; END"],
+  // A role helper answers NULL for somebody with no role there, and NULL NOT
+  // IN (...) is not true: the IF never raises (HarborLine's
+  // complete_automation_run). Written so NULL cannot pass, it is a guard.
+  role_not_in: ['org int', 'BEGIN IF ' + S + ".role_in(org) NOT IN ('owner', 'admin') THEN RAISE EXCEPTION 'no'; END IF; " + WRITE + ' RETURN true; END'],
+  role_not_equal: ['org int', 'BEGIN IF ' + S + ".role_in(org) <> 'owner' THEN RAISE EXCEPTION 'no'; END IF; " + WRITE + ' RETURN true; END'],
+  role_coalesce: ['org int', 'BEGIN IF coalesce(' + S + ".role_in(org)::text, 'none') NOT IN ('owner', 'admin') THEN RAISE EXCEPTION 'no'; END IF; " + WRITE + ' RETURN true; END'],
+  role_is_null: ['org int', 'BEGIN IF ' + S + '.role_in(org) IS NULL OR ' + S + ".role_in(org) NOT IN ('owner', 'admin') THEN RAISE EXCEPTION 'no'; END IF; " + WRITE + ' RETURN true; END'],
 };
-const GUARDED = ['guarded_after_if', 'guarded_export', 'guarded_inline', 'guarded_is_not_true'];
-const OPEN = ['anyone_signed_in', 'anyone_signed_in_too', 'backwards', 'glued', 'late_guard', 'names_its_own', 'notice_only', 'returns_first'];
+const GUARDED = ['guarded_after_if', 'guarded_export', 'guarded_inline', 'guarded_is_not_true', 'role_coalesce', 'role_is_null'];
+const OPEN = ['anyone_signed_in', 'anyone_signed_in_too', 'backwards', 'glued', 'late_guard', 'names_its_own', 'notice_only', 'returns_first',
+  'role_not_equal', 'role_not_in'];
+// The ones whose only check is a role helper a stranger slips past.
+const SLIPS = ['role_not_equal', 'role_not_in'];
 
 async function build(client) {
   await client.query('CREATE SCHEMA ' + S);
@@ -81,6 +92,11 @@ async function build(client) {
   // The same question about somebody the caller names.
   await client.query(definer('is_admin_named', 'org int, who text', 'BEGIN RETURN EXISTS (SELECT 1 FROM ' + S +
     ".organization_members m WHERE m.org = org AND m.user_id = who AND m.role = 'admin'); END"));
+  // The caller's own role in an organization, the way org_role() is written.
+  await client.query('CREATE TYPE ' + S + ".member_role AS ENUM ('owner', 'admin', 'member', 'viewer')");
+  await client.query('CREATE FUNCTION ' + S + '.role_in(org int) RETURNS ' + S + '.member_role LANGUAGE plpgsql SECURITY DEFINER ' +
+    'SET search_path = public AS $f$ BEGIN RETURN (SELECT m.role::' + S + '.member_role FROM ' + S + '.organization_members m ' +
+    'WHERE m.org = org AND m.user_id = auth.uid()::text LIMIT 1); END $f$');
   for (const [name, [args, body]] of Object.entries(FUNCTIONS)) await client.query(definer(name, args, body));
 }
 
@@ -107,6 +123,38 @@ async function main() {
       const got = fns.filter((f) => f.guarded).map((f) => f.name).sort();
       return JSON.stringify(got) === JSON.stringify(GUARDED)
         ? [] : ['expected ' + JSON.stringify(GUARDED) + ', got ' + JSON.stringify(got)];
+    })());
+
+    check('a role check a stranger slips past is named as one; the role helper itself is about the caller', (() => {
+      const problems = [];
+      const slips = fns.filter((f) => f.nullSlips).map((f) => f.name).sort();
+      if (JSON.stringify(slips) !== JSON.stringify(SLIPS)) problems.push('slips: ' + JSON.stringify(slips));
+      const helper = byName.get('role_in') || {};
+      if (!helper.aboutCaller) problems.push('role_in is not read as about the caller: ' + JSON.stringify(helper));
+      return problems;
+    })());
+
+    // The nightly run reads functions in SQL. Same answer, field for field.
+    const canon = (list) => JSON.stringify((list || []).map((f) => Object.keys(f).sort().reduce((o, k) => { o[k] = f[k]; return o; }, {})));
+    let fromSql = null;
+    let nightly = null;
+    await sqlengine.withEngine(client, async (target) => {
+      fromSql = (await client.query('SELECT ' + schema.quote(target) + '.read_anon_definer_functions($1) AS f', [APP])).rows[0].f;
+      const id = (await client.query('SELECT ' + schema.quote(target) + '.nightly($1) AS id', [APP])).rows[0].id;
+      nightly = (await client.query('SELECT findings, stopped FROM ' + schema.quote(target) + '.runs WHERE id = $1', [id])).rows[0];
+    });
+    check('the SQL engine reads every function exactly as the Node engine does', canon(fromSql) === canon(fns)
+      ? [] : ['node ' + canon(fns), 'sql  ' + canon(fromSql)]);
+    check('the nightly run reports the same open functions, and none of the guarded ones', (() => {
+      if (!nightly || nightly.stopped) return ['the night stopped: ' + (nightly && nightly.stopped)];
+      const said = (nightly.findings || []).filter((f) => f.kind === 'privileged').map((f) => f.table).sort();
+      const problems = [];
+      const want = fns.filter((f) => f.callable && !f.aboutCaller && !f.guarded).map((f) => f.name).sort();
+      if (JSON.stringify(said) !== JSON.stringify(want)) problems.push('nightly said ' + JSON.stringify(said) + ', the node reader ' + JSON.stringify(want));
+      if (OPEN.some((n) => !said.includes(n)) || GUARDED.some((n) => said.includes(n))) problems.push('open or guarded ones misread: ' + JSON.stringify(said));
+      const slip = (nightly.findings || []).find((f) => f.table === 'role_not_in');
+      if (slip && slip.nullSlips !== true) problems.push('the nightly finding lost nullSlips');
+      return problems;
     })());
 
     check('the plain helpers are not guarded by themselves', (() => {

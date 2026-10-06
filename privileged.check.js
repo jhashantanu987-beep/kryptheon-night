@@ -15,6 +15,7 @@ const schema = require('./schema.js');
 const fixture = require('./fixture.js');
 const { scan } = require('./scan.js');
 const recheck = require('./recheck.js');
+const sqlengine = require('./sqlengine.js');
 
 const CONNECTION = process.argv[2] || process.env.KN_DATABASE_URL;
 const STAMP = Date.now().toString(36);
@@ -120,6 +121,24 @@ async function main() {
     const flagged = fns.filter((f) => f.callable);
     const byName = new Map(flagged.map((f) => [f.name, f]));
     const names = flagged.map((f) => f.name).sort();
+
+    // The nightly run reads functions in SQL: the same answer, field for field,
+    // for anon and for a role it is asked about.
+    const canon = (list) => JSON.stringify((list || []).map((f) => Object.keys(f).sort().reduce((o, k) => { o[k] = f[k]; return o; }, {})));
+    const forAuth = await schema.readAnonDefinerFunctions(client, APP, 'authenticated');
+    let sqlAnon = null;
+    let sqlAuth = null;
+    await sqlengine.withEngine(client, async (target) => {
+      const read = (role) => client.query('SELECT ' + q(target) + '.read_anon_definer_functions($1, $2) AS f', [APP, role]);
+      sqlAnon = (await read('anon')).rows[0].f;
+      sqlAuth = (await read('authenticated')).rows[0].f;
+    });
+    check('the SQL engine reads every function exactly as the Node engine does, for anon and for authenticated', (() => {
+      const problems = [];
+      if (canon(sqlAnon) !== canon(fns)) problems.push('anon: node ' + canon(fns) + ' / sql ' + canon(sqlAnon));
+      if (canon(sqlAuth) !== canon(forAuth)) problems.push('authenticated: node ' + canon(forAuth) + ' / sql ' + canon(sqlAuth));
+      return problems;
+    })());
 
     check('it flags the definer function anon can call', (() => {
       return byName.has('claim') ? [] : ['claim was not flagged; got ' + JSON.stringify(names)];

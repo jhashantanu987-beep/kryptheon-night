@@ -358,6 +358,10 @@ function headlineFor(finding) {
   if (finding.kind === 'privileged') {
     return 'Anyone on the internet can call your ' + finding.fn + ' function, and it runs with full rights.';
   }
+  if (finding.kind === 'role' && finding.takeover) {
+    return capital(aRole(finding.who)) + ' in ' + aOne(finding.parent) + ' can take another member\'s place in your ' +
+      finding.table + ' table - and with it their role.';
+  }
   if (finding.kind === 'role') {
     const order = ['delete', 'change', 'add'];
     const does = order.filter((what) => (finding.can || []).includes(what)).map((what) => WRITE_WORDS[what]);
@@ -368,6 +372,9 @@ function headlineFor(finding) {
     return capital(aRole(finding.who)) + ' in ' + aOne(finding.parent) + ' can read your ' + finding.table +
       ' table, which holds ' + listOf(finding.secrets || []) + '.';
   }
+  if (finding.kind === 'bucket' && finding.noRule) {
+    return 'Your ' + finding.table + ' storage bucket is public, and its name says its files are not for everyone.';
+  }
   if (finding.kind === 'bucket') {
     return 'Your ' + finding.table + ' storage bucket is public, but a rule says only some people may read it.';
   }
@@ -377,6 +384,7 @@ function headlineFor(finding) {
   // The table name goes in front of the sentence rather than inside it. Put
   // inside, a table called `customers` produced "One customer can read another
   // customer's customers", which is the kind of line that loses a reader.
+  if (finding.tenant) return 'Your ' + finding.table + ' table lets a signed-in user read another organization\'s rows.';
   return 'Your ' + finding.table + ' table lets one customer read another one\'s rows.';
 }
 
@@ -454,6 +462,20 @@ function bodyFor(finding, contents) {
       'kept, and your live app was never touched.';
   }
 
+  if (finding.kind === 'role' && finding.takeover) {
+    // Not a matter of taste like a viewer who may edit: taking somebody
+    // else's membership is never what a role is for.
+    const place = oneOf(finding.parent);
+    return (
+      'I put one of my fake people into the other one\'s ' + place + ' as ' + aRole(finding.who) +
+      ' in ' + finding.via + '.' + finding.roleColumn + ' and, signed in as them, changed ' +
+      finding.via + '.' + finding.personColumn + ' on the other person\'s own membership row to their own id - so ' +
+      'they held that member\'s place and role, on a copy of your app. Before joining, they could not. It was ' +
+      'undone straight away. A member taking over another member\'s row is never something a role should be able ' +
+      'to do, even where members may edit some of a membership.'
+    );
+  }
+
   if (finding.kind === 'role') {
     // Said as what was done, and then whose decision it is: a viewer who may
     // edit is a hole in one app and the design of another.
@@ -494,6 +516,15 @@ function bodyFor(finding, contents) {
     );
   }
 
+  if (finding.kind === 'bucket' && finding.noRule) {
+    return (
+      'In Supabase Storage the bucket "' + finding.bucket + '" is set to public, so anyone with a ' +
+      'file\'s link can download it without logging in - the rules on storage.objects are not asked. ' +
+      'No rule says who may read it, but its name says what it holds, and that does not sound like ' +
+      'something for everyone. I only read the bucket\'s setting and its rules; I did not open or list ' +
+      'any file. Whether it should be public is yours to say.'
+    );
+  }
   if (finding.kind === 'bucket') {
     // Said as what was read, never as a file taken: no file was opened.
     return (
@@ -520,6 +551,11 @@ function bodyFor(finding, contents) {
                        : ', reaching whatever it reads past the rules on those tables.') +
       ' I did not call it: whether an open function like this is intended is ' +
       'something only you can confirm.' +
+      (finding.nullSlips
+        ? ' Its first lines do check the caller\'s role - but with NOT IN or <>, and somebody with no role ' +
+          'there gets NULL back, and NULL NOT IN (...) is not true: the IF never raises, so a signed-in ' +
+          'stranger gets through as if they had passed.'
+        : '') +
       (finding.hasFixedSearchPath ? ''
         : ' It also does not pin its search_path, so a caller can point the names ' +
           'inside it at their own objects.')
@@ -556,6 +592,13 @@ function bodyFor(finding, contents) {
       'this table. ' + (finding.fromNight ? 'The nightly run did it on a copy and got back ' : 'I did it myself just now and got back ') +
       finding.readable + ' ' + rowWord +
       (holds ? ', including ' + holds : '') + '.'
+    );
+  }
+  if (finding.tenant) {
+    return (
+      'Signed in as someone in a different organization, I asked for another organization\'s rows and got ' +
+      finding.readable + ' of them back' + (holds ? ', including ' + holds : '') +
+      '. Anyone with an account can read every organization\'s rows.'
     );
   }
   return (
@@ -629,14 +672,17 @@ function serverOnlyLines(finding) {
   // column saying whose row it is. The assistant applying it had to correct
   // the prompt; a less careful one would have locked the table away from the
   // members who use it.
-  const team = finding.authTied !== false && (finding.columns || []).find((c) => TENANT_COLUMN.test(String(c)));
+  // A row an organization owns names its organization even when the column is
+  // not called organization_id: the attack found which key it is.
+  const team = finding.authTied !== false &&
+    (finding.tenant ? finding.owner : (finding.columns || []).find((c) => TENANT_COLUMN.test(String(c))));
   const maker = finding.owner || finding.ownedBy;
   // A team's row that also says who made it - created_by beside workspace_id.
   // Found on a benchmark: the prompt said to compare created_by to auth.uid()
   // for reading, which hides every teammate's rows and breaks the shared
   // view the table exists for. Who made a row decides who may write it
   // under their name, not who may see it.
-  if (team && finding.owned !== false && maker) {
+  if (team && !finding.tenant && finding.owned !== false && maker) {
     return [
       'Rows in "' + table + '" belong to a team ("' + team + '"), and "' + maker + '" only records who ' +
         'made each one. So reading should be decided by team membership: let a signed-in user read a ' +
@@ -654,7 +700,7 @@ function serverOnlyLines(finding) {
       '',
     ];
   }
-  const tenant = finding.owned === false && team;
+  const tenant = (finding.tenant || finding.owned === false) && team;
   if (tenant) {
     return [
       'Rows in "' + table + '" belong to an organization ("' + tenant + '"), not to one person. So the ' +
@@ -785,6 +831,23 @@ function fixPromptFor(finding) {
       'Then sign in as an ordinary user and open the pages that use these tables, and run this ' +
         'check again - the tables it could not test will be tested this time.',
     ]
+    : finding.kind === 'role' && finding.takeover
+    ? [
+      'My app has a permissions problem - a member can take over another member\'s place.',
+      '',
+      'In my database, a member of ' + aOne(finding.parent) + ' whose role in "' + finding.via + '"."' +
+        finding.roleColumn + '" is "' + finding.who + '" can update another member\'s row in "' + finding.via +
+        '" and set "' + finding.personColumn + '" to their own id - taking that member\'s place and role, an ' +
+        'admin\'s or the owner\'s included. This was proved on a copy of the database.',
+      '',
+      'Fix the rules on "' + finding.via + '" that cover UPDATE or ALL: nobody may change "' + finding.personColumn +
+        '" or the team a membership belongs to on an existing row - adding or removing members is how membership ' +
+        'changes. Let only the roles that manage the team (usually owner and admin) update membership rows at ' +
+        'all, check that in WITH CHECK as well as USING, and never use WITH CHECK (true). If members only need to ' +
+        'change something of their own, allow exactly that column on their own row and nothing else.',
+      '',
+      'Then check every function that updates "' + finding.via + '" for the same thing.',
+    ]
     : finding.kind === 'role'
     ? [
       'My app may have a permissions problem - please check it rather than assume it.',
@@ -830,11 +893,14 @@ function fixPromptFor(finding) {
       'My app may have a storage problem - please check it rather than assume it.',
       '',
       'The Supabase Storage bucket "' + finding.bucket + '" is public. Anyone with a file\'s URL can ' +
-        'download it without logging in, and the storage.objects ' +
-        ((finding.rules || []).length === 1 ? 'policy that names' : 'policies that name') + ' this bucket (' +
-        listOf((finding.rules || []).map((r) => '"' + r + '"')) + ') ' +
-        ((finding.rules || []).length === 1 ? 'is' : 'are') + ' not checked for public URLs - so ' +
-        ((finding.rules || []).length === 1 ? 'it protects' : 'they protect') + ' nothing while it is public.',
+        'download it without logging in' + (finding.noRule
+        ? ', and no rule on storage.objects says who may read it - its name suggests its files are not ' +
+          'meant for everyone.'
+        : ', and the storage.objects ' +
+          ((finding.rules || []).length === 1 ? 'policy that names' : 'policies that name') + ' this bucket (' +
+          listOf((finding.rules || []).map((r) => '"' + r + '"')) + ') ' +
+          ((finding.rules || []).length === 1 ? 'is' : 'are') + ' not checked for public URLs - so ' +
+          ((finding.rules || []).length === 1 ? 'it protects' : 'they protect') + ' nothing while it is public.'),
       '',
       'First tell me: is every file in this bucket meant to be downloadable by anyone? If yes, change nothing.',
       '',
@@ -843,8 +909,11 @@ function fixPromptFor(finding) {
         'change the app to fetch these files with signed URLs (createSignedUrl) instead of getPublicUrl, ' +
         'or the links it shows will stop working.',
       '',
-      'Keep the read rule: once the bucket is private it is what decides who gets a file. Check that it ' +
-        'only lets in the right people.',
+      finding.noRule
+        ? 'Once it is private, add a read rule on storage.objects for this bucket that lets in only the ' +
+          'people a file belongs to - without one, nobody but your server can read them.'
+        : 'Keep the read rule: once the bucket is private it is what decides who gets a file. Check that it ' +
+          'only lets in the right people.',
       '',
       'Then look at every other bucket for the same thing.',
     ]
@@ -863,6 +932,16 @@ function fixPromptFor(finding) {
         'backend key, the way an admin-only function like this should be reached.',
       '',
     ].concat(
+      finding.nullSlips
+        ? [
+          'Its role check lets through anyone with no role at all: the helper returns NULL for them, and ' +
+            'NULL NOT IN (...) - or NULL <> ... - is not true, so the IF never raises. Write the check so ' +
+            'NULL cannot pass, for example IF coalesce(<the helper>(...), \'none\') NOT IN (...) THEN RAISE, ' +
+            'or IF <the helper>(...) IS NULL OR <the helper>(...) NOT IN (...) THEN RAISE - and check every ' +
+            'other function that uses the same helper the same way.',
+          '',
+        ]
+        : [],
       finding.hasFixedSearchPath
         ? []
         : [
@@ -998,7 +1077,9 @@ function fixPromptFor(finding) {
         'The "' + finding.table + '" table ' +
           (finding.kind === 'exposed'
             ? 'can be read by anyone who is not logged in, because ' + cause.short + '.'
-            : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
+            : finding.tenant
+              ? 'lets a signed-in user read rows belonging to a different organization, because ' + cause.short + '.'
+              : 'lets one signed-in user read rows belonging to a different user, because ' + cause.short + '.'),
         '',
       ].concat(
         serverOnlyLines(finding) || [
@@ -1058,11 +1139,22 @@ function describe(finding) {
     readable: finding.readable,
     secrets: finding.secrets,
     bucket: finding.bucket,
+    // An organization's rows read from outside it, and a member taking over
+    // another member's row: kept so the re-check and the read-back word them
+    // the same way the report did.
+    tenant: finding.tenant,
+    takeover: finding.takeover,
+    personColumn: finding.personColumn,
+    nullSlips: finding.nullSlips,
+    noRule: finding.noRule,
     proof: finding.kind === 'recursive'
       ? 'Using ' + listOf((finding.reads || []).map((t) => '"' + t + '"')) + ' stopped with ' +
         loopError(finding) + '.'
       : finding.kind === 'privileged'
       ? 'I did not call "' + finding.fn + '". This is a reach that exists in the grants, not a break I ran.'
+      : finding.kind === 'role' && finding.takeover
+      ? 'As ' + aRole(finding.who) + ' who had just joined, I put my own id on the other person\'s row of "' +
+        finding.via + '", which I could not touch before joining. It was undone.'
       : finding.kind === 'role'
       ? 'As ' + aRole(finding.who) + ' who had just joined, I ' +
         listOf((finding.can || []).map((what) => {
@@ -1072,6 +1164,8 @@ function describe(finding) {
       : finding.kind === 'teamread'
       ? 'As ' + aRole(finding.who) + ' who had just joined, I read ' + (finding.readable || 1) +
         ((finding.readable || 1) === 1 ? ' row' : ' rows') + ' of "' + finding.table + '" that I could not read before joining.'
+      : finding.kind === 'bucket' && finding.noRule
+      ? 'I read that "' + finding.bucket + '" is public and that no rule says who may read it. I did not open any file.'
       : finding.kind === 'bucket'
       ? 'I read that "' + finding.bucket + '" is public and that ' + listOf((finding.rules || []).map((r) => '"' + r + '"')) +
         ' says who may read it. I did not open any file.'

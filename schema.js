@@ -225,6 +225,25 @@ async function readIndexes(client, schema) {
  * argument the caller chose.
  */
 function guardedAtTheDoor(body, helpers) {
+  return doorOf(body, helpers).guarded;
+}
+
+/**
+ * The same reading, and one more answer: whether the only check at the door
+ * is one a caller with no role at all slips past.
+ *
+ * Found on a blind test (HarborLine): complete_automation_run opened with
+ *   if public.org_role(v_org) not in ('owner', 'admin') then raise ...
+ * org_role answers with the caller's role there - and with NULL for somebody
+ * who has none. NULL NOT IN (...) is not true, so the IF never raises, and a
+ * stranger completed another organization's runs. A role helper's check is a
+ * guard only when it is written so NULL cannot pass - coalesce(...), or
+ * IS NULL OR ... - and otherwise it is said, by name, why it is not one.
+ *
+ * `helpers` are names (yes/no helpers about the caller) or { name, nullable }
+ * (a role helper, which answers NULL for a stranger).
+ */
+function doorOf(body, helpers) {
   const text = String(body || '');
   const writes = /\b(insert\s+into|update\s+(only\s+)?["\w]+|delete\s+from|truncate|merge\s+into)\b/i.exec(text);
   const returns = /\breturn\b/i.exec(text);
@@ -236,17 +255,26 @@ function guardedAtTheDoor(body, helpers) {
   // never as the tail of a longer name.
   const asks = (cond, name) => new RegExp('(^|[^\\w$"])"?' +
     name.replace(/[$]/g, '\\$') + '"?\\s*\\(', 'i').test(cond);
+  const list = (helpers || []).map((h) => (typeof h === 'string' ? { name: h, nullable: false } : h));
+  let slips = false;
   let found;
   while ((found = guard.exec(text)) !== null) {
     if (found.index > firstAct) break;
     const cond = found[1].trim();
     // Refusing when the check fails, not when it passes.
     const refusesOnNo = /^not\b/i.test(cond) || /\bis\s+(not\s+true|false)\s*$/i.test(cond) || /=\s*false\s*$/i.test(cond);
-    if (!refusesOnNo) continue;
-    if ((helpers || []).some((name) => asks(cond, name))) return true;
-    if (/\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(cond) && /admin|owner|member|role/i.test(cond)) return true;
+    if (refusesOnNo && list.some((h) => !h.nullable && asks(cond, h.name))) return { guarded: true, nullSlips: false };
+    if (refusesOnNo && /\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(cond) && /admin|owner|member|role/i.test(cond)) {
+      return { guarded: true, nullSlips: false };
+    }
+    if (list.some((h) => h.nullable && asks(cond, h.name))) {
+      const refuses = refusesOnNo || /\bnot\s+in\s*\(/i.test(cond) || /<>|!=/.test(cond);
+      const nullSafe = /\bcoalesce\s*\(/i.test(cond) || /\bis\s+null\b/i.test(cond) || /\bis\s+not\s+true\s*$/i.test(cond);
+      if (refuses && nullSafe) return { guarded: true, nullSlips: false };
+      if (refuses) slips = true;
+    }
   }
-  return false;
+  return { guarded: false, nullSlips: slips };
 }
 
 async function readAnonDefinerFunctions(client, schema, role) {
@@ -262,6 +290,7 @@ async function readAnonDefinerFunctions(client, schema, role) {
             p.proconfig::text AS config,
             pg_get_functiondef(p.oid) AS def,
             p.prorettype = 'pg_catalog.bool'::regtype AS returns_bool,
+            (SELECT t.typtype = 'e' FROM pg_type t WHERE t.oid = p.prorettype) AS returns_enum,
             ${exists.rows.length ? "has_function_privilege($2, p.oid, 'EXECUTE')" : 'false'} AS callable
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -271,21 +300,25 @@ async function readAnonDefinerFunctions(client, schema, role) {
       ORDER BY p.proname`,
     exists.rows.length ? [schema, caller] : [schema],
   );
-  // The schema's yes/no helpers about the caller - is_org_admin(org) asking
-  // whether auth.uid() is an admin of it - definer or not, since a guard can
-  // call either. Read once, for guardedAtTheDoor.
+  // The schema's helpers about the caller - is_org_admin(org) asking whether
+  // auth.uid() is an admin of it, org_role(org) answering with their role -
+  // definer or not, since a guard can call either. Read once, for doorOf. A
+  // role helper answers NULL for somebody with no role, so it is marked.
   const { rows: yesNo } = await client.query(
-    `SELECT p.proname AS name, pg_get_functiondef(p.oid) AS def
+    `SELECT p.proname AS name, pg_get_functiondef(p.oid) AS def,
+            p.prorettype <> 'pg_catalog.bool'::regtype AS nullable
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE n.nspname = $1 AND p.prokind = 'f' AND p.prorettype = 'pg_catalog.bool'::regtype`,
+       JOIN pg_type t ON t.oid = p.prorettype
+      WHERE n.nspname = $1 AND p.prokind = 'f' AND (p.prorettype = 'pg_catalog.bool'::regtype OR t.typtype = 'e')
+      ORDER BY p.proname`,
     [schema],
   );
   const helpers = yesNo.filter((row) => {
     const body = String(row.def || '').replace(/--[^\n]*/g, ' ');
     return /\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(body) &&
       !/\b(insert\s+into|update\s+(only\s+)?["\w]+|delete\s+from|truncate|merge\s+into)\b/i.test(body);
-  }).map((row) => row.name);
+  }).map((row) => ({ name: row.name, nullable: row.nullable === true }));
   return rows.map((row) => {
     // A definer function with no search_path pinned is a second, separate
     // hazard: the caller can set their own search_path and make the function
@@ -309,13 +342,21 @@ async function readAnonDefinerFunctions(client, schema, role) {
     // else and writing nothing, they are not a reach. A yes/no that does not
     // ask auth.uid() - is_admin(user_id) - answers about other people, and
     // stays a finding.
-    const aboutCaller = row.returns_bool === true && !writes && /\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(body);
+    //
+    // A role about the caller alone is the same: org_role(org), the caller's
+    // own role there, from a fixed list of labels (an enum) that can hold
+    // nothing about anybody else. Found on a blind test (HarborLine), where
+    // org_role was reported beside the functions it guards.
+    const aboutCaller = (row.returns_bool === true || row.returns_enum === true) && !writes &&
+      /\bauth\s*\.\s*(uid|jwt)\s*\(/i.test(body);
+    const door = doorOf(body, helpers);
     return {
       name: row.name,
       args: row.args || '',
       writes: writes,
       aboutCaller: aboutCaller,
-      guarded: guardedAtTheDoor(body, helpers),
+      guarded: door.guarded,
+      nullSlips: door.nullSlips,
       hasFixedSearchPath: hasFixedSearchPath,
       callable: row.callable === true,
     };
@@ -1438,6 +1479,7 @@ module.exports = {
   readSchema: readSchema,
   readAnonDefinerFunctions: readAnonDefinerFunctions,
   guardedAtTheDoor: guardedAtTheDoor,
+  doorOf: doorOf,
   writeSchema: writeSchema,
   diffSchemas: diffSchemas,
   readPolicies: readPolicies,

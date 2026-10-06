@@ -367,6 +367,169 @@ EXCEPTION WHEN OTHERS THEN
   RETURN '[]'::jsonb;
 END $$;
 
+/*
+ * Whether a function turns the caller away before it does anything, and
+ * whether its only check is one somebody with no role slips past (schema.js
+ * doorOf, read the same way: IF <check> THEN RAISE, before the first write
+ * and the first RETURN). `helpers` are { name, nullable } - a yes/no about
+ * the caller, or a role helper that answers NULL for a stranger.
+ */
+CREATE OR REPLACE FUNCTION __KN__.door_of(body text, helpers jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  text_ text := coalesce(body, '');
+  writes_re constant text := '\y(insert\s+into|update\s+(only\s+)?["\w]+|delete\s+from|truncate|merge\s+into)\y';
+  guard_re constant text :=
+    '((?<!\yend\s)(?<!\yend\s\s)\yif\y((?:(?!\ythen\y).)*?)\ythen\s+raise\y(?!\s+(?:notice|warning|info|log|debug)\y))';
+  first_act integer := 2147483647;
+  m text[];
+  pos integer;
+  from_ integer := 1;
+  cond text;
+  refuses_on_no boolean;
+  refuses boolean;
+  null_safe boolean;
+  h jsonb;
+  asks boolean;
+  slips boolean := false;
+BEGIN
+  IF text_ ~* writes_re THEN
+    first_act := least(first_act, length((regexp_split_to_array(text_, writes_re, 'i'))[1]) + 1);
+  END IF;
+  IF text_ ~* '\yreturn\y' THEN
+    first_act := least(first_act, length((regexp_split_to_array(text_, '\yreturn\y', 'i'))[1]) + 1);
+  END IF;
+  FOR m IN SELECT regexp_matches(text_, guard_re, 'gi') LOOP
+    pos := from_ + strpos(substr(text_, from_), m[1]) - 1;
+    from_ := pos + length(m[1]);
+    EXIT WHEN pos > first_act;
+    cond := btrim(m[2]);
+    -- Refusing when the check fails, not when it passes.
+    refuses_on_no := cond ~* '^not\y' OR cond ~* '\yis\s+(not\s+true|false)\s*$' OR cond ~* '=\s*false\s*$';
+    FOR h IN SELECT * FROM jsonb_array_elements(coalesce(helpers, '[]'::jsonb)) LOOP
+      asks := cond ~* ('(^|[^\w$"])"?' || replace(h->>'name', '$', '\$') || '"?\s*\(');
+      CONTINUE WHEN NOT asks;
+      IF NOT coalesce((h->>'nullable')::boolean, false) THEN
+        IF refuses_on_no THEN RETURN jsonb_build_object('guarded', true, 'nullSlips', false); END IF;
+      ELSE
+        refuses := refuses_on_no OR cond ~* '\ynot\s+in\s*\(' OR cond ~ '<>|!=';
+        null_safe := cond ~* '\ycoalesce\s*\(' OR cond ~* '\yis\s+null\y' OR cond ~* '\yis\s+not\s+true\s*$';
+        IF refuses AND null_safe THEN RETURN jsonb_build_object('guarded', true, 'nullSlips', false); END IF;
+        IF refuses THEN slips := true; END IF;
+      END IF;
+    END LOOP;
+    IF refuses_on_no AND cond ~* '\yauth\s*\.\s*(uid|jwt)\s*\(' AND cond ~* 'admin|owner|member|role' THEN
+      RETURN jsonb_build_object('guarded', true, 'nullSlips', false);
+    END IF;
+  END LOOP;
+  RETURN jsonb_build_object('guarded', false, 'nullSlips', slips);
+END $$;
+
+/*
+ * Every SECURITY DEFINER function in the schema, trigger functions aside, and
+ * what the report needs to know about each (schema.js
+ * readAnonDefinerFunctions). Found on a blind test (HarborLine): the nightly
+ * run never looked at functions at all, so mark_invoice_paid, set_team_role
+ * and every other open one showed on the command line and never on the
+ * dashboard.
+ */
+CREATE OR REPLACE FUNCTION __KN__.read_anon_definer_functions(source text, role_ text DEFAULT 'anon')
+RETURNS jsonb LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  writes_re constant text := '\y(insert\s+into|update\s+(only\s+)?["\w]+|delete\s+from|truncate|merge\s+into)\y';
+  auth_re constant text := '\yauth\s*\.\s*(uid|jwt)\s*\(';
+  has_role boolean := EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_);
+  helpers jsonb;
+  out_ jsonb := '[]'::jsonb;
+  r record;
+  body text;
+  conf text;
+  writes boolean;
+  door jsonb;
+BEGIN
+  SELECT coalesce(jsonb_agg(jsonb_build_object('name', h.name, 'nullable', h.nullable) ORDER BY h.name), '[]'::jsonb)
+    INTO helpers
+    FROM (SELECT p.proname::text AS name, p.prorettype <> 'pg_catalog.bool'::regtype AS nullable,
+                 regexp_replace(coalesce(pg_get_functiondef(p.oid), ''), '--[^\n]*', ' ', 'g') AS b
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            JOIN pg_type t ON t.oid = p.prorettype
+           WHERE n.nspname = source AND p.prokind = 'f'
+             AND (p.prorettype = 'pg_catalog.bool'::regtype OR t.typtype = 'e')) h
+   WHERE h.b ~* auth_re AND NOT h.b ~* writes_re;
+
+  FOR r IN
+    SELECT p.proname::text AS name,
+           pg_get_function_identity_arguments(p.oid) AS args,
+           p.proconfig::text AS config,
+           pg_get_functiondef(p.oid) AS def,
+           p.prorettype = 'pg_catalog.bool'::regtype AS returns_bool,
+           (SELECT t.typtype = 'e' FROM pg_type t WHERE t.oid = p.prorettype) AS returns_enum,
+           CASE WHEN has_role THEN has_function_privilege(role_, p.oid, 'EXECUTE') ELSE false END AS callable
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = source
+       AND p.prosecdef
+       AND p.prorettype <> 'pg_catalog.trigger'::regtype
+     ORDER BY p.proname
+  LOOP
+    body := regexp_replace(coalesce(r.def, ''), '--[^\n]*', ' ', 'g');
+    conf := replace(replace(replace(coalesce(r.config, ''), '{', ''), '}', ''), '"', '');
+    writes := body ~* writes_re;
+    door := __KN__.door_of(body, helpers);
+    out_ := out_ || jsonb_build_array(jsonb_build_object(
+      'name', r.name,
+      'args', coalesce(r.args, ''),
+      'writes', writes,
+      'aboutCaller', (coalesce(r.returns_bool, false) OR coalesce(r.returns_enum, false)) AND NOT writes AND body ~* auth_re,
+      'guarded', (door->>'guarded')::boolean,
+      'nullSlips', (door->>'nullSlips')::boolean,
+      'hasFixedSearchPath', conf ~* '(^|,)search_path=',
+      'callable', coalesce(r.callable, false)));
+  END LOOP;
+  RETURN out_;
+END $$;
+
+/*
+ * Public buckets worth a look (scan.js bucketsOf): a read rule says only some
+ * people may read it, or there is no read rule and its name says its files
+ * are somebody's own.
+ */
+CREATE OR REPLACE FUNCTION __KN__.bucket_findings(buckets jsonb)
+RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  b jsonb;
+  rule jsonb;
+  esc text;
+  rest text;
+  narrowing jsonb;
+  no_rule boolean;
+  found jsonb := '[]'::jsonb;
+BEGIN
+  FOR b IN SELECT * FROM jsonb_array_elements(coalesce(buckets, '[]'::jsonb)) LOOP
+    CONTINUE WHEN NOT coalesce((b->>'public')::boolean, false);
+    esc := regexp_replace(b->>'id', '([.*+?^${}()|\[\]\\])', '\\\1', 'g');
+    narrowing := '[]'::jsonb;
+    FOR rule IN SELECT * FROM jsonb_array_elements(coalesce(b->'readRules', '[]'::jsonb)) LOOP
+      rest := regexp_replace(coalesce(rule->>'qual', ''), 'bucket_id\s*=\s*''' || esc || '''(::text)?', '', 'gi');
+      rest := regexp_replace(rest, '''' || esc || '''(::text)?\s*=\s*bucket_id', '', 'gi');
+      rest := regexp_replace(rest, '\ytrue\y|\yand\y|[()\s]', '', 'gi');
+      IF NOT (coalesce(rule->'roles', '[]'::jsonb) ? 'anon' OR coalesce(rule->'roles', '[]'::jsonb) ? 'public')
+         OR rest <> '' THEN
+        narrowing := narrowing || to_jsonb(rule->>'name');
+      END IF;
+    END LOOP;
+    no_rule := jsonb_array_length(coalesce(b->'readRules', '[]'::jsonb)) = 0
+      AND (b->>'name') ~* '(^|[-_.])(exports?|private|documents?|docs|invoices?|contracts?|backups?|reports?|receipts?|statements?|payouts?|evidence|kyc|passports?|medical|records?|confidential|internal|secrets?|attachments?)([-_.]|$)';
+    IF jsonb_array_length(narrowing) > 0 OR no_rule THEN
+      found := found || jsonb_build_array(jsonb_build_object(
+        'kind', 'bucket', 'table', b->>'name', 'bucket', b->>'id',
+        'rules', narrowing, 'noRule', no_rule, 'columns', '[]'::jsonb));
+    END IF;
+  END LOOP;
+  RETURN found;
+END $$;
+
 /* Everything needed to rebuild a schema, in one shape. */
 CREATE OR REPLACE FUNCTION __KN__.read_schema(source text)
 RETURNS jsonb LANGUAGE plpgsql STABLE AS $$
@@ -395,6 +558,7 @@ BEGIN
     'viewGrants', __KN__.read_view_grants(source),
     'functions', __KN__.read_functions(source),
     'buckets', __KN__.read_buckets(),
+    'anonFunctions', __KN__.read_anon_definer_functions(source),
     -- A foreign key pointing at something whose shape could not be read is
     -- not something to guess at. The caller stops rather than attacking a
     -- copy that is missing a piece.
@@ -1454,6 +1618,31 @@ BEGIN
   RETURN keys;
 END $$;
 
+/*
+ * The column that says which organization's a row is, on a table with no
+ * person's name on it - or NULL. Its first single-column key to a table that
+ * others point at, where the table itself is not one of those (attack.js
+ * tenantKey). Found on a blind test (HarborLine): integration_secrets was
+ * readable by every signed-in user, and with no person column it was never
+ * tried.
+ */
+CREATE OR REPLACE FUNCTION __KN__.tenant_key(tab jsonb, tables jsonb, parents jsonb)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  key jsonb;
+BEGIN
+  -- A view is not seeded: it shows whatever its tables hold, the second
+  -- person's own organization included (workspace_health, on the same test).
+  IF coalesce((tab->>'isView')::boolean, false) OR parents ? (tab->>'name') THEN RETURN NULL; END IF;
+  FOR key IN SELECT * FROM jsonb_array_elements(__KN__.foreign_keys(tab) || __KN__.implied_keys(tab, tables)) LOOP
+    IF key->>'refTable' <> tab->>'name' AND parents ? (key->>'refTable')
+       AND jsonb_array_length(key->'columns') = 1 THEN
+      RETURN key->'columns'->>0;
+    END IF;
+  END LOOP;
+  RETURN NULL;
+END $$;
+
 /* Every table some other table points at, by a key it declared or one it implies. */
 CREATE OR REPLACE FUNCTION __KN__.parent_tables(tables jsonb)
 RETURNS jsonb LANGUAGE plpgsql IMMUTABLE AS $$
@@ -1942,8 +2131,19 @@ BEGIN
       -- into this table can use the same one instead of rediscovering it, and
       -- be sure a refusal is the app defending itself rather than a CHECK it
       -- never satisfied.
+      -- A table with nobody's name on it that got a row for each person keeps
+      -- which row is the first person's, so a write meant for somebody else's
+      -- row is aimed at it (attack.js seed; HarborLine's invoices).
       seeded := seeded || jsonb_build_array(jsonb_build_object(
-        'table', tab->>'name', 'owner', owner, 'attempt', worked));
+        'table', tab->>'name', 'owner', owner, 'attempt', worked)
+        || CASE WHEN owner IS NULL
+                 AND (SELECT count(*) FROM jsonb_object_keys(rows_->(tab->>'name'))) = 2
+                 AND __KN__.primary_key_of(tab) IS NOT NULL
+                 AND rows_->(tab->>'name')->__KN__.user_a()->>__KN__.primary_key_of(tab) IS NOT NULL
+            THEN jsonb_build_object('rowOfA', jsonb_build_object(
+              'column', __KN__.primary_key_of(tab),
+              'value', rows_->(tab->>'name')->__KN__.user_a()->>__KN__.primary_key_of(tab)))
+            ELSE '{}'::jsonb END);
     ELSE
       -- Recorded, never swallowed. The report has to say this table was not
       -- checked rather than let an empty table pass for a safe one.
@@ -2093,9 +2293,13 @@ DECLARE
   key text;
   named jsonb;
   reached boolean;
+  parents jsonb := __KN__.parent_tables(tables);
+  tenant text;
+  as_b jsonb;
 BEGIN
   FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
     owner := __KN__.owner_column(tab);
+    tenant := CASE WHEN owner IS NULL THEN __KN__.tenant_key(tab, tables, parents) END;
     named := coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c),
                       '[]'::jsonb);
 
@@ -2168,6 +2372,35 @@ BEGIN
         blocked := blocked || jsonb_build_array(jsonb_build_object(
           'table', tab->>'name', 'key', key,
           'why', 'as a signed-in customer: ' || (as_a->>'why')));
+      END IF;
+    END IF;
+
+    -- A table whose rows are an organization's, not a person's: its one row
+    -- is the first person's organization's, and the second person - signed
+    -- in, in an organization of their own - asks for it. What a logged-out
+    -- stranger can already read is reported as exposed, and not twice.
+    IF tenant IS NOT NULL THEN
+      key := 'crossed:' || (tab->>'name');
+      as_b := __KN__.read_as(source, tab->>'name', 'authenticated', __KN__.user_b(), NULL);
+      IF (as_b->>'ok')::boolean THEN
+        completed := completed || to_jsonb(key);
+        IF (as_b->>'count')::bigint > 0
+           AND NOT ((anon->>'ok')::boolean AND (anon->>'count')::bigint > 0) THEN
+          findings := findings || jsonb_build_array(jsonb_build_object(
+            'kind', 'crossed',
+            'table', tab->>'name',
+            'owner', tenant,
+            'tenant', true,
+            'readable', (as_b->>'count')::bigint,
+            'columns', named,
+            'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+        END IF;
+      ELSIF __KN__.refusal_means(as_b->>'why') = 'unreachable' THEN
+        completed := completed || to_jsonb(key);
+      ELSE
+        blocked := blocked || jsonb_build_array(jsonb_build_object(
+          'table', tab->>'name', 'key', key,
+          'why', 'as a signed-in user in another organization: ' || (as_b->>'why')));
       END IF;
     END IF;
   END LOOP;
@@ -2340,10 +2573,11 @@ DECLARE
   -- narrow what is allowed and never open it, so it is never the reason.
   rules_for jsonb;
   named jsonb;
+  first_row jsonb;
 BEGIN
   FOR tab IN SELECT * FROM jsonb_array_elements(tables) LOOP
     -- Never seeded, so there is nothing in it to protect.
-    SELECT (s->>'attempt')::integer INTO shape
+    SELECT (s->>'attempt')::integer, s->'rowOfA' INTO shape, first_row
       FROM jsonb_array_elements(coalesce(seeded, '[]'::jsonb)) s
      WHERE s->>'table' = tab->>'name';
     CONTINUE WHEN NOT FOUND;
@@ -2369,8 +2603,14 @@ BEGIN
     -- Rows belonging to the other fake person. Scoped on purpose: a signed-in
     -- customer deleting their OWN rows is not a finding, it is the feature,
     -- and an unscoped DELETE would report every correctly built app.
-    their_rows := CASE WHEN owner IS NULL THEN ''
-      ELSE ' WHERE ' || __KN__.always_quote(owner) || ' = ' || quote_literal(__KN__.user_a()) END;
+    -- With nobody's name on the table, the first person's own row where each
+    -- person got one (seed's rowOfA).
+    their_rows := CASE
+      WHEN owner IS NOT NULL
+        THEN ' WHERE ' || __KN__.always_quote(owner) || ' = ' || quote_literal(__KN__.user_a())
+      WHEN jsonb_typeof(first_row) = 'object'
+        THEN ' WHERE ' || __KN__.always_quote(first_row->>'column') || '::text = ' || quote_literal(first_row->>'value')
+      ELSE '' END;
 
     -- Written under a name nobody has used, which is both what makes the row
     -- land at all and what makes it the right test: adding a row of your own
@@ -2641,7 +2881,8 @@ DECLARE
   in_rule_literal text := '''\{([^}'']*,)?"?' || regexp_replace(role_, esc, '\\\1', 'g') ||
     '"?(,[^}'']*)?\}''::("?[A-Za-z0-9_$]+"?\.)?"?' || type_name || '"?\[\]';
   in_helper_list text := '(\mIN\s*\(|ARRAY\[)[^])]*' || label;
-  command text := CASE what WHEN 'add' THEN 'INSERT' WHEN 'change' THEN 'UPDATE' WHEN 'delete' THEN 'DELETE' END;
+  -- A takeover is an UPDATE too (tamper.js COMMAND).
+  command text := CASE what WHEN 'add' THEN 'INSERT' WHEN 'change' THEN 'UPDATE' WHEN 'delete' THEN 'DELETE' WHEN 'takeover' THEN 'UPDATE' END;
   policy jsonb;
   body text;
 BEGIN
@@ -2825,6 +3066,18 @@ BEGIN
         jsonb_build_object('what', 'change',
           'statement', 'UPDATE ' || target || ' SET ' || column_ || ' = ' || column_ || not_theirs),
         jsonb_build_object('what', 'delete', 'statement', 'DELETE FROM ' || target || not_theirs));
+      -- On the members table itself: putting their own id on the first
+      -- person's membership row - taking that member's place, and their role
+      -- (tamper.js; HarborLine). Asked of every role, listed or not.
+      IF tab->>'name' = member->'table'->>'name' THEN
+        where_ := ARRAY[__KN__.always_quote(member->>'person') || ' = ' || quote_literal(__KN__.user_a())];
+        FOR name IN SELECT jsonb_object_keys(pointed) ORDER BY 1 LOOP
+          where_ := where_ || (__KN__.always_quote(name) || ' = ' || quote_literal(pointed->>name));
+        END LOOP;
+        moves := moves || jsonb_build_array(jsonb_build_object('what', 'takeover', 'anyRole', true,
+          'statement', 'UPDATE ' || target || ' SET ' || __KN__.always_quote(member->>'person') || ' = '
+            || quote_literal(__KN__.user_b()) || ' WHERE ' || array_to_string(where_, ' AND ')));
+      END IF;
 
       -- Adding a row to the team, said only of a role whose own name says it
       -- may only look, and written under the other person's name: a rule that
@@ -2868,7 +3121,8 @@ BEGIN
           CONTINUE WHEN coalesce((move->>'lookOnly')::boolean, false) AND NOT __KN__.look_only(role_);
           -- A write the rules list this role for is not asked: whatever it did
           -- would not be reported, and a key refusing it left the table untested.
-          IF __KN__.allowed_by_rules(rules, tab->>'name', move->>'what', role_, member->>'roleType') THEN
+          IF NOT coalesce((move->>'anyRole')::boolean, false)
+             AND __KN__.allowed_by_rules(rules, tab->>'name', move->>'what', role_, member->>'roleType') THEN
             listed := true;
             CONTINUE;
           END IF;
@@ -2903,7 +3157,10 @@ BEGIN
             'changed', changed,
             'below', below,
             'columns', coalesce((SELECT jsonb_agg(c->>'name') FROM jsonb_array_elements(tab->'columns') c), '[]'::jsonb),
-            'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false)));
+            'rlsEnabled', coalesce((tab->>'rlsEnabled')::boolean, false))
+            || CASE WHEN can ? 'takeover'
+                 THEN jsonb_build_object('takeover', true, 'personColumn', member->>'person')
+                 ELSE '{}'::jsonb END);
           EXIT;
         END IF;
         IF NOT listed THEN below := below || to_jsonb(role_); END IF;
@@ -3499,12 +3756,32 @@ BEGIN
                 FROM jsonb_array_elements(coalesce(seen->'looped', '[]'::jsonb)) l
                GROUP BY l->>'relation') g), '[]'::jsonb);
 
+    -- Functions anybody can call that run past the rules, and public buckets
+    -- worth a look - read from the app's own shape, never run or opened
+    -- (scan.js privilegedOf and bucketsOf). Found on a blind test
+    -- (HarborLine): neither was ever in the nightly run, so the dashboard
+    -- showed less than the command line did.
+    findings := findings || coalesce((
+      SELECT jsonb_agg(jsonb_build_object(
+               'kind', 'privileged', 'fn', f->>'name', 'table', f->>'name', 'args', f->>'args',
+               'writes', (f->>'writes')::boolean, 'hasFixedSearchPath', (f->>'hasFixedSearchPath')::boolean,
+               'nullSlips', coalesce((f->>'nullSlips')::boolean, false), 'columns', '[]'::jsonb))
+        FROM jsonb_array_elements(coalesce(plan->'anonFunctions', '[]'::jsonb)) f
+       WHERE (f->>'callable')::boolean AND NOT (f->>'aboutCaller')::boolean AND NOT (f->>'guarded')::boolean),
+      '[]'::jsonb)
+      || __KN__.bucket_findings(plan->'buckets');
+
     -- Everything genuinely attacked, so a re-check can tell a finding that was
-    -- fixed from one whose attack simply did not run this time.
+    -- fixed from one whose attack simply did not run this time. Every function
+    -- and bucket read counts as looked at, so a revoked grant comes back fixed.
     attempted := coalesce(seen->'completed', '[]'::jsonb)
               || coalesce(wrote->'completed', '[]'::jsonb)
               || coalesce(ranked->'completed', '[]'::jsonb)
-              || coalesce(stranded->'completed', '[]'::jsonb);
+              || coalesce(stranded->'completed', '[]'::jsonb)
+              || coalesce((SELECT jsonb_agg('privileged:' || (f->>'name'))
+                             FROM jsonb_array_elements(coalesce(plan->'anonFunctions', '[]'::jsonb)) f), '[]'::jsonb)
+              || coalesce((SELECT jsonb_agg('bucket:' || (b->>'name'))
+                             FROM jsonb_array_elements(coalesce(plan->'buckets', '[]'::jsonb)) b), '[]'::jsonb);
 
     -- And everything that was not. Said out loud, never left out: a table
     -- nothing could be put into reads exactly like a table nothing got out of.
